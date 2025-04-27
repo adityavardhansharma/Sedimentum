@@ -1,0 +1,45 @@
+{
+  "name": "t3-desktop",
+  "version": "1.0.0",
+  "description": "Desktop application for T3 Chat",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --publish=never"
+  },
+  "keywords": ["t3", "chat", "desktop"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^35.2.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.t3.desktop",
+    "productName": "T3 Chat",
+    "win": {
+      "target": ["nsis", "portable"],
+      "icon": "t3.jpg",
+      "artifactName": "T3Chat-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "t3.jpg",
+      "uninstallerIcon": "t3.jpg",
+      "installerHeaderIcon": "t3.jpg"
+    },
+    "files": [
+      "**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}",
+      "!**/._*",
+      "!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,.gitignore,.gitattributes}"
+    ],
+    "asar": true
+  }
+}
