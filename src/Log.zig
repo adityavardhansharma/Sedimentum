@@ -80,6 +80,9 @@ last_seq: u64 = 0,
 /// Set after a failed write or sync. The file may hold a partial record,
 /// so further appends would bury it in the middle of the log.
 poisoned: bool = false,
+/// A segment whose handle an unlocked sync is still using. Rollover keeps
+/// that handle open until `unpinSync` runs.
+sync_pin: ?u64 = null,
 
 /// A visitor that ignores every record.
 pub const NoVisitor = struct {
@@ -368,6 +371,121 @@ pub fn scanSegment(log: *const Log, id: u64) !segment.Scanner {
     return scanner;
 }
 
+/// Returns the active handle for a sync that runs without the caller's lock,
+/// and keeps rollover from closing it until `unpinSync`.
+pub fn pinSyncHandle(log: *Log) Io.File {
+    std.debug.assert(log.sync_pin == null);
+    log.sync_pin = log.active_id;
+    return log.active;
+}
+
+/// Ends a pin from `pinSyncHandle`. If the pinned segment was sealed in the
+/// meantime, its handle is dropped now.
+pub fn unpinSync(log: *Log) void {
+    const id = log.sync_pin orelse return;
+    log.sync_pin = null;
+    if (id == log.active_id) return;
+    if (log.segs.getPtr(id)) |seg| dropHandleIfMapped(log.io, seg);
+}
+
+/// One problem `check` found in a segment file.
+pub const Problem = struct {
+    segment: u64,
+    kind: Kind,
+    /// Byte offset of the first bad record.
+    offset: u64,
+    file_len: u64,
+
+    pub const Kind = enum {
+        /// A partial record at the end of the newest segment. Opening cuts it off.
+        torn_tail,
+        /// A partial record at the end of a sealed segment. Opening refuses it.
+        torn_sealed,
+        /// A bad record followed by valid ones. Opening refuses it.
+        corrupt,
+        /// A batch whose checksum matches but whose contents are invalid.
+        bad_batch,
+    };
+};
+
+pub const CheckReport = struct {
+    records: u64 = 0,
+    segments: usize = 0,
+    problems: std.ArrayList(Problem) = .empty,
+
+    pub fn deinit(r: *CheckReport, gpa: Allocator) void {
+        r.problems.deinit(gpa);
+    }
+};
+
+/// Verifies every segment in `sub_path` read-only, without repairing
+/// anything. Holds the directory lock while it runs, so it fails with
+/// `error.Locked` instead of racing a writer or compaction.
+pub fn check(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8) !CheckReport {
+    var dir = try parent.openDir(io, sub_path, .{ .iterate = true });
+    defer dir.close(io);
+    const lock_file = dir.createFile(io, "LOCK", .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return error.Locked,
+        else => |e| return e,
+    };
+    defer lock_file.close(io);
+
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(gpa);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (segment.parseFileName(entry.name)) |id| try ids.append(gpa, id);
+    }
+    std.mem.sortUnstable(u64, ids.items, {}, std.sort.asc(u64));
+
+    var report: CheckReport = .{ .segments = ids.items.len };
+    errdefer report.deinit(gpa);
+    for (ids.items, 0..) |id, i| {
+        const newest = i + 1 == ids.items.len;
+        var name_buf: [segment.name_len]u8 = undefined;
+        const file = try dir.openFile(io, segment.fileName(&name_buf, id), .{});
+        defer file.close(io);
+        var scanner = try segment.Scanner.init(gpa, io, file);
+        defer scanner.deinit();
+        var bad_batch: ?u64 = null;
+        while (try scanner.next()) |item| {
+            report.records += 1;
+            if (item.record.kind != .batch or bad_batch != null) continue;
+            var ops = record.BatchIterator.init(item.record);
+            while (true) {
+                const op = ops.next() catch {
+                    bad_batch = item.offset;
+                    break;
+                };
+                if (op == null) break;
+            }
+        }
+        if (bad_batch) |off| try report.problems.append(gpa, .{
+            .segment = id,
+            .kind = .bad_batch,
+            .offset = off,
+            .file_len = scanner.file_len,
+        });
+        const kind: ?Problem.Kind = switch (scanner.stop) {
+            .end => null,
+            .torn => if (newest) .torn_tail else .torn_sealed,
+            .corrupt => .corrupt,
+        };
+        if (kind) |k| try report.problems.append(gpa, .{
+            .segment = id,
+            .kind = k,
+            .offset = scanner.pos,
+            .file_len = scanner.file_len,
+        });
+    }
+    return report;
+}
+
 /// Deletes a sealed segment. The caller must have made every record it
 /// still needs durable elsewhere first.
 pub fn removeSegment(log: *Log, id: u64) !void {
@@ -476,7 +594,7 @@ fn rollover(log: *Log) !void {
     // The sealed segment keeps its mapping in `segs` for reads.
     const sealed = log.segs.getPtr(log.active_id).?;
     sealed.size = log.active_end;
-    dropHandleIfMapped(log.io, sealed);
+    if (log.sync_pin != log.active_id) dropHandleIfMapped(log.io, sealed);
     log.active = next;
     log.active_id = next_id;
     log.active_end = 0;
@@ -766,6 +884,29 @@ test "a torn batch is dropped as a whole" {
     try testing.expectEqual(@as(u64, 1), log.last_seq);
 }
 
+test "rollover keeps a pinned sync handle open" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var log = try Log.open(std.testing.allocator, io, tmp.dir, "log", .{ .segment_bytes = 128 }, NoVisitor{});
+    defer log.close();
+    _ = try log.append(.{ .seq = 1, .kind = .put, .key = "key", .value = "some value bytes" });
+    try log.flush();
+    const pinned_id = log.active_id;
+    const file = log.pinSyncHandle();
+    var seq: u64 = 2;
+    while (log.active_id == pinned_id) : (seq += 1) {
+        _ = try log.append(.{ .seq = seq, .kind = .put, .key = "key", .value = "some value bytes" });
+    }
+    // The sealed segment's handle is still open for the pending sync.
+    try std.testing.expect(log.segs.get(pinned_id).?.file != null);
+    try file.sync(io);
+    log.unpinSync();
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        try std.testing.expect(log.segs.get(pinned_id).?.file == null);
+    }
+}
+
 test "sealed mapped segments hold no file handle" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -790,4 +931,74 @@ test "sealed mapped segments hold no file handle" {
     var scanner = try log.scanSegment(log.segments.items[0]);
     defer scanner.deinit();
     try std.testing.expect(try scanner.next() != null);
+}
+
+test "check tells a repairable tail from a damaged sealed segment" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first: u64 = undefined;
+    var last: u64 = undefined;
+    {
+        var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{ .segment_bytes = 128 }, NoVisitor{});
+        defer log.close();
+        var seq: u64 = 1;
+        while (log.segments.items.len < 3) : (seq += 1) {
+            _ = try log.append(.{ .seq = seq, .kind = .put, .key = "key", .value = "some value bytes" });
+        }
+        first = log.segments.items[0];
+        last = log.active_id;
+    }
+    var report = try Log.check(testing.allocator, io, tmp.dir, "db");
+    try testing.expectEqual(@as(usize, 0), report.problems.items.len);
+    report.deinit(testing.allocator);
+
+    var dir = try tmp.dir.openDir(io, "db", .{});
+    defer dir.close(io);
+    for ([_]u64{ first, last }) |id| {
+        var name_buf: [segment.name_len]u8 = undefined;
+        const f = try dir.openFile(io, segment.fileName(&name_buf, id), .{ .mode = .read_write });
+        defer f.close(io);
+        try f.setLength(io, try f.length(io) - 3);
+    }
+    report = try Log.check(testing.allocator, io, tmp.dir, "db");
+    defer report.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), report.problems.items.len);
+    try testing.expectEqual(Problem.Kind.torn_sealed, report.problems.items[0].kind);
+    try testing.expectEqual(Problem.Kind.torn_tail, report.problems.items[1].kind);
+}
+
+test "check finds a batch with a valid checksum but bad contents" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try tmp.dir.createDirPathOpen(io, "db", .{});
+    defer dir.close(io);
+    const op: record.Record = .{ .seq = 1, .kind = .put, .key = "a", .value = "1" };
+    var buf: [record.header_len + 4 + 64]u8 = undefined;
+    const op_len = record.encodedLen(op);
+    const total = record.header_len + 4 + op_len;
+    // The batch claims two operations but holds one.
+    std.mem.writeInt(u32, buf[record.header_len..][0..4], 2, .little);
+    record.encode(buf[record.header_len + 4 ..][0..op_len], op);
+    record.finish(buf[0..total], 1, .batch, 4, @intCast(op_len));
+    var name_buf: [segment.name_len]u8 = undefined;
+    const f = try dir.createFile(io, segment.fileName(&name_buf, 1), .{});
+    defer f.close(io);
+    try f.writePositionalAll(io, buf[0..total], 0);
+
+    var report = try Log.check(testing.allocator, io, tmp.dir, "db");
+    defer report.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), report.problems.items.len);
+    try testing.expectEqual(Problem.Kind.bad_batch, report.problems.items[0].kind);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, io, tmp.dir, "db", .{}, NoVisitor{}));
+}
+
+test "check refuses a directory another handle has open" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, NoVisitor{});
+    defer log.close();
+    try testing.expectError(error.Locked, Log.check(testing.allocator, io, tmp.dir, "db"));
 }

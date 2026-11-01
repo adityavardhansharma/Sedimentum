@@ -195,15 +195,16 @@ fn syncNow(s: *Shared) !u64 {
         defer s.lock.unlock(s.io);
         try s.db.log.flush();
         target = s.db.lastSeq();
-        file = s.db.log.active;
+        // A writer may roll over while we sync; the pin keeps this handle open.
+        file = s.db.log.pinSyncHandle();
     }
     // Earlier segments were synced when they were sealed.
-    file.sync(s.io) catch |err| {
-        s.lock.lockUncancelable(s.io);
-        s.db.log.poisoned = true;
-        s.lock.unlock(s.io);
-        return err;
-    };
+    const result = file.sync(s.io);
+    s.lock.lockUncancelable(s.io);
+    s.db.log.unpinSync();
+    if (result) |_| {} else |_| s.db.log.poisoned = true;
+    s.lock.unlock(s.io);
+    try result;
     _ = s.stats.syncs.fetchAdd(1, .monotonic);
     return target;
 }

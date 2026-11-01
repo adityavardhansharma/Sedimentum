@@ -104,45 +104,29 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
-/// Scans every segment file read-only and reports damage without repairing
-/// anything. Returns whether every file is clean.
+/// Verifies every segment file read-only and reports damage without
+/// repairing anything. Returns whether every file is clean.
 fn checkFiles(gpa: std.mem.Allocator, io: Io, path: []const u8, out: *Io.Writer) !bool {
-    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
-        try out.print("cannot open {s}: {t}\n", .{ path, err });
+    var report = sdm.Log.check(gpa, io, Io.Dir.cwd(), path) catch |err| {
+        switch (err) {
+            error.Locked => try out.print("{s} is open in another process; close it before checking\n", .{path}),
+            else => try out.print("cannot check {s}: {t}\n", .{ path, err }),
+        }
         return false;
     };
-    defer dir.close(io);
-    var ids: std.ArrayList(u64) = .empty;
-    defer ids.deinit(gpa);
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (sdm.segment.parseFileName(entry.name)) |id| try ids.append(gpa, id);
-    }
-    std.mem.sortUnstable(u64, ids.items, {}, std.sort.asc(u64));
-    var clean = true;
-    var records: u64 = 0;
-    for (ids.items) |id| {
+    defer report.deinit(gpa);
+    for (report.problems.items) |p| {
         var name_buf: [sdm.segment.name_len]u8 = undefined;
-        const name = sdm.segment.fileName(&name_buf, id);
-        const file = try dir.openFile(io, name, .{});
-        defer file.close(io);
-        var scanner = try sdm.segment.Scanner.init(gpa, io, file);
-        defer scanner.deinit();
-        while (try scanner.next()) |_| records += 1;
-        switch (scanner.stop) {
-            .end => {},
-            .torn => {
-                clean = false;
-                try out.print("{s}: damaged tail at byte {d} of {d} (opening the database will cut it off)\n", .{ name, scanner.pos, scanner.file_len });
-            },
-            .corrupt => {
-                clean = false;
-                try out.print("{s}: damaged record at byte {d} followed by valid records\n", .{ name, scanner.pos });
-            },
+        const name = sdm.segment.fileName(&name_buf, p.segment);
+        switch (p.kind) {
+            .torn_tail => try out.print("{s}: damaged tail at byte {d} of {d} (opening the database will cut it off)\n", .{ name, p.offset, p.file_len }),
+            .torn_sealed => try out.print("{s}: damaged tail at byte {d} of {d} in a sealed segment (opening will fail)\n", .{ name, p.offset, p.file_len }),
+            .corrupt => try out.print("{s}: damaged record at byte {d} followed by valid records (opening will fail)\n", .{ name, p.offset }),
+            .bad_batch => try out.print("{s}: batch at byte {d} has invalid contents (opening will fail)\n", .{ name, p.offset }),
         }
     }
-    if (clean) try out.print("ok: {d} records verified across {d} segments\n", .{ records, ids.items.len });
+    const clean = report.problems.items.len == 0;
+    if (clean) try out.print("ok: {d} records verified across {d} segments\n", .{ report.records, report.segments });
     return clean;
 }
 
