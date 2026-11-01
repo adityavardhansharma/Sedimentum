@@ -118,12 +118,7 @@ pub const Hit = struct {
     buried: bool,
     /// Which query terms it matched (bit per term, rarest first).
     matched: u8 = 0,
-    /// With meaning: the memory's words that best answer the question
-    /// (meaning-table index + 1; 0 for none).
-    topics: Topics = @splat(0),
 };
-
-pub const Topics = [4]u32;
 
 pub fn freeMemories(gpa: Allocator, ms: []const Memory) void {
     for (ms) |m| m.deinit(gpa);
@@ -216,7 +211,10 @@ forgotten: Bits = .{},
 
 ops_seq: u64 = 0,
 ckpt_count: u32 = 0,
-batch_unsynced: std.atomic.Value(bool) = .init(false),
+/// Batches written (`batch_gen`) and batches covered by a finished full
+/// sync (`synced_gen`); `sync` flushes while they differ.
+batch_gen: std.atomic.Value(u64) = .init(0),
+synced_gen: std.atomic.Value(u64) = .init(0),
 /// Rows added whose text is not in the store yet. A checkpoint waits for
 /// zero, so it never saves a row without its text.
 inflight: std.atomic.Value(u32) = .init(0),
@@ -766,8 +764,13 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
     _ = h.inflight.fetchSub(1, .acq_rel);
     for (errs) |e| if (e) |x| return x;
     for (0..items.len) |i| try h.dropIfForgotten(first + @as(u32, @intCast(i)));
-    if (h.options.sync_writes) try h.kv.syncAll() else h.batch_unsynced.store(true, .release);
-    if (h.count - h.ckpt_count >= checkpoint_every) try h.checkpoint();
+    if (h.options.sync_writes) try h.kv.syncAll() else _ = h.batch_gen.fetchAdd(1, .acq_rel);
+    const want_ckpt = blk: {
+        h.lock.lockSharedUncancelable(h.io);
+        defer h.lock.unlockShared(h.io);
+        break :blk h.count - h.ckpt_count >= checkpoint_every;
+    };
+    if (want_ckpt) try h.checkpoint();
     return first;
 }
 
@@ -777,7 +780,15 @@ const max_workers = 8;
 pub fn sync(h: *Holo) !void {
     // Batch writes store text from worker threads, which this thread's
     // own sync would not cover.
-    if (h.batch_unsynced.swap(false, .acq_rel)) return h.kv.syncAll();
+    // A batch counts as synced only after a full sync that started after
+    // it finished; until then every caller flushes.
+    const gen = h.batch_gen.load(.acquire);
+    if (gen != h.synced_gen.load(.acquire)) {
+        try h.kv.syncAll();
+        var cur = h.synced_gen.load(.acquire);
+        while (cur < gen) cur = h.synced_gen.cmpxchgWeak(cur, gen, .acq_rel, .acquire) orelse break;
+        return;
+    }
     try h.kv.sync();
 }
 
@@ -1199,7 +1210,6 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         const m = (try h.get(gpa, c.id)) orelse continue;
         var score = c.score;
         var matched: u8 = 0;
-        var topics: Topics = @splat(0);
         if (nq > 0) {
             var mt: text.TermSet = .{};
             mt.fill(m.text);
@@ -1228,7 +1238,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                 continue;
             }
             var near: f32 = 0;
-            if (meaning) |mn| near, topics = closeness(mn, qt_buf[0..nq], m.text);
+            if (meaning) |mn| near = closeness(mn, qt_buf[0..nq], m.text);
             const r = blk: {
                 h.lock.lockSharedUncancelable(h.io);
                 defer h.lock.unlockShared(h.io);
@@ -1243,7 +1253,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
             defer h.lock.unlockShared(h.io);
             break :blk h.buried.get(c.id);
         };
-        try hits.append(gpa, .{ .memory = m, .score = score, .buried = buried, .matched = matched, .topics = topics });
+        try hits.append(gpa, .{ .memory = m, .score = score, .buried = buried, .matched = matched });
     }
     const Ctx = struct {
         fn gt(_: void, a: Hit, b: Hit) bool {
@@ -1294,17 +1304,9 @@ fn sedimentHits(hits: []Hit) void {
 }
 
 /// `b` (ranked below `a`) looks like another version of the same fact:
-/// it matched the same question words (two or more) about as well, or,
-/// with meaning, it shares the question's name and answers it with a
-/// same word ("moved to the X region" after "deployed in the Y region").
+/// it matched the same question words (two or more) about as well.
 fn sameFact(a: *const Hit, b: *const Hit) bool {
-    if (a.matched == b.matched and @popCount(a.matched) >= 2 and b.score >= a.score * 0.9) return true;
-    if (a.matched & b.matched & 1 == 0 or b.score < a.score * 0.5) return false;
-    for (a.topics) |x| {
-        if (x == 0) break;
-        for (b.topics) |y| if (x == y) return true;
-    }
-    return false;
+    return a.matched == b.matched and @popCount(a.matched) >= 2 and b.score >= a.score * 0.9;
 }
 /// How much the closest-in-meaning candidate gains over an unrelated one.
 const semantic_weight = 8.0;
@@ -1314,7 +1316,7 @@ const semantic_weight = 8.0;
 /// less for related words, nothing below `sim_floor`), weighted by rarity.
 /// Words near a name the question asks about count fully; farther ones
 /// fade, so chatter around the answer does not drown it.
-fn closeness(mn: *const Meaning, qt: []const QTerm, body: []const u8) struct { f32, Topics } {
+fn closeness(mn: *const Meaning, qt: []const QTerm, body: []const u8) f32 {
     const Seq = struct {
         hashes: [256]u64 = undefined,
         len: usize = 0,
@@ -1356,33 +1358,18 @@ fn closeness(mn: *const Meaning, qt: []const QTerm, body: []const u8) struct { f
     }
     var sum: f32 = 0;
     var wsum: f32 = 0;
-    var topics: Topics = @splat(0);
-    var nt: usize = 0;
     for (qt) |t| {
         if (t.hash != qt[t.group].hash) continue;
         const qi = mn.index(t.hash) orelse continue;
         wsum += t.idf;
         var best: f32 = 0;
-        var best_d: u32 = 0;
-        for (di[0..nd], dw[0..nd]) |d, w| {
-            const sm = w * mn.similarity(qi, d);
-            if (sm > best) {
-                best = sm;
-                best_d = d;
-            }
-        }
+        for (di[0..nd], dw[0..nd]) |d, w| best = @max(best, w * mn.similarity(qi, d));
         if (best < sim_floor) continue;
         sum += t.idf * (best - sim_floor) / (1 - sim_floor);
-        if (best >= topic_sim and nt < topics.len) {
-            topics[nt] = best_d + 1;
-            nt += 1;
-        }
     }
-    return .{ if (wsum > 0) sum / wsum else 0, topics };
+    return if (wsum > 0) sum / wsum else 0;
 }
 
-/// A memory's answer word must be at least this close to count as a topic.
-const topic_sim = 0.5;
 /// Words this close to a name count fully in `closeness`.
 const near_words = 4;
 const sim_floor = 0.15;

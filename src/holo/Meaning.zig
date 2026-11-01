@@ -56,6 +56,12 @@ pub fn load(gpa: Allocator, bytes_in: []const u8) !*Meaning {
     if (p + vlen + nlen != bytes.len) return error.BadModel;
     const vectors: []const i8 = @ptrCast(bytes[p..][0..vlen]);
     const neighbours = bytes[p + vlen ..][0..nlen];
+    // A damaged file must fail here, not read out of bounds in a search.
+    var k: usize = 0;
+    while (k < nlen) : (k += 3) {
+        const j = std.mem.readInt(u16, neighbours[k..][0..2], .little);
+        if (j != none and j >= count) return error.BadModel;
+    }
 
     var cap: usize = 1;
     while (cap < @as(usize, count) * 2) cap <<= 1;
@@ -187,4 +193,14 @@ test "related words and vectors" {
     const ib = m.index(text.hashTerm("banana")).?;
     try testing.expect(m.similarity(io, id) > 0.9);
     try testing.expect(m.similarity(io, ib) < 0.1);
+}
+
+test "a neighbour index past the end is rejected" {
+    const good = try testModel(testing.allocator);
+    defer good.deinit(testing.allocator);
+    const bad = try testing.allocator.dupe(u8, good.bytes);
+    defer testing.allocator.free(bad);
+    // First neighbour of the first word: index 7 of 3 words.
+    std.mem.writeInt(u16, bad[bad.len - 9 ..][0..2], 7, .little);
+    try testing.expectError(error.BadModel, load(testing.allocator, bad));
 }
