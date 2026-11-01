@@ -111,6 +111,9 @@ const alloc_align = 256;
 const rec_header = 19;
 const max_seq = std.math.maxInt(u64);
 
+/// Set in a manifest chunk's bloom word count when the filter is blocked.
+const bloom_blocked_bit: u32 = 1 << 31;
+
 pub fn Shard(comptime cfg: Config) type {
     return struct {
         const Self = @This();
@@ -126,6 +129,11 @@ pub fn Shard(comptime cfg: Config) type {
             bloom: []u64,
             /// Checks that already passed (see `chunk.View.checked`).
             checked: u64 = 0,
+            /// `chunk.hint` of `last` past the stream name, so most fence
+            /// comparisons don't touch the key bytes.
+            last_hint: u64 = 0,
+            /// The bloom filter keeps each key's bits in one cache line.
+            blocked_bloom: bool = false,
 
             fn deinit(c: *ChunkMeta, gpa: Allocator) void {
                 gpa.free(c.first);
@@ -188,7 +196,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var hi: usize = st.idx.items.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, st.recKey(st.idx.items[mid]), key) == .lt) lo = mid + 1 else hi = mid;
+                    if (chunk.order(st.recKey(st.idx.items[mid]), key) == .lt) lo = mid + 1 else hi = mid;
                 }
                 return lo;
             }
@@ -437,7 +445,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var hi: usize = s.named.items.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, s.named.items[mid].name, name) == .lt) lo = mid + 1 else hi = mid;
+                    if (chunk.order(s.named.items[mid].name, name) == .lt) lo = mid + 1 else hi = mid;
                 }
                 s.named.insertAssumeCapacity(lo, st);
             }
@@ -866,6 +874,8 @@ pub fn Shard(comptime cfg: Config) type {
                 const bloom = try b.bloom(gpa);
                 errdefer gpa.free(bloom);
                 try w.run.chunks.append(gpa, .{
+                    .last_hint = chunk.hint(last, streamName(last).len),
+                    .blocked_bloom = true,
                     .off = off,
                     .len = @intCast(bytes.len),
                     .count = b.count,
@@ -925,12 +935,12 @@ pub fn Shard(comptime cfg: Config) type {
             for (order, 0..) |*o, i| o.* = i;
             std.mem.sortUnstable(usize, order, runs, struct {
                 fn lt(rs: []Run, a: usize, b: usize) bool {
-                    return std.mem.order(u8, rs[a].first(), rs[b].first()) == .lt;
+                    return chunk.order(rs[a].first(), rs[b].first()) == .lt;
                 }
             }.lt);
             var total: usize = 0;
             for (order[1..], 0..) |o, i| {
-                if (std.mem.order(u8, runs[order[i]].last(), runs[o].first()) != .lt) {
+                if (chunk.order(runs[order[i]].last(), runs[o].first()) != .lt) {
                     return s.mergeRunsRewrite(st, first, count, tier);
                 }
             }
@@ -965,7 +975,10 @@ pub fn Shard(comptime cfg: Config) type {
             curs: []RunCursor,
             key: std.ArrayList(u8) = .empty,
             versions_seen: usize = 0,
-            value: std.ArrayList(u8) = .empty,
+            /// The cursor whose entry was returned last. It moves on at the
+            /// start of the next call, so that entry's value can borrow the
+            /// cursor's block instead of being copied.
+            pending: ?usize = null,
 
             fn init(s: *Self, runs: []Run) !MergeCursor {
                 const curs = try s.gpa.alloc(RunCursor, runs.len);
@@ -978,19 +991,22 @@ pub fn Shard(comptime cfg: Config) type {
                 for (m.curs) |*c| c.deinit();
                 m.s.gpa.free(m.curs);
                 m.key.deinit(m.s.gpa);
-                m.value.deinit(m.s.gpa);
             }
 
             /// The next entry. Versions of one key come out newest first;
             /// `versions_seen` counts how many of that key came before.
             fn nextKey(m: *MergeCursor) !?chunk.Entry {
+                if (m.pending) |p| {
+                    m.pending = null;
+                    try m.curs[p].step(true);
+                }
                 var best: ?usize = null;
                 for (m.curs, 0..) |*c, i| {
                     if (!c.valid) continue;
                     if (best) |b| {
                         const be = m.curs[b].cur();
                         const ce = c.cur();
-                        switch (std.mem.order(u8, ce.key, be.key)) {
+                        switch (chunk.order(ce.key, be.key)) {
                             .lt => best = i,
                             .eq => if (ce.seq > be.seq) {
                                 best = i;
@@ -1005,11 +1021,9 @@ pub fn Shard(comptime cfg: Config) type {
                 if (m.versions_seen > 0 and std.mem.eql(u8, m.key.items, e.key)) m.versions_seen += 1 else m.versions_seen = 1;
                 m.key.clearRetainingCapacity();
                 try m.key.appendSlice(gpa, e.key);
-                m.value.clearRetainingCapacity();
-                try m.value.appendSlice(gpa, e.value);
-                const out: chunk.Entry = .{ .key = m.key.items, .value = m.value.items, .seq = e.seq, .kind = e.kind };
-                try m.curs[b].step(true);
-                return out;
+                m.pending = b;
+                // Valid until the next call: the value borrows cursor `b`.
+                return .{ .key = m.key.items, .value = e.value, .seq = e.seq, .kind = e.kind };
             }
         };
 
@@ -1285,13 +1299,14 @@ pub fn Shard(comptime cfg: Config) type {
             var kb: std.ArrayList(u8) = .empty;
             defer kb.deinit(a);
             const h = chunk.keyHash(key);
+            const key_hint = chunk.hint(key, st.name.len);
             var ri = st.runs.items.len;
             while (ri > 0) {
                 ri -= 1;
                 const r = &st.runs.items[ri];
-                const c = findChunk(r, key) orelse continue;
+                const c = findChunk(r, key, key_hint) orelse continue;
                 if (c.min_seq > at) continue;
-                if (!chunk.bloomHas(c.bloom, h)) continue;
+                if (!(if (c.blocked_bloom) chunk.blockedBloomHas(c.bloom, h) else chunk.bloomHas(c.bloom, h))) continue;
                 const v = try s.chunkView(c);
                 if (try chunk.get(v, a, key, at, &scratch, &kb)) |e| return try hitFor(gpa, e, now_s, want);
             }
@@ -1321,16 +1336,18 @@ pub fn Shard(comptime cfg: Config) type {
             return hit;
         }
 
-        fn findChunk(r: *const Run, key: []const u8) ?*const ChunkMeta {
+        fn findChunk(r: *const Run, key: []const u8, key_hint: u64) ?*const ChunkMeta {
             const cs = r.chunks.items;
             var lo: usize = 0;
             var hi: usize = cs.len;
             while (lo < hi) {
                 const mid = (lo + hi) / 2;
-                if (std.mem.order(u8, cs[mid].last, key) == .lt) lo = mid + 1 else hi = mid;
+                const c = &cs[mid];
+                const lt = if (c.last_hint != key_hint) c.last_hint < key_hint else chunk.order(c.last, key) == .lt;
+                if (lt) lo = mid + 1 else hi = mid;
             }
             if (lo == cs.len) return null;
-            if (std.mem.order(u8, cs[lo].first, key) == .gt) return null;
+            if (chunk.order(cs[lo].first, key) == .gt) return null;
             return &cs[lo];
         }
 
@@ -1402,7 +1419,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var hi: usize = cs.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, cs[mid].last, key) == .lt) lo = mid + 1 else hi = mid;
+                    if (chunk.order(cs[mid].last, key) == .lt) lo = mid + 1 else hi = mid;
                 }
                 c.valid = lo < cs.len;
                 if (!c.valid) return;
@@ -1410,7 +1427,7 @@ pub fn Shard(comptime cfg: Config) type {
                 try c.loadBlock((try c.view.findBlock(key)) orelse 0);
                 const es = c.parsed.entries.items;
                 var i: usize = 0;
-                while (i < es.len and std.mem.order(u8, es[i].key, key) == .lt) i += 1;
+                while (i < es.len and chunk.order(es[i].key, key) == .lt) i += 1;
                 if (i < es.len) {
                     c.ei = i;
                 } else {
@@ -1426,7 +1443,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var hi: usize = cs.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, cs[mid].first, key) == .lt) lo = mid + 1 else hi = mid;
+                    if (chunk.order(cs[mid].first, key) == .lt) lo = mid + 1 else hi = mid;
                 }
                 c.valid = lo > 0;
                 if (!c.valid) return;
@@ -1434,7 +1451,7 @@ pub fn Shard(comptime cfg: Config) type {
                 try c.loadBlock((try c.view.findBlockBefore(key)) orelse 0);
                 const es = c.parsed.entries.items;
                 var i: usize = es.len;
-                while (i > 0 and std.mem.order(u8, es[i - 1].key, key) != .lt) i -= 1;
+                while (i > 0 and chunk.order(es[i - 1].key, key) != .lt) i -= 1;
                 if (i > 0) {
                     c.ei = i - 1;
                 } else {
@@ -1578,15 +1595,15 @@ pub fn Shard(comptime cfg: Config) type {
                     for (it.sources.items, 0..) |*src, i| {
                         if (!src.valid()) continue;
                         if (pick) |p| {
-                            const o = std.mem.order(u8, src.cur().key, it.sources.items[p].cur().key);
+                            const o = chunk.order(src.cur().key, it.sources.items[p].cur().key);
                             if ((fwd and o == .lt) or (!fwd and o == .gt)) pick = i;
                         } else pick = i;
                     }
                     const p = pick orelse return null;
                     const k = it.sources.items[p].cur().key;
                     if (fwd) {
-                        if (it.range.end) |e| if (std.mem.order(u8, k, e) != .lt) return null;
-                    } else if (std.mem.order(u8, k, it.range.start) == .lt) return null;
+                        if (it.range.end) |e| if (chunk.order(k, e) != .lt) return null;
+                    } else if (chunk.order(k, it.range.start) == .lt) return null;
                     it.key.clearRetainingCapacity();
                     try it.key.appendSlice(gpa, k);
                     var best_seq: u64 = 0;
@@ -1649,7 +1666,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var hi: usize = ns.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, ns[mid].name, key) == .lt) lo = mid + 1 else hi = mid;
+                    if (chunk.order(ns[mid].name, key) == .lt) lo = mid + 1 else hi = mid;
                 }
                 return lo;
             }
@@ -1670,13 +1687,13 @@ pub fn Shard(comptime cfg: Config) type {
                     if (!it.range.reverse) {
                         if (it.ni >= ns.len) return null;
                         const st = ns[it.ni];
-                        if (it.range.end) |e| if (std.mem.order(u8, st.name, e) != .lt) return null;
+                        if (it.range.end) |e| if (chunk.order(st.name, e) != .lt) return null;
                         it.ni += 1;
                         it.named = try StreamIter.init(it.s, st, it.range, it.at);
                     } else {
                         if (it.ni == 0) return null;
                         const st = ns[it.ni - 1];
-                        if (std.mem.order(u8, st.name, it.range.start) == .lt and !std.mem.startsWith(u8, it.range.start, st.name)) return null;
+                        if (chunk.order(st.name, it.range.start) == .lt and !std.mem.startsWith(u8, it.range.start, st.name)) return null;
                         it.ni -= 1;
                         it.named = try StreamIter.init(it.s, st, it.range, it.at);
                     }
@@ -1698,7 +1715,7 @@ pub fn Shard(comptime cfg: Config) type {
                 const n = it.named_cur;
                 if (m == null and n == null) return null;
                 const take_misc = if (m == null) false else if (n == null) true else blk: {
-                    const o = std.mem.order(u8, m.?.key, n.?.key);
+                    const o = chunk.order(m.?.key, n.?.key);
                     break :blk if (it.range.reverse) o == .gt else o == .lt;
                 };
                 if (take_misc) {
@@ -1881,7 +1898,7 @@ pub fn Shard(comptime cfg: Config) type {
                 try s.putU(u64, c.max_seq);
                 try s.putStr(c.first);
                 try s.putStr(c.last);
-                try s.putU(u32, @intCast(c.bloom.len));
+                try s.putU(u32, @as(u32, @intCast(c.bloom.len)) | (if (c.blocked_bloom) bloom_blocked_bit else 0));
                 try s.man_buf.appendSlice(s.gpa, std.mem.sliceAsBytes(c.bloom));
             }
         }
@@ -2006,7 +2023,10 @@ pub fn Shard(comptime cfg: Config) type {
                 errdefer gpa.free(c.first);
                 c.last = try gpa.dupe(u8, try r.str());
                 errdefer gpa.free(c.last);
-                const words = try r.u(u32);
+                c.last_hint = chunk.hint(c.last, streamName(c.last).len);
+                const words_flag = try r.u(u32);
+                c.blocked_bloom = words_flag & bloom_blocked_bit != 0;
+                const words = words_flag & ~bloom_blocked_bit;
                 if (r.pos + @as(usize, words) * 8 > r.b.len) return error.Corrupt;
                 c.bloom = try gpa.alloc(u64, words);
                 errdefer gpa.free(c.bloom);

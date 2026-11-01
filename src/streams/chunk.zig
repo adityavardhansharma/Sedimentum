@@ -40,6 +40,33 @@ const index_entry = 20;
 const footer_len = 24;
 const compressed_bit: u32 = 1 << 31;
 
+/// Byte-wise key order, compared eight bytes at a time.
+pub fn order(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const x = std.mem.readInt(u64, a[i..][0..8], .big);
+        const y = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (x != y) return std.math.order(x, y);
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// The eight bytes of `key` after its first `skip` bytes, zero-padded, as
+/// a number. If two keys' hints differ, they order the same way as the
+/// keys; equal hints say nothing.
+pub fn hint(key: []const u8, skip: usize) u64 {
+    var buf: [8]u8 = @splat(0);
+    if (key.len > skip) {
+        const n = @min(8, key.len - skip);
+        @memcpy(buf[0..n], key[skip..][0..n]);
+    }
+    return std.mem.readInt(u64, &buf, .big);
+}
+
 pub fn keyHash(key: []const u8) u64 {
     return std.hash.Wyhash.hash(0x51ed, key);
 }
@@ -78,6 +105,42 @@ pub fn bloomHas(words: []const u64, h: u64) bool {
     return true;
 }
 
+/// A blocked bloom filter: each key sets its bits inside one 512-bit
+/// block, so a lookup touches one cache line instead of seven.
+const bloom_block_words = 8;
+
+pub fn blockedBloomWords(keys: usize) usize {
+    const blocks = @max(1, (keys * 10 + 511) / 512);
+    return blocks * bloom_block_words;
+}
+
+fn blockedProbe(h: u64, nblocks: usize) struct { base: usize, h1: u32, h2: u32 } {
+    const base: usize = @intCast((@as(u128, h >> 32) * nblocks) >> 32);
+    const lo: u32 = @truncate(h);
+    return .{ .base = base * bloom_block_words, .h1 = lo, .h2 = (lo >> 17 | lo << 15) | 1 };
+}
+
+pub fn blockedBloomAdd(words: []u64, h: u64) void {
+    const p = blockedProbe(h, words.len / bloom_block_words);
+    const blk = words[p.base..][0..bloom_block_words];
+    for (0..bloom_probes) |i| {
+        const bit = (p.h1 +% @as(u32, @intCast(i)) *% p.h2) & 511;
+        blk[bit >> 6] |= @as(u64, 1) << @intCast(bit & 63);
+    }
+}
+
+pub fn blockedBloomHas(words: []const u64, h: u64) bool {
+    if (words.len < bloom_block_words) return true;
+    const p = blockedProbe(h, words.len / bloom_block_words);
+    const blk = words[p.base..][0..bloom_block_words];
+    var hit = true;
+    for (0..bloom_probes) |i| {
+        const bit = (p.h1 +% @as(u32, @intCast(i)) *% p.h2) & 511;
+        hit = hit and blk[bit >> 6] & (@as(u64, 1) << @intCast(bit & 63)) != 0;
+    }
+    return hit;
+}
+
 // ---------------------------------------------------------------- varints
 
 fn putVar(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
@@ -86,7 +149,16 @@ fn putVar(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
     try list.append(gpa, @truncate(x));
 }
 
-fn getVar(b: []const u8, pos: *usize) error{Corrupt}!u64 {
+inline fn getVar(b: []const u8, pos: *usize) error{Corrupt}!u64 {
+    // Most lengths fit in one byte.
+    if (pos.* < b.len and b[pos.*] < 0x80) {
+        pos.* += 1;
+        return b[pos.* - 1];
+    }
+    return getVarSlow(b, pos);
+}
+
+fn getVarSlow(b: []const u8, pos: *usize) error{Corrupt}!u64 {
     var x: u64 = 0;
     var shift: u6 = 0;
     while (true) {
@@ -121,6 +193,7 @@ pub const Builder = struct {
     max_seq: u64 = 0,
     block_entries: u32 = 0,
     misses: u8 = 0,
+    skipped: u8 = 0,
 
     pub fn init(gpa: Allocator, fmt: Format) Builder {
         return .{ .gpa = gpa, .fmt = fmt };
@@ -209,17 +282,20 @@ pub const Builder = struct {
         const raw = b.block.items;
         var stored = raw;
         var flag: u32 = 0;
-        // Data that didn't shrink twice in a row (random bytes, already
-        // compressed media) is not tried again until the next chunk.
-        if (b.fmt.compress and raw.len > 64 and b.misses < 2) {
+        // After two blocks in a row didn't shrink (random bytes, already
+        // compressed media), only every 16th block is tried, so such data
+        // costs little and a change back to text is still noticed.
+        const try_it = b.misses < 2 or b.skipped >= 15;
+        if (b.fmt.compress and raw.len > 64 and try_it) {
+            b.skipped = 0;
             try b.scratch.resize(gpa, lz4.bound(raw.len));
             const n = lz4.compress(raw, b.scratch.items);
             if (n < raw.len - raw.len / 10) {
                 stored = b.scratch.items[0..n];
                 flag = compressed_bit;
                 b.misses = 0;
-            } else b.misses += 1;
-        }
+            } else b.misses +|= 1;
+        } else if (b.fmt.compress) b.skipped +|= 1;
         const off: u32 = @intCast(b.out.items.len);
         try b.out.appendSlice(gpa, stored);
         // The key offset was written when the block started; finish its entry.
@@ -256,11 +332,11 @@ pub const Builder = struct {
         return b.out.items;
     }
 
-    /// A bloom filter over every distinct key added. Caller owns it.
+    /// A blocked bloom filter over every distinct key added. Caller owns it.
     pub fn bloom(b: *const Builder, gpa: Allocator) ![]u64 {
-        const words = try gpa.alloc(u64, bloomWords(b.hashes.items.len));
+        const words = try gpa.alloc(u64, blockedBloomWords(b.hashes.items.len));
         @memset(words, 0);
-        for (b.hashes.items) |h| bloomAdd(words, h);
+        for (b.hashes.items) |h| blockedBloomAdd(words, h);
         return words;
     }
 };
@@ -341,7 +417,7 @@ pub const View = struct {
         var hi: usize = v.nblocks;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.order(u8, try v.firstKey(mid), key) == .gt) hi = mid else lo = mid + 1;
+            if (order(try v.firstKey(mid), key) == .gt) hi = mid else lo = mid + 1;
         }
         return if (lo == 0) null else lo - 1;
     }
@@ -352,7 +428,7 @@ pub const View = struct {
         var hi: usize = v.nblocks;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.order(u8, try v.firstKey(mid), key) != .lt) hi = mid else lo = mid + 1;
+            if (order(try v.firstKey(mid), key) != .lt) hi = mid else lo = mid + 1;
         }
         return if (lo == 0) null else lo - 1;
     }
@@ -428,7 +504,7 @@ pub const Block = struct {
         var hi: usize = b.restartCount();
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.order(u8, try b.restartKey(mid), key) == .lt) lo = mid + 1 else hi = mid;
+            if (order(try b.restartKey(mid), key) == .lt) lo = mid + 1 else hi = mid;
         }
         return if (lo == 0) 0 else b.restart(lo - 1);
     }
@@ -503,7 +579,7 @@ pub fn get(v: View, gpa: Allocator, key: []const u8, at: u64, scratch: *std.Arra
     var it: BlockIter = .{ .raw = blk.entries, .pos = try blk.seek(key) };
     kb.clearRetainingCapacity();
     while (try it.next(gpa, kb)) |e| {
-        switch (std.mem.order(u8, e.key, key)) {
+        switch (order(e.key, key)) {
             .lt => continue,
             .gt => return null,
             .eq => if (e.seq <= at) return e,
@@ -561,7 +637,7 @@ fn buildAndCheck(fmt: Format) !void {
     for (0..view.nblocks) |bi| {
         try p.load(gpa, view, bi);
         for (p.entries.items) |e| {
-            try testing.expect(std.mem.order(u8, prev.items, e.key) != .gt);
+            try testing.expect(order(prev.items, e.key) != .gt);
             prev.clearRetainingCapacity();
             try prev.appendSlice(gpa, e.key);
         }
@@ -571,10 +647,10 @@ fn buildAndCheck(fmt: Format) !void {
     // Bloom finds every key.
     const bloom = try b.bloom(gpa);
     defer gpa.free(bloom);
-    for (0..n) |i| try testing.expect(bloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "chat/1/m{d:0>6}", .{i}))));
+    for (0..n) |i| try testing.expect(blockedBloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "chat/1/m{d:0>6}", .{i}))));
     var false_pos: usize = 0;
     for (0..10_000) |i| {
-        if (bloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "nope/{d}", .{i})))) false_pos += 1;
+        if (blockedBloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "nope/{d}", .{i})))) false_pos += 1;
     }
     try testing.expect(false_pos < 300);
     // Damage is caught.
@@ -608,5 +684,25 @@ test "a key's versions that cross restart points are all found" {
         try testing.expect((try get(view, gpa, "a/1/k1", 60, &scratch, &kb)) == null);
         try testing.expectEqual(@as(u64, 2), (try get(view, gpa, "a/1/k2", 9, &scratch, &kb)).?.seq);
         try testing.expect((try get(view, gpa, "a/1/k15", 999, &scratch, &kb)) == null);
+    }
+}
+
+test "order and hint agree with byte order" {
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    var a: [24]u8 = undefined;
+    var b: [24]u8 = undefined;
+    for (0..20000) |_| {
+        const la = r.uintAtMost(usize, 24);
+        const lb = r.uintAtMost(usize, 24);
+        for (a[0..la]) |*c| c.* = r.uintAtMost(u8, 3);
+        for (b[0..lb]) |*c| c.* = r.uintAtMost(u8, 3);
+        const want = std.mem.order(u8, a[0..la], b[0..lb]);
+        try testing.expectEqual(want, order(a[0..la], b[0..lb]));
+        const skip = r.uintAtMost(usize, 4);
+        if (la < skip or lb < skip or !std.mem.eql(u8, a[0..skip], b[0..skip])) continue;
+        const ha = hint(a[0..la], skip);
+        const hb = hint(b[0..lb], skip);
+        if (ha != hb) try testing.expectEqual(want, std.math.order(ha, hb));
     }
 }

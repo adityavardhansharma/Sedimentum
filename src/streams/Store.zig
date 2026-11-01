@@ -543,7 +543,7 @@ pub fn Store(comptime flavor: Flavor) type {
             }
             std.mem.sortUnstable(StreamInfo, out.items, {}, struct {
                 fn lt(_: void, a: StreamInfo, b: StreamInfo) bool {
-                    return std.mem.order(u8, a.name, b.name) == .lt;
+                    return chunk.order(a.name, b.name) == .lt;
                 }
             }.lt);
             return out.toOwnedSlice(gpa);
@@ -778,7 +778,7 @@ pub fn Store(comptime flavor: Flavor) type {
                 for (it.cur, 0..) |c, i| {
                     const p = c orelse continue;
                     if (pick) |b| {
-                        const o = std.mem.order(u8, p.key, it.cur[b].?.key);
+                        const o = chunk.order(p.key, it.cur[b].?.key);
                         if ((!it.reverse and o == .lt) or (it.reverse and o == .gt)) pick = i;
                     } else pick = i;
                 }
@@ -1072,7 +1072,7 @@ fn modelTest(comptime S: type, seed: u64, time_ordered: bool) !void {
     while (mit.next()) |k| try keys.append(gpa, k.*);
     std.mem.sortUnstable([]const u8, keys.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+            return chunk.order(a, b) == .lt;
         }
     }.lt);
     for ([_]bool{ false, true }) |rev| {
