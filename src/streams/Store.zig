@@ -108,6 +108,9 @@ pub const max_shards = 16;
 /// A handle that finds no free slot falls back to syncing every shard.
 const Touched = struct { owner: u64 = 0, mask: u32 = 0 };
 threadlocal var touched: [8]Touched = @splat(.{});
+/// Set for good once this thread finds no free slot. Kept per thread, so
+/// another thread's sync can never consume it before this thread's write.
+threadlocal var touched_overflow: bool = false;
 var next_handle_id: std.atomic.Value(u64) = .init(1);
 
 fn touchedSlot(id: u64, create: bool) ?*Touched {
@@ -152,9 +155,6 @@ pub fn Store(comptime flavor: Flavor) type {
         lock_file: Io.File,
         /// Unique per open handle; keys this handle's touched-shard bits.
         id: u64,
-        /// Set when this thread-local bookkeeping overflowed: the next
-        /// `sync` covers every shard.
-        sync_everything: std.atomic.Value(bool) = .init(false),
         /// v3: batches that span streams are journaled here first.
         journal: if (flavor == .v3) *Journal else void,
 
@@ -214,10 +214,7 @@ pub fn Store(comptime flavor: Flavor) type {
             var buf: [8]u8 = undefined;
             _ = dir.readFile(io, "FORMAT", &buf) catch |err| switch (err) {
                 error.FileNotFound => {
-                    const f = try dir.createFile(io, "FORMAT", .{});
-                    defer f.close(io);
-                    try f.writePositionalAll(io, format_text, 0);
-                    try f.sync(io);
+                    try writeFileAtomic(io, dir, "FORMAT", format_text);
                     return;
                 },
                 else => |e| return e,
@@ -239,11 +236,8 @@ pub fn Store(comptime flavor: Flavor) type {
                 .v2 => 1,
                 .v3 => options.shards orelse @max(1, @min(max_shards, std.Thread.getCpuCount() catch 4)),
             };
-            const f = try dir.createFile(io, "SHARDS", .{});
-            defer f.close(io);
             const text = std.fmt.bufPrint(&buf, "{d}\n", .{n}) catch unreachable;
-            try f.writePositionalAll(io, text, 0);
-            try f.sync(io);
+            try writeFileAtomic(io, dir, "SHARDS", text);
             return n;
         }
 
@@ -682,10 +676,9 @@ pub fn Store(comptime flavor: Flavor) type {
         /// wrote to). Writes from other threads are covered by their own
         /// `sync`, or by `syncAll`.
         pub fn sync(self: *Self) !void {
-            if (self.sync_everything.swap(false, .acq_rel)) {
-                errdefer self.sync_everything.store(true, .release);
-                return self.syncAll();
-            }
+            // This thread wrote through more handles than it can track:
+            // every sync from it covers every shard from now on.
+            if (touched_overflow) return self.syncAll();
             const t = touchedSlot(self.id, false) orelse return;
             for (self.shards, 0..) |sh, i| {
                 const bit = @as(u32, 1) << @intCast(i);
@@ -708,7 +701,7 @@ pub fn Store(comptime flavor: Flavor) type {
             const i = std.mem.indexOfScalar(*Shard, self.shards, sh).?;
             if (touchedSlot(self.id, true)) |t| {
                 t.mask |= @as(u32, 1) << @intCast(i);
-            } else self.sync_everything.store(true, .release);
+            } else touched_overflow = true;
         }
 
         /// Rewrites every stream into a single run.
@@ -857,6 +850,26 @@ pub fn freePairs(gpa: Allocator, pairs: []const Pair) void {
         gpa.free(p.value);
     }
     gpa.free(pairs);
+}
+
+/// Writes a small file so that a crash leaves either no file or the whole
+/// one: write a temporary file, sync it, rename it into place, sync the
+/// directory.
+fn writeFileAtomic(io: Io, dir: Io.Dir, name: []const u8, text: []const u8) !void {
+    var tmp_buf: [32]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{name}) catch unreachable;
+    {
+        const f = try dir.createFile(io, tmp, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, text, 0);
+        try f.sync(io);
+    }
+    try dir.rename(tmp, dir, name, io);
+    if (@import("builtin").os.tag != .windows) {
+        const d = try dir.openFile(io, ".", .{});
+        defer d.close(io);
+        try d.sync(io);
+    }
 }
 
 /// Which engine made the store at `sub_path`, or null when it is not a
