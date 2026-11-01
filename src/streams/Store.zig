@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const shard = @import("Shard.zig");
 const Journal = @import("Journal.zig");
 const chunk = @import("chunk.zig");
+const segment = @import("../segment.zig");
 
 pub const Pair = shard.Pair;
 pub const Range = shard.Range;
@@ -53,9 +54,16 @@ pub fn freeStreams(gpa: Allocator, list: []StreamInfo) void {
 }
 
 pub const Problem = struct {
+    kind: enum {
+        /// A chunk's metadata or a block failed its hash.
+        damaged_chunk,
+        /// At open, a stream's page ended in a record with a bad checksum
+        /// and was cut there: a write torn by a crash, or damage.
+        torn_tail,
+    } = .damaged_chunk,
     shard: usize,
     stream: []u8,
-    chunk_offset: u64,
+    chunk_offset: u64 = 0,
 };
 
 pub const VerifyReport = struct {
@@ -159,7 +167,7 @@ pub fn Store(comptime flavor: Flavor) type {
         journal: if (flavor == .v3) *Journal else void,
 
         pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !*Self {
-            var dir = try parent.createDirPathOpen(io, sub_path, .{});
+            var dir = try parent.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
             defer dir.close(io);
             // One process at a time, taken before reading or creating any
             // store-level file.
@@ -210,6 +218,9 @@ pub fn Store(comptime flavor: Flavor) type {
         fn checkFormat(io: Io, dir: Io.Dir) !void {
             if (try detectIn(io, dir)) |f| {
                 if (f != flavor) return error.WrongEngine;
+            } else if (try holdsV1(io, dir)) {
+                // A v1 database: don't start a stream store beside it.
+                return error.WrongEngine;
             }
             var buf: [8]u8 = undefined;
             _ = dir.readFile(io, "FORMAT", &buf) catch |err| switch (err) {
@@ -256,7 +267,9 @@ pub fn Store(comptime flavor: Flavor) type {
                     try self.shards[op.shard].replayJournalOp(op.key, op.value, op.seq, @fromBackingInt(op.kind));
                 }
             }
-            for (self.shards) |sh| try sh.sync();
+            // Write every recovered tail out, even where the shard's
+            // sequence didn't move, before the journal copy goes away.
+            for (self.shards) |sh| try sh.checkpointNow();
             try j.reset();
         }
 
@@ -444,7 +457,10 @@ pub fn Store(comptime flavor: Flavor) type {
         pub fn getMany(self: *Self, gpa: Allocator, keys: []const []const u8) ![]?[]u8 {
             const out = try gpa.alloc(?[]u8, keys.len);
             var done: usize = 0;
-            errdefer freeMany(gpa, out[0..done]);
+            errdefer {
+                for (out[0..done]) |v| if (v) |x| gpa.free(x);
+                gpa.free(out);
+            }
             for (keys, out) |k, *o| {
                 o.* = try self.get(gpa, k);
                 done += 1;
@@ -541,6 +557,11 @@ pub fn Store(comptime flavor: Flavor) type {
             for (self.shards, 0..) |sh, si| {
                 sh.lock.lockSharedUncancelable(self.io);
                 defer sh.lock.unlockShared(self.io);
+                for (sh.torn_tails.items) |n| {
+                    const name = try gpa.dupe(u8, n);
+                    errdefer gpa.free(name);
+                    try report.problems.append(gpa, .{ .kind = .torn_tail, .shard = si, .stream = name });
+                }
                 var it = sh.streams.valueIterator();
                 while (it.next()) |p| {
                     const st = p.*;
@@ -881,6 +902,15 @@ pub fn detect(io: Io, parent: Io.Dir, sub_path: []const u8) !?Flavor {
     };
     defer dir.close(io);
     return detectIn(io, dir);
+}
+
+/// Whether `dir` holds v1 segment files.
+fn holdsV1(io: Io, dir: Io.Dir) !bool {
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind == .file and segment.parseFileName(e.name) != null) return true;
+    }
+    return false;
 }
 
 fn detectIn(io: Io, dir: Io.Dir) !?Flavor {
@@ -1438,4 +1468,70 @@ test "a v2 batch is all or nothing after a crash" {
     defer db.close();
     try expectValue(db, "a/1/k", "A");
     try expectValue(db, "b/2/k", "B");
+}
+
+test "an expired replacement never uncovers the value it replaced" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = 1 });
+    defer db.close();
+    db.setClockForTest(1000);
+    try db.put("e/1/k", "old");
+    const snap = try db.snapshot();
+    try db.putTtl("e/1/k", "new", 10);
+    db.setClockForTest(2000);
+    db.release(snap);
+    try db.checkpoint();
+    try db.compact();
+    try expectValue(db, "e/1/k", null);
+}
+
+test "check reports a v3 page cut off at open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var page_off: u64 = 0;
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = true, .shards = 1 });
+        defer db.close();
+        try db.put("p/1/a", "first");
+        try db.put("p/1/b", "second");
+        page_off = db.shards[0].streams.get("p/1/").?.page_off;
+    }
+    {
+        // Damage the second record's value byte.
+        var dir = try tmp.dir.openDir(io, "db/shard-0", .{});
+        defer dir.close(io);
+        const f = try dir.openFile(io, "data.0", .{ .mode = .read_write });
+        defer f.close(io);
+        const pos = page_off + 19 + 5 + 5 + 19 + 5 + 2;
+        var b: [1]u8 = undefined;
+        _ = try f.readPositionalAll(io, &b, pos);
+        b[0] ^= 0xff;
+        try f.writePositionalAll(io, &b, pos);
+    }
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    try expectValue(db, "p/1/a", "first");
+    var rep = try db.verify(gpa);
+    defer rep.deinit(gpa);
+    try testing.expect(!rep.ok());
+    try testing.expectEqual(.torn_tail, rep.problems.items[0].kind);
+}
+
+test "a stream store refuses a v1 directory" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try @import("../Db.zig").open(gpa, io, tmp.dir, "db", .{});
+        defer db.close();
+        try db.put("k", "v");
+    }
+    try testing.expectError(error.WrongEngine, V3.open(gpa, io, tmp.dir, "db", .{}));
+    try testing.expectError(error.WrongEngine, V2.open(gpa, io, tmp.dir, "db", .{}));
 }

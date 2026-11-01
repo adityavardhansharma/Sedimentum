@@ -240,6 +240,9 @@ pub fn Shard(comptime cfg: Config) type {
         clock_override: ?u64 = null,
         /// Holds a TTL value with its expiry prefix while it is written.
         value_buf: std.ArrayList(u8) = .empty,
+        /// v3: streams whose page ended in a record with a bad checksum at
+        /// open (cut off by recovery).
+        torn_tails: std.ArrayList([]u8) = .empty,
 
         lock: Io.RwLock = .init,
         commit_mutex: Io.Mutex = .init,
@@ -303,7 +306,9 @@ pub fn Shard(comptime cfg: Config) type {
         pub fn close(s: *Self) void {
             s.file_mutex.lockUncancelable(s.io);
             s.lock.lockUncancelable(s.io);
-            if (cfg.wal) {
+            if (s.poisoned) {
+                // Leave the files as they are; recovery rebuilds from them.
+            } else if (cfg.wal) {
                 s.checkpoint() catch {};
             } else {
                 s.writePages(true) catch {};
@@ -353,6 +358,8 @@ pub fn Shard(comptime cfg: Config) type {
             s.man_buf.deinit(gpa);
             s.snaps.deinit(gpa);
             s.value_buf.deinit(gpa);
+            for (s.torn_tails.items) |n| gpa.free(n);
+            s.torn_tails.deinit(gpa);
             s.builder.deinit();
         }
 
@@ -653,6 +660,10 @@ pub fn Shard(comptime cfg: Config) type {
                 if (s.poisoned) return error.Poisoned;
                 for (ops, recs, 0..) |op, *r, i| r.* = walRecord(op, s.seq + 1 + i);
                 try s.wal.appendBatch(recs, locs);
+                // The WAL holds the whole batch now. If applying it fails
+                // part way, memory doesn't match: refuse further writes and
+                // checkpoints; reopening replays the batch from the WAL.
+                errdefer s.poisoned = true;
                 for (ops) |op| try s.writeLocked(op, false);
                 break :blk s.seq;
             };
@@ -788,8 +799,16 @@ pub fn Shard(comptime cfg: Config) type {
             const now_s = s.now();
             var w = s.runWriter();
             errdefer w.discard();
+            // With no snapshot open, only each key's newest version matters:
+            // older ones are dropped with it, so an expired or deleted
+            // newest version can never uncover an older value.
+            const newest_only = !s.snapshotsOpen();
+            var prev: ?[]const u8 = null;
             for (st.idx.items) |off| {
                 const e = st.entry(off);
+                const older = prev != null and std.mem.eql(u8, prev.?, e.key);
+                prev = e.key;
+                if (newest_only and older) continue;
                 if (drop_tombstones and liveValue(e, now_s) == null) continue;
                 try w.add(e);
             }
@@ -1760,6 +1779,9 @@ pub fn Shard(comptime cfg: Config) type {
         /// the manifest durable, then deletes the sealed WAL segments.
         fn checkpoint(s: *Self) !void {
             s.needs_checkpoint = false;
+            // A poisoned shard's memory may lack writes its log or journal
+            // holds; folding memory into chunks would lose them.
+            if (s.poisoned) return error.Poisoned;
             if (!cfg.wal) return s.durablePoint(false);
             var it = s.streams.valueIterator();
             while (it.next()) |p| try s.seal(p.*);
@@ -2110,8 +2132,14 @@ pub fn Shard(comptime cfg: Config) type {
                     const vl = std.mem.readInt(u32, h[15..19], .little);
                     const len = rec_header + @as(usize, kl) + vl;
                     if (len > h.len or kl == 0) break;
-                    if (record.Crc32c.hash(h[4..len]) != std.mem.readInt(u32, h[0..4], .little)) break;
                     const seq = std.mem.readInt(u64, h[4..12], .little);
+                    if (record.Crc32c.hash(h[4..len]) != std.mem.readInt(u32, h[0..4], .little)) {
+                        // A newer-looking record with a bad checksum: a torn
+                        // last write, or damage. Either way it is cut off;
+                        // remember it so `verify` can say so.
+                        if (seq > prev) try s.torn_tails.append(gpa, try gpa.dupe(u8, st.name));
+                        break;
+                    }
                     if (seq <= prev) break;
                     prev = seq;
                     const off: u32 = @intCast(st.buf.items.len);

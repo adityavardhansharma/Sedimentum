@@ -108,13 +108,16 @@ export fn sdm_open_engine(path: ?[*]const u8, path_len: usize, engine: c_int, sy
     ensureIo();
     const io = io_state.io();
     const p = path.?[0..path_len];
-    const which: c_int = if (engine != 0) engine else blk: {
-        const found = streams.detect(io, std.Io.Dir.cwd(), p) catch |err| return fail(err);
-        break :blk if (found) |f| switch (f) {
-            .v2 => 2,
-            .v3 => 3,
-        } else 1;
-    };
+    const found = streams.detect(io, std.Io.Dir.cwd(), p) catch |err| return fail(err);
+    const existing: c_int = if (found) |f| switch (f) {
+        .v2 => 2,
+        .v3 => 3,
+    } else 0;
+    // A stream store asked for as another engine is refused, never opened
+    // as an empty database beside the real one. (v2 and v3 refuse a v1
+    // directory themselves.)
+    if (engine != 0 and existing != 0 and engine != existing) return fail(error.WrongEngine);
+    const which: c_int = if (engine != 0) engine else if (existing != 0) existing else 1;
     if (which == 1) return sdm_open(path, path_len, sync_writes, out);
     const hd = gpa.create(Handle) catch |err| return fail(err);
     const opts: streams.Options = .{ .sync_writes = sync_writes != 0 };

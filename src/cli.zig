@@ -50,7 +50,12 @@ pub fn main(init: std.process.Init) !void {
     const cmd = rest[0];
     const dir = rest[1];
 
-    const found = sdm.streams.detect(io, Io.Dir.cwd(), dir) catch null;
+    const found = sdm.streams.detect(io, Io.Dir.cwd(), dir) catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "sedimentum: cannot tell which engine made {s}: {t}\n", .{ dir, err }) catch "sedimentum: cannot read the store format\n";
+        try Io.File.stderr().writeStreamingAll(io, msg);
+        std.process.exit(1);
+    };
     const which: []const u8 = if (found) |f| @tagName(f) else engine orelse "v1";
     if (engine) |e| if (found != null and !std.mem.eql(u8, e, which)) {
         try Io.File.stderr().writeStreamingAll(io, "sedimentum: the directory holds a different engine\n");
@@ -115,13 +120,13 @@ pub fn main(init: std.process.Init) !void {
         var limit: usize = std.math.maxInt(usize);
         var i: usize = 2;
         while (i < args_v1.len) : (i += 1) {
-            const a = args[i];
+            const a = args_v1[i];
             if (std.mem.eql(u8, a, "-r")) {
                 reverse = true;
             } else if (std.mem.eql(u8, a, "-n")) {
                 if (i + 1 >= args_v1.len) return usageExit(io);
                 i += 1;
-                limit = try std.fmt.parseInt(usize, args[i], 10);
+                limit = try std.fmt.parseInt(usize, args_v1[i], 10);
             } else prefix = a;
         }
         const end_buf = try arena.alloc(u8, prefix.len);
@@ -203,7 +208,10 @@ fn streamMain(comptime S: type, init: std.process.Init, args: []const []const u8
     } else if (std.mem.eql(u8, cmd, "check")) {
         var rep = try db.verify(gpa);
         defer rep.deinit(gpa);
-        for (rep.problems.items) |p| try out.print("shard {d}, stream \"{s}\": damaged chunk at byte {d}\n", .{ p.shard, p.stream, p.chunk_offset });
+        for (rep.problems.items) |p| switch (p.kind) {
+            .damaged_chunk => try out.print("shard {d}, stream \"{s}\": damaged chunk at byte {d}\n", .{ p.shard, p.stream, p.chunk_offset }),
+            .torn_tail => try out.print("shard {d}, stream \"{s}\": its newest record had a bad checksum and was cut off at open (a torn write or damage)\n", .{ p.shard, p.stream }),
+        };
         if (rep.ok()) {
             try out.print("ok: {d} chunks ({d} blocks, {d} bytes) verified\n", .{ rep.chunks, rep.blocks, rep.bytes });
         } else {
