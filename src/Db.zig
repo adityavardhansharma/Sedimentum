@@ -1023,6 +1023,13 @@ pub fn spill(db: *Db) !bool {
     if (db.snapshots.items.len > 0) return false;
     const through = db.log.active_id - 1;
     if (through == 0) return false;
+    // Rewriting the cold index is only worth it if something leaves memory.
+    var movable: usize = 0;
+    var scan = db.index.first();
+    while (scan.valid()) : (scan.next()) {
+        if (scan.valuePtr().segment <= through) movable += 1;
+    }
+    if (movable == 0) return false;
     const gpa = db.gpa;
     const io = db.log.io;
     const now_s = db.now();
