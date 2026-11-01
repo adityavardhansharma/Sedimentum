@@ -647,7 +647,7 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
     // Ceiling and cost of not having an index: read every memory and score
     // it exactly, for a handful of questions.
     {
-        const sample = 10;
+        const sample: u64 = if (n > 2_000_000) 3 else 10;
         phaseStart("baseline_full_scan", sample);
         var lat: Lat = .{};
         defer lat.ns.deinit(driver);

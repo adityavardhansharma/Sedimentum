@@ -521,8 +521,23 @@ fn sealPage(h: *Holo) !void {
 
 // ---------------------------------------------------------------- values
 
-fn memKey(buf: *[24]u8, id: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "~m/{x:0>6}/{x:0>8}", .{ id >> 12, id }) catch unreachable;
+/// Memories are keyed by id, in blocks of 65536 ids. Each block is split
+/// into 8 lanes (streams) by scope, so one chat's writes share a sync and
+/// different chats spread over the store's shards and sync in parallel.
+const lanes = 8;
+const block_shift = 16;
+
+fn laneOf(scope: u32) u32 {
+    return scope % lanes;
+}
+
+fn memKey(buf: *[24]u8, id: u32, lane: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "~m/{x:0>4}{x}/{x:0>8}", .{ id >> block_shift, lane, id }) catch unreachable;
+}
+
+/// Store key of a memory, from its row.
+fn keyOf(h: *const Holo, buf: *[24]u8, id: u32) []const u8 {
+    return memKey(buf, id, laneOf(h.row(id).scope));
 }
 
 fn opKey(buf: *[32]u8, seq: u64) []const u8 {
@@ -582,13 +597,13 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
         h.lock.unlock(h.io);
         return e;
     };
-    // The put happens under the lock so ids reach the store in order;
-    // durable writes wait for their sync (group commit) after unlocking.
-    var kb: [24]u8 = undefined;
     const want_ckpt = h.count - h.ckpt_count >= checkpoint_every;
-    const put_err = h.kv.put(memKey(&kb, id), value);
+    var kb: [24]u8 = undefined;
+    const key = h.keyOf(&kb, id);
     h.lock.unlock(h.io);
-    try put_err;
+    // Text goes to the store outside the lock, so writers run in parallel.
+    // A reader that finds a row before its text simply skips it.
+    try h.kv.put(key, value);
     if (h.options.sync_writes) try h.kv.sync();
     if (want_ckpt) try h.checkpoint();
     return id;
@@ -623,7 +638,7 @@ fn forgetLocked(h: *Holo, id: u32) !void {
     if (h.forgotten.get(id)) return;
     h.forgotten.set(id);
     var kb: [24]u8 = undefined;
-    try h.kv.delete(memKey(&kb, id));
+    try h.kv.delete(h.keyOf(&kb, id));
 }
 
 /// Forgets every memory in a scope and below it. Returns how many.
@@ -683,7 +698,13 @@ fn sinkLocked(h: *Holo, summary_id: u32) void {
 /// One memory by id, or null if it was forgotten.
 pub fn get(h: *Holo, gpa: Allocator, id: u32) !?Memory {
     var kb: [24]u8 = undefined;
-    const raw = (try h.kv.get(gpa, memKey(&kb, id))) orelse return null;
+    const key = blk: {
+        h.lock.lockSharedUncancelable(h.io);
+        defer h.lock.unlockShared(h.io);
+        if (id >= h.count) return null;
+        break :blk h.keyOf(&kb, id);
+    };
+    const raw = (try h.kv.get(gpa, key)) orelse return null;
     errdefer gpa.free(raw);
     return try decodeValue(id, raw);
 }
@@ -1037,7 +1058,7 @@ fn subjBoost(r: *const Row) f32 {
 pub fn brief(h: *Holo, gpa: Allocator, situation: []const u8, scope: []const u8, budget: usize) !Brief {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    const hits = try h.recall(gpa, .{ .about = situation, .scope = scope, .limit = 24 });
+    const hits = try h.recall(gpa, .{ .about = situation, .scope = scope, .limit = 16 });
     defer freeHits(gpa, hits);
     const rec = if (h.isExactScope(scope)) try h.recent(gpa, scope, 6) else try gpa.alloc(Memory, 0);
     defer freeMemories(gpa, rec);
@@ -1293,22 +1314,52 @@ fn loadCheckpoint(h: *Holo) !void {
 fn replay(h: *Holo) !bool {
     const gpa = h.gpa;
     var changed = false;
-    var sk: [24]u8 = undefined;
-    const start = memKey(&sk, h.count);
+    // Walk the id blocks from the one holding `count`; within a block the
+    // lanes interleave, so sort each block by id before applying it.
+    var sk: [16]u8 = undefined;
+    const start = std.fmt.bufPrint(&sk, "~m/{x:0>4}", .{h.count >> block_shift}) catch unreachable;
     var it = try h.kv.iterator(.{ .start = start, .end = "~m0" }, null);
     defer it.deinit();
-    while (try it.next()) |p| {
-        const slash = std.mem.lastIndexOfScalar(u8, p.key, '/') orelse return error.Corrupt;
-        const id = std.fmt.parseInt(u32, p.key[slash + 1 ..], 16) catch return error.Corrupt;
+    const Pending = struct { id: u32, value: []u8 };
+    var block: std.ArrayList(Pending) = .empty;
+    defer {
+        for (block.items) |x| gpa.free(x.value);
+        block.deinit(gpa);
+    }
+    var block_no: u32 = none;
+    while (true) {
+        const next = try it.next();
+        var id: u32 = 0;
+        if (next) |p| {
+            const slash = std.mem.lastIndexOfScalar(u8, p.key, '/') orelse return error.Corrupt;
+            id = std.fmt.parseInt(u32, p.key[slash + 1 ..], 16) catch return error.Corrupt;
+        }
+        if (next == null or (id >> block_shift) != block_no) {
+            std.mem.sortUnstable(Pending, block.items, {}, struct {
+                fn lt(_: void, a: Pending, b: Pending) bool {
+                    return a.id < b.id;
+                }
+            }.lt);
+            for (block.items) |x| {
+                if (x.id < h.count) continue;
+                while (h.count < x.id) try h.placeholder();
+                const m = try decodeValue(x.id, x.value);
+                var ts: text.TermSet = .{};
+                ts.fill(m.text);
+                _ = try h.applyRow(m.scope, m.subject, m.time, m.text, &ts);
+                changed = true;
+            }
+            for (block.items) |x| gpa.free(x.value);
+            block.clearRetainingCapacity();
+            const p = next orelse break;
+            block_no = id >> block_shift;
+            _ = p;
+        }
+        const p = next.?;
         if (id < h.count) continue;
-        while (h.count < id) try h.placeholder();
         const copy = try gpa.dupe(u8, p.value);
-        defer gpa.free(copy);
-        const m = try decodeValue(id, copy);
-        var ts: text.TermSet = .{};
-        ts.fill(m.text);
-        _ = try h.applyRow(m.scope, m.subject, m.time, m.text, &ts);
-        changed = true;
+        errdefer gpa.free(copy);
+        try block.append(gpa, .{ .id = id, .value = copy });
     }
     var ok: [32]u8 = undefined;
     const ostart = opKey(&ok, h.ops_seq + 1);
