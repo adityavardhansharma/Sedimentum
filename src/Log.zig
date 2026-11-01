@@ -203,6 +203,19 @@ fn replaySegment(log: *Log, file: Io.File, id: u64, is_active: bool, visitor: an
         // Compaction copies live records forward with their original
         // sequence numbers, so file order is not sequence order.
         log.last_seq = @max(log.last_seq, item.record.seq);
+        if (item.record.kind == .batch) {
+            const body_offset = item.offset + record.header_len + 4;
+            var ops = record.BatchIterator.init(item.record);
+            while (try ops.next()) |op| {
+                log.last_seq = @max(log.last_seq, op.record.seq);
+                try visitor.onRecord(Location{
+                    .segment = id,
+                    .offset = body_offset + op.offset,
+                    .len = @intCast(op.bytes.len),
+                }, op.record);
+            }
+            continue;
+        }
         try visitor.onRecord(Location{
             .segment = id,
             .offset = item.offset,
@@ -253,16 +266,59 @@ pub fn append(log: *Log, rec: record.Record) !Location {
     return loc;
 }
 
-/// Appends an already encoded, already verified record unchanged. Used by
-/// compaction to move live records out of old segments.
-pub fn appendRaw(log: *Log, bytes: []const u8) !Location {
+/// Appends several records as one batch that recovery applies entirely or
+/// not at all. Sequence numbers must increase. Writes each record's
+/// location to `locs`.
+pub fn appendBatch(log: *Log, recs: []const record.Record, locs: []Location) !void {
+    std.debug.assert(recs.len == locs.len and recs.len > 0);
     if (log.poisoned) return error.Poisoned;
-    if (log.active_end > 0 and log.active_end + bytes.len > log.options.segment_bytes) {
+    var body_len: usize = 0;
+    var prev_seq = log.last_seq;
+    for (recs) |rec| {
+        try record.validate(rec);
+        if (rec.seq <= prev_seq) return error.SequenceNotIncreasing;
+        prev_seq = rec.seq;
+        body_len += record.encodedLen(rec);
+    }
+    if (body_len > record.max_value_len) return error.BatchTooLarge;
+    const total = record.header_len + 4 + body_len;
+    if (log.active_end > 0 and log.active_end + total > log.options.segment_bytes) {
         try log.rollover();
     }
-    try log.wbuf.appendSlice(log.gpa, bytes);
-    const loc: Location = .{ .segment = log.active_id, .offset = log.active_end, .len = @intCast(bytes.len) };
-    log.active_end += bytes.len;
+
+    const start = log.wbuf.items.len;
+    try log.wbuf.resize(log.gpa, start + total);
+    const out = log.wbuf.items[start..];
+    std.mem.writeInt(u32, out[record.header_len..][0..4], @intCast(recs.len), .little);
+    var pos: usize = record.header_len + 4;
+    for (recs, locs) |rec, *loc| {
+        const len = record.encodedLen(rec);
+        var inner = rec;
+        inner.kind = record.inBatch(rec.kind);
+        record.encode(out[pos..][0..len], inner);
+        loc.* = .{ .segment = log.active_id, .offset = log.active_end + pos, .len = @intCast(len) };
+        pos += len;
+    }
+    record.finish(out, prev_seq, .batch, 4, @intCast(body_len));
+
+    log.active_end += total;
+    log.last_seq = prev_seq;
+    if (log.wbuf.items.len >= log.options.write_buffer_bytes) try log.flush();
+}
+
+/// Appends a copy of an existing record with its original sequence number.
+/// Used by compaction to move live records out of old segments.
+pub fn appendCopy(log: *Log, rec: record.Record) !Location {
+    if (log.poisoned) return error.Poisoned;
+    const len = record.encodedLen(rec);
+    if (log.active_end > 0 and log.active_end + len > log.options.segment_bytes) {
+        try log.rollover();
+    }
+    const start = log.wbuf.items.len;
+    try log.wbuf.resize(log.gpa, start + len);
+    record.encode(log.wbuf.items[start..], rec);
+    const loc: Location = .{ .segment = log.active_id, .offset = log.active_end, .len = @intCast(len) };
+    log.active_end += len;
     if (log.wbuf.items.len >= log.options.write_buffer_bytes) try log.flush();
     return loc;
 }
@@ -355,7 +411,8 @@ pub fn read(log: *const Log, loc: Location, buf: []u8) !record.Record {
 fn verify(full: []const u8) !record.Record {
     if (full.len < record.header_len) return error.Corrupt;
     const h = record.decodeHeader(full[0..record.header_len]);
-    if (!h.isPlausible() or h.totalLen() != full.len or !record.checksumMatches(h, full)) {
+    const plausible = h.isPlausible() or h.isPlausibleInBatch();
+    if (!plausible or h.totalLen() != full.len or !record.checksumMatches(h, full)) {
         return error.Corrupt;
     }
     return record.view(h, full);
@@ -607,4 +664,56 @@ test "buffered, flushed and mapped reads all see the same records" {
         try testing.expectEqualStrings(want, rec.key);
         if (try log.view(loc)) |v| try testing.expectEqualStrings(want, v.key);
     }
+}
+
+test "batches replay as their individual records" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var locs: [3]Location = undefined;
+    {
+        var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, NoVisitor{});
+        defer log.close();
+        _ = try log.append(.{ .seq = 1, .kind = .put, .key = "x", .value = "0" });
+        try log.appendBatch(&.{
+            .{ .seq = 2, .kind = .put, .key = "a", .value = "1" },
+            .{ .seq = 3, .kind = .delete, .key = "x" },
+            .{ .seq = 4, .kind = .put, .key = "b", .value = "2" },
+        }, &locs);
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings("b", (try log.read(locs[2], &buf)).key);
+        try log.sync();
+    }
+    var c: Collector = .{};
+    defer c.deinit();
+    var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, &c);
+    defer log.close();
+    try testing.expectEqual(@as(usize, 4), c.keys.items.len);
+    try testing.expectEqualSlices(Location, &locs, c.locs.items[1..]);
+    try testing.expectEqual(@as(u64, 4), log.last_seq);
+}
+
+test "a torn batch is dropped as a whole" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, NoVisitor{});
+        defer log.close();
+        _ = try log.append(.{ .seq = 1, .kind = .put, .key = "x", .value = "0" });
+        var locs: [2]Location = undefined;
+        try log.appendBatch(&.{
+            .{ .seq = 2, .kind = .put, .key = "a", .value = "1" },
+            .{ .seq = 3, .kind = .put, .key = "b", .value = "2" },
+        }, &locs);
+        try log.sync();
+        // Cut the batch in the middle of its second operation.
+        try log.active.setLength(io, log.active_end - 5);
+    }
+    var c: Collector = .{};
+    defer c.deinit();
+    var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, &c);
+    defer log.close();
+    try testing.expectEqual(@as(usize, 1), c.keys.items.len);
+    try testing.expectEqual(@as(u64, 1), log.last_seq);
 }

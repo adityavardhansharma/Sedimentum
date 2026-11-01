@@ -138,12 +138,108 @@ fn commit(s: *Shared, seq: u64) !void {
 pub fn get(s: *Shared, gpa: Allocator, key: []const u8) !?[]u8 {
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
-    const e = s.db.index.get(key) orelse return null;
+    const e = s.db.lookup(key) orelse return null;
+    return try s.copyValue(gpa, e.*);
+}
+
+/// Reads a value without touching `Db`'s shared scratch buffer, so it is
+/// safe under the shared lock.
+fn copyValue(s: *Shared, gpa: Allocator, e: Db.Entry) ![]u8 {
     if (try s.db.log.view(e.location())) |rec| return try gpa.dupe(u8, rec.value);
     const buf = try gpa.alloc(u8, e.len);
     defer gpa.free(buf);
     const rec = try s.db.log.read(e.location(), buf);
     return try gpa.dupe(u8, rec.value);
+}
+
+/// Applies `ops` atomically. See `Db.write`.
+pub fn write(s: *Shared, ops: []const Db.Op) !void {
+    var rolled = false;
+    const seq = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const before = s.db.log.segments.items.len;
+        try s.db.writeBuffered(ops);
+        rolled = s.db.log.segments.items.len > before;
+        break :blk s.db.lastSeq();
+    };
+    if (s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
+}
+
+/// Compare-and-swap. See `Db.putIf`. The check and the write happen under
+/// one lock, so concurrent callers can't both win.
+pub fn putIf(s: *Shared, key: []const u8, value: []const u8, expect: Db.Expect) !void {
+    var rolled = false;
+    const seq = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const current = s.db.seqOf(key);
+        const ok = switch (expect) {
+            .absent => current == null,
+            .seq => |want| current != null and current.? == want,
+        };
+        if (!ok) return error.Conflict;
+        const before = s.db.log.segments.items.len;
+        try s.db.putBuffered(key, value);
+        rolled = s.db.log.segments.items.len > before;
+        break :blk s.db.lastSeq();
+    };
+    if (s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
+}
+
+pub fn seqOf(s: *Shared, key: []const u8) ?u64 {
+    s.lock.lockSharedUncancelable(s.io);
+    defer s.lock.unlockShared(s.io);
+    return s.db.seqOf(key);
+}
+
+pub fn snapshot(s: *Shared) !Db.Snapshot {
+    s.lock.lockUncancelable(s.io);
+    defer s.lock.unlock(s.io);
+    return s.db.snapshot();
+}
+
+pub fn release(s: *Shared, snap: Db.Snapshot) void {
+    s.lock.lockUncancelable(s.io);
+    defer s.lock.unlock(s.io);
+    s.db.release(snap);
+}
+
+/// The value of `key` as of `snap`, copied for the caller.
+pub fn getAt(s: *Shared, gpa: Allocator, snap: Db.Snapshot, key: []const u8) !?[]u8 {
+    s.lock.lockSharedUncancelable(s.io);
+    defer s.lock.unlockShared(s.io);
+    const e = s.db.index.getPtr(key) orelse return null;
+    var v: ?*const Db.Entry = e;
+    while (v) |cur| : (v = cur.older) {
+        if (cur.seq <= snap.seq) {
+            if (cur.deleted) return null;
+            return try s.copyValue(gpa, cur.*);
+        }
+    }
+    return null;
+}
+
+/// Copies up to `limit` pairs from `range`, at `snap` if given. Free the
+/// result with `Db.freePairs`.
+pub fn scan(s: *Shared, gpa: Allocator, range: Db.Range, snap: ?Db.Snapshot, limit: usize) ![]Db.Pair {
+    // Iteration may fall back to Db's scratch buffer when mmap is off, so
+    // take the exclusive lock in that case.
+    const exclusive = !s.db.options.log.mmap;
+    if (exclusive) s.lock.lockUncancelable(s.io) else s.lock.lockSharedUncancelable(s.io);
+    defer if (exclusive) s.lock.unlock(s.io) else s.lock.unlockShared(s.io);
+    var it = s.db.iterator(range);
+    if (snap) |sn| it.at = sn.seq;
+    return Db.collect(gpa, &it, limit);
+}
+
+/// The newest `n` entries under `prefix`. See `Db.latest`.
+pub fn latest(s: *Shared, gpa: Allocator, prefix: []const u8, n: usize) ![]Db.Pair {
+    const end_buf = try gpa.alloc(u8, prefix.len);
+    defer gpa.free(end_buf);
+    return s.scan(gpa, Db.prefixRange(prefix, true, end_buf), null, n);
 }
 
 pub fn contains(s: *Shared, key: []const u8) bool {
@@ -202,4 +298,73 @@ test "concurrent durable writers share fsyncs and lose nothing" {
     const v = (try s.get(testing.allocator, "w3/000049")).?;
     defer testing.allocator.free(v);
     try testing.expectEqualStrings("w3/000049", v);
+}
+
+const Incrementer = struct {
+    fn run(s: *Shared, n: usize, failed: *std.atomic.Value(bool)) void {
+        var buf: [32]u8 = undefined;
+        var done: usize = 0;
+        while (done < n) {
+            const cur = s.get(testing.allocator, "counter") catch return failed.store(true, .seq_cst);
+            const value: u64 = if (cur) |c| std.fmt.parseInt(u64, c, 10) catch 0 else 0;
+            if (cur) |c| testing.allocator.free(c);
+            const expect: Db.Expect = if (s.seqOf("counter")) |sq| .{ .seq = sq } else .absent;
+            // Re-read under the expectation: a stale value fails the swap.
+            const fresh = s.get(testing.allocator, "counter") catch return failed.store(true, .seq_cst);
+            const fresh_value: u64 = if (fresh) |c| std.fmt.parseInt(u64, c, 10) catch 0 else 0;
+            if (fresh) |c| testing.allocator.free(c);
+            if (fresh_value != value) continue;
+            const next = std.fmt.bufPrint(&buf, "{d}", .{value + 1}) catch unreachable;
+            s.putIf("counter", next, expect) catch |err| switch (err) {
+                error.Conflict => continue,
+                else => return failed.store(true, .seq_cst),
+            };
+            done += 1;
+        }
+    }
+};
+
+test "compare-and-swap counter under contention" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const s = try Shared.open(testing.allocator, io, tmp.dir, "db", .{ .sync_writes = false });
+    defer s.close();
+
+    var failed: std.atomic.Value(bool) = .init(false);
+    var handles: [4]std.Thread = undefined;
+    for (&handles) |*h| h.* = try std.Thread.spawn(.{}, Incrementer.run, .{ s, 200, &failed });
+    for (handles) |h| h.join();
+    try testing.expect(!failed.load(.seq_cst));
+    const v = (try s.get(testing.allocator, "counter")).?;
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("800", v);
+}
+
+test "shared snapshot and latest" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const s = try Shared.open(testing.allocator, io, tmp.dir, "db", .{ .sync_writes = false });
+    defer s.close();
+    try s.put("m/1", "one");
+    try s.put("m/2", "two");
+    const snap = try s.snapshot();
+    try s.put("m/3", "three");
+    _ = try s.delete("m/1");
+
+    const now = try s.latest(testing.allocator, "m/", 10);
+    defer Db.freePairs(testing.allocator, now);
+    try testing.expectEqual(@as(usize, 2), now.len);
+    try testing.expectEqualStrings("m/3", now[0].key);
+
+    const then = try s.scan(testing.allocator, .{}, snap, 10);
+    defer Db.freePairs(testing.allocator, then);
+    try testing.expectEqual(@as(usize, 2), then.len);
+    try testing.expectEqualStrings("one", then[0].value);
+
+    const old = (try s.getAt(testing.allocator, snap, "m/1")).?;
+    defer testing.allocator.free(old);
+    try testing.expectEqualStrings("one", old);
+    s.release(snap);
 }
