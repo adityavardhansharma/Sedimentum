@@ -40,6 +40,8 @@ pub const Config = struct {
     fmt: chunk.Format,
     chunk_target: usize,
     fanout: usize = 8,
+    /// Tails of all streams in a shard share this much RAM.
+    tail_budget: usize = 16 * 1024 * 1024,
 };
 
 pub const Pair = struct { key: []const u8, value: []const u8 };
@@ -107,8 +109,6 @@ pub fn Shard(comptime cfg: Config) type {
             chunks: std.ArrayList(ChunkMeta) = .empty,
             tier: u8 = 0,
             bytes: u64 = 0,
-            /// No shadowed versions or tombstones inside (not persisted).
-            clean: bool = false,
 
             fn first(r: *const Run) []const u8 {
                 return r.chunks.items[0].first;
@@ -193,10 +193,16 @@ pub fn Shard(comptime cfg: Config) type {
         /// Streams with a name, sorted by name. Their key ranges never overlap.
         named: std.ArrayList(*Stream) = .empty,
         dirty: std.ArrayList(*Stream) = .empty,
+        /// RAM held by all tail buffers.
+        tail_bytes: usize = 0,
         seq: u64 = 0,
         snaps: std.ArrayList(u64) = .empty,
         wal: if (cfg.wal) Log else void = undefined,
         needs_checkpoint: bool = false,
+        /// Data file generation; compaction moves to the next one.
+        gen: u64 = 0,
+        /// Set when memory and disk may disagree. Writes are refused.
+        poisoned: bool = false,
         builder: chunk.Builder,
         stats: Stats = .{},
 
@@ -217,12 +223,8 @@ pub fn Shard(comptime cfg: Config) type {
                 else => |e| return e,
             };
             errdefer lock_file.close(io);
-            const data = try dir.createFile(io, "data", .{ .read = true, .truncate = false });
-            errdefer data.close(io);
             const manifest = try dir.createFile(io, "MANIFEST", .{ .read = true, .truncate = false });
             errdefer manifest.close(io);
-            const map = try std.posix.mmap(null, map_reserve, .{ .READ = true }, .{ .TYPE = .SHARED }, data.handle, 0);
-            errdefer std.posix.munmap(map);
 
             const s = try gpa.create(Self);
             errdefer gpa.destroy(s);
@@ -232,14 +234,21 @@ pub fn Shard(comptime cfg: Config) type {
                 .sync_writes = sync_writes,
                 .dir = dir,
                 .lock_file = lock_file,
-                .data = data,
-                .map = map,
+                .data = undefined,
+                .map = undefined,
                 .manifest = manifest,
                 .builder = chunk.Builder.init(gpa, cfg.fmt),
             };
             errdefer s.freeMemory();
-            s.data_end = try data.length(io);
+            // The manifest names the data file generation to use.
             try s.replayManifest();
+            var name_buf: [32]u8 = undefined;
+            s.data = try dir.createFile(io, dataName(&name_buf, s.gen), .{ .read = true, .truncate = false });
+            errdefer s.data.close(io);
+            s.map = try mapData(s.data);
+            errdefer std.posix.munmap(s.map);
+            s.data_end = try s.data.length(io);
+            s.removeOtherGenerations();
             try s.rebuildFreeList();
             if (cfg.wal) {
                 var replay: WalReplay = .{ .s = s };
@@ -311,6 +320,32 @@ pub fn Shard(comptime cfg: Config) type {
             s.builder.deinit();
         }
 
+        fn dataName(buf: *[32]u8, gen: u64) []const u8 {
+            return std.fmt.bufPrint(buf, "data.{d}", .{gen}) catch unreachable;
+        }
+
+        fn mapData(file: Io.File) ![]align(page_align) const u8 {
+            return std.posix.mmap(null, map_reserve, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        }
+
+        /// Deletes data files left by a compaction that crashed or finished.
+        fn removeOtherGenerations(s: *Self) void {
+            var it = s.dir.iterate();
+            var names: std.ArrayList([]u8) = .empty;
+            defer {
+                for (names.items) |n| s.gpa.free(n);
+                names.deinit(s.gpa);
+            }
+            while (it.next(s.io) catch null) |e| {
+                if (e.kind != .file or !std.mem.startsWith(u8, e.name, "data.")) continue;
+                const g = std.fmt.parseInt(u64, e.name["data.".len..], 10) catch continue;
+                if (g == s.gen) continue;
+                const n = s.gpa.dupe(u8, e.name) catch continue;
+                names.append(s.gpa, n) catch s.gpa.free(n);
+            }
+            for (names.items) |n| s.dir.deleteFile(s.io, n) catch {};
+        }
+
         fn freeRun(gpa: Allocator, r: *Run) void {
             for (r.chunks.items) |*c| c.deinit(gpa);
             r.chunks.deinit(gpa);
@@ -347,7 +382,6 @@ pub fn Shard(comptime cfg: Config) type {
                 // v3: every stream gets a page, aligned so in-place writes
                 // don't straddle more disk pages than needed.
                 st.page_off = s.allocPage();
-                try st.buf.ensureTotalCapacity(gpa, 1024);
             }
             if (log_it) try s.manStreamNew(st);
             return st;
@@ -437,8 +471,10 @@ pub fn Shard(comptime cfg: Config) type {
                 }
             }.lt);
             var end: u64 = 0;
+            const file_len = s.data_end;
             for (used.items) |u| {
                 if (u.off < end) return error.Corrupt; // Two owners for one byte.
+                if (cfg.wal and u.off + u.len > std.mem.alignForward(u64, file_len, alloc_align)) return error.Corrupt;
                 if (u.off > end) try s.free.append(gpa, .{ .off = end, .len = u.off - end });
                 end = u.off + u.len;
             }
@@ -496,6 +532,7 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         fn writeLocked(s: *Self, key: []const u8, value: []const u8, kind: chunk.Kind) !void {
+            if (s.poisoned) return error.Poisoned;
             const st = try s.streamFor(key);
             const seq = s.seq + 1;
             if (cfg.wal) _ = try s.wal.append(.{ .seq = seq, .kind = if (kind == .put) .put else .delete, .key = key, .value = value });
@@ -522,9 +559,15 @@ pub fn Shard(comptime cfg: Config) type {
                 return;
             }
             if (st.buf.items.len + len > cfg.tail_limit) try s.seal(st);
+            // Over the shared tail budget: seal this stream early, unless
+            // its tail is tiny (then others hold the memory and will seal
+            // when they are written to).
+            if (s.tail_bytes > cfg.tail_budget and st.buf.items.len >= 4096) try s.seal(st);
             const gpa = s.gpa;
             const off: u32 = @intCast(st.buf.items.len);
+            const cap_before = st.buf.capacity;
             const h = try st.buf.addManyAsSlice(gpa, len);
+            s.tail_bytes += st.buf.capacity - cap_before;
             std.mem.writeInt(u64, h[4..12], seq, .little);
             h[12] = @intFromEnum(kind);
             std.mem.writeInt(u16, h[13..15], @intCast(key.len), .little);
@@ -550,9 +593,17 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         fn resetTail(s: *Self, st: *Stream) void {
-            _ = s;
-            st.buf.clearRetainingCapacity();
-            st.idx.clearRetainingCapacity();
+            s.tail_bytes -|= st.buf.capacity;
+            // Big buffers go back to the allocator, so thousands of quiet
+            // streams don't each pin a full tail's worth of RAM.
+            if (st.buf.capacity > 4096) {
+                st.buf.clearAndFree(s.gpa);
+                st.idx.clearAndFree(s.gpa);
+            } else {
+                st.buf.clearRetainingCapacity();
+                st.idx.clearRetainingCapacity();
+            }
+            s.tail_bytes += st.buf.capacity;
             st.written = 0;
         }
 
@@ -573,8 +624,7 @@ pub fn Shard(comptime cfg: Config) type {
                 if (drop_tombstones and e.kind == .del) continue;
                 try w.add(e);
             }
-            var run = try w.finish();
-            run.clean = drop_tombstones;
+            const run = try w.finish();
             st.floor = s.seq;
             s.resetTail(st);
             s.stats.seals += 1;
@@ -754,35 +804,104 @@ pub fn Shard(comptime cfg: Config) type {
         };
 
         /// Rewrites each stream into one run and drops dead versions.
+        /// Copies every live pair into a fresh data file, one run per
+        /// stream, then swaps it in with a new manifest. The old file is
+        /// deleted, so disk use drops to the live data.
         pub fn compact(s: *Self) !void {
             s.file_mutex.lockUncancelable(s.io);
             defer s.file_mutex.unlock(s.io);
             s.lock.lockUncancelable(s.io);
             defer s.lock.unlock(s.io);
-            var it = s.streams.valueIterator();
-            while (it.next()) |p| {
-                const st = p.*;
-                try s.seal(st);
-                if (st.runs.items.len > 1 or (st.runs.items.len == 1 and !s.snapshotsOpen())) {
-                    try s.forceRewrite(st, st.runs.items.len);
-                }
-                if (s.pending_bytes > 64 * 1024 * 1024) try s.durablePoint(false);
+            if (s.poisoned) return error.Poisoned;
+            const gpa = s.gpa;
+            {
+                var it = s.streams.valueIterator();
+                while (it.next()) |p| try s.seal(p.*);
             }
-            if (cfg.wal) try s.checkpoint() else try s.durablePoint(true);
-            // Give back free space at the end of the file.
-            while (s.free.items.len > 0) {
-                const last = s.free.items[s.free.items.len - 1];
-                if (last.off + last.len < s.data_end) break;
-                s.data_end = last.off;
-                _ = s.free.pop();
-            }
-            try s.data.setLength(s.io, s.data_end);
-        }
+            if (cfg.wal) try s.checkpoint() else try s.durablePoint(false);
 
-        fn forceRewrite(s: *Self, st: *Stream, n: usize) !void {
-            // A run already rewritten with nothing older to keep is clean.
-            if (n == 1 and st.runs.items[0].clean) return;
-            try s.mergeRunsRewrite(st, 0, n, st.runs.items[n - 1].tier);
+            var name_buf: [32]u8 = undefined;
+            const new_gen = s.gen + 1;
+            const nf = try s.dir.createFile(s.io, dataName(&name_buf, new_gen), .{ .read = true, .truncate = true });
+            const old_data = s.data;
+            const old_end = s.data_end;
+            var old_free = s.free;
+            s.data = nf;
+            s.data_end = 0;
+            s.free = .empty;
+            var swapped = false;
+            errdefer if (!swapped) {
+                // Nothing durable changed yet: go back to the old file.
+                s.data = old_data;
+                s.data_end = old_end;
+                s.free.deinit(gpa);
+                s.free = old_free;
+                nf.close(s.io);
+                s.dir.deleteFile(s.io, dataName(&name_buf, new_gen)) catch {};
+            };
+
+            // New runs are built while the old ones stay readable.
+            const list = try gpa.alloc(*Stream, s.streams.count());
+            defer gpa.free(list);
+            const fresh = try gpa.alloc(?Run, list.len);
+            defer gpa.free(fresh);
+            @memset(fresh, null);
+            defer if (!swapped) for (fresh) |*f| if (f.*) |*r| freeRun(gpa, r);
+            const pages = try gpa.alloc(u64, list.len);
+            defer gpa.free(pages);
+            {
+                var it = s.streams.valueIterator();
+                var i: usize = 0;
+                while (it.next()) |p| : (i += 1) list[i] = p.*;
+            }
+            const drop = !s.snapshotsOpen();
+            for (list, 0..) |st, i| {
+                if (!cfg.wal) pages[i] = s.allocPage();
+                if (st.runs.items.len == 0) continue;
+                var w = s.runWriter();
+                var mc = try MergeCursor.init(s, st.runs.items);
+                defer mc.deinit();
+                while (try mc.nextKey()) |e| {
+                    if (drop and (mc.versions_seen > 1 or e.kind == .del)) continue;
+                    try w.add(e);
+                }
+                var r = try w.finish();
+                r.tier = st.runs.items[st.runs.items.len - 1].tier;
+                fresh[i] = r;
+            }
+            try nf.sync(s.io);
+            const new_map = try mapData(nf);
+
+            // Point of no return: swap the runs in and write the manifest.
+            swapped = true;
+            const old_map = s.map;
+            const old_gen = s.gen;
+            s.map = new_map;
+            s.gen = new_gen;
+            for (list, 0..) |st, i| {
+                for (st.runs.items) |*r| freeRun(gpa, r);
+                st.runs.clearRetainingCapacity();
+                if (fresh[i]) |r| st.runs.appendAssumeCapacity(r);
+                fresh[i] = null;
+                if (!cfg.wal) {
+                    st.page_off = pages[i];
+                    st.written = 0;
+                }
+            }
+            s.pending_free.clearRetainingCapacity();
+            s.pending_bytes = 0;
+            old_free.deinit(gpa);
+            s.man_buf.clearRetainingCapacity();
+            s.rewriteManifest() catch |err| {
+                // The durable manifest still names the old file, but memory
+                // now points at the new one. Refuse further writes.
+                s.poisoned = true;
+                return err;
+            };
+            std.posix.munmap(old_map);
+            old_data.close(s.io);
+            s.dir.deleteFile(s.io, dataName(&name_buf, old_gen)) catch {};
+            s.stats.merges += 1;
         }
 
         fn mergeRunsRewrite(s: *Self, st: *Stream, first: usize, count: usize, tier: u8) !void {
@@ -802,7 +921,6 @@ pub fn Shard(comptime cfg: Config) type {
             ok = true;
             var merged = try w.finish();
             merged.tier = tier;
-            merged.clean = drop and first == 0;
             for (runs) |*r| {
                 for (r.chunks.items) |*c| try s.releaseLater(chunkExtent(c));
                 freeRun(gpa, r);
@@ -822,7 +940,8 @@ pub fn Shard(comptime cfg: Config) type {
 
         /// Deletes every key under `prefix`. Whole streams are dropped in
         /// one step; partial ones get a tombstone per key.
-        pub fn deletePrefix(s: *Self, prefix: []const u8) !void {
+        pub fn deletePrefix(s: *Self, prefix: []const u8) !bool {
+            var changed = false;
             const seq = blk: {
                 s.lock.lockUncancelable(s.io);
                 defer s.lock.unlock(s.io);
@@ -852,9 +971,11 @@ pub fn Shard(comptime cfg: Config) type {
                 }
                 for (victims.items) |st| try s.dropStream(st);
                 for (keys.items) |k| try s.writeLocked(k, "", .del);
+                changed = victims.items.len + keys.items.len > 0;
                 break :blk s.seq;
             };
-            try s.afterWrite(seq);
+            if (changed) try s.afterWrite(seq);
+            return changed;
         }
 
         fn dropStream(s: *Self, st: *Stream) !void {
@@ -1313,6 +1434,16 @@ pub fn Shard(comptime cfg: Config) type {
             try s.commit(seq);
         }
 
+        /// Whether some accepted write is not durable yet.
+        pub fn needsSync(s: *Self) bool {
+            s.lock.lockSharedUncancelable(s.io);
+            const seq = s.seq;
+            s.lock.unlockShared(s.io);
+            s.commit_mutex.lockUncancelable(s.io);
+            defer s.commit_mutex.unlock(s.io);
+            return s.synced_seq < seq;
+        }
+
         /// Group commit: the first waiter syncs for everyone.
         fn commit(s: *Self, seq: u64) !void {
             s.commit_mutex.lockUncancelable(s.io);
@@ -1388,7 +1519,8 @@ pub fn Shard(comptime cfg: Config) type {
             var it = s.streams.valueIterator();
             while (it.next()) |p| try s.seal(p.*);
             try s.durablePoint(false);
-            try s.wal.sync();
+            // Every record so far is in a chunk now, so the whole log can go.
+            try s.wal.rotate();
             const segs = try s.gpa.dupe(u64, s.wal.segments.items);
             defer s.gpa.free(segs);
             for (segs) |id| {
@@ -1420,7 +1552,7 @@ pub fn Shard(comptime cfg: Config) type {
 
         // ------------------------------------------------------ manifest
 
-        const Op = enum(u8) { stream = 1, add_run = 2, merge = 3, drop = 4, floor = 5, seq = 6, _ };
+        const Op = enum(u8) { stream = 1, add_run = 2, merge = 3, drop = 4, floor = 5, seq = 6, gen = 7, _ };
 
         fn manBegin(s: *Self, op: Op) !usize {
             const start = s.man_buf.items.len;
@@ -1515,6 +1647,11 @@ pub fn Shard(comptime cfg: Config) type {
                 s.man_buf.deinit(gpa);
                 s.man_buf = saved;
             }
+            {
+                const m = try s.manBegin(.gen);
+                try s.putU(u64, s.gen);
+                s.manEnd(m);
+            }
             try s.manSeq();
             var it = s.streams.valueIterator();
             while (it.next()) |p| {
@@ -1581,7 +1718,6 @@ pub fn Shard(comptime cfg: Config) type {
                 errdefer gpa.free(c.bloom);
                 @memcpy(std.mem.sliceAsBytes(c.bloom), r.b[r.pos..][0 .. @as(usize, words) * 8]);
                 r.pos += @as(usize, words) * 8;
-                if (c.off + c.len > s.data_end) return error.Corrupt;
                 s.seq = @max(s.seq, c.max_seq);
                 try run.chunks.append(gpa, c);
                 run.bytes += c.len;
@@ -1670,6 +1806,7 @@ pub fn Shard(comptime cfg: Config) type {
                     s.seq = @max(s.seq, st.floor);
                 },
                 .seq => s.seq = @max(s.seq, try r.u(u64)),
+                .gen => s.gen = try r.u(u64),
                 _ => return error.Corrupt,
             }
         }
@@ -1731,7 +1868,7 @@ pub fn Shard(comptime cfg: Config) type {
             var it = s.streams.valueIterator();
             while (it.next()) |p| {
                 const st = p.*;
-                try st.buf.ensureTotalCapacity(gpa, 1024);
+                defer s.tail_bytes += st.buf.capacity;
                 const n = try s.data.readPositionalAll(s.io, page, st.page_off);
                 var pos: usize = 0;
                 var prev = st.floor;

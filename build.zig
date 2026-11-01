@@ -43,6 +43,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
             .optimize = optimize,
+            // glibc malloc hands freed memory back to the OS, so RSS tracks
+            // what the engine holds rather than allocator caches.
+            .link_libc = true,
             .imports = &.{.{ .name = "sedimentum", .module = mod }},
         }),
     });

@@ -32,6 +32,9 @@ pub const Options = struct {
 
 pub const max_shards = 16;
 
+/// Shards this thread wrote to since its last `sync`, as a bit mask.
+threadlocal var touched: u32 = 0;
+
 pub fn Store(comptime flavor: Flavor) type {
     const cfg: shard.Config = switch (flavor) {
         .v2 => .{
@@ -45,6 +48,8 @@ pub fn Store(comptime flavor: Flavor) type {
             .tail_limit = 16 * 1024,
             .fmt = .{ .block_bytes = 8192, .front_coding = true, .compress = true },
             .chunk_target = 64 * 1024,
+            // Per shard; one shard per core.
+            .tail_budget = 4 * 1024 * 1024,
         },
     };
     return struct {
@@ -114,17 +119,23 @@ pub fn Store(comptime flavor: Flavor) type {
         }
 
         pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
-            return self.shardOf(key).put(key, value);
+            const sh = self.shardOf(key);
+            self.touch(sh);
+            return sh.put(key, value);
         }
 
         pub fn delete(self: *Self, key: []const u8) !void {
-            return self.shardOf(key).delete(key);
+            const sh = self.shardOf(key);
+            self.touch(sh);
+            return sh.delete(key);
         }
 
         /// Deletes every key under `prefix`. A prefix that covers whole
         /// streams (like `chat/42/`) drops them without reading anything.
         pub fn deletePrefix(self: *Self, prefix: []const u8) !void {
-            for (self.shards) |sh| try sh.deletePrefix(prefix);
+            for (self.shards) |sh| {
+                if (try sh.deletePrefix(prefix)) self.touch(sh);
+            }
         }
 
         pub fn get(self: *Self, gpa: Allocator, key: []const u8) !?[]u8 {
@@ -147,8 +158,26 @@ pub fn Store(comptime flavor: Flavor) type {
             for (self.shards, 0..) |sh, i| sh.release(snap.seqs[i]);
         }
 
+        /// Makes every write this thread made durable (on every shard it
+        /// wrote to). Writes from other threads are covered by their own
+        /// `sync`, or by `syncAll`.
         pub fn sync(self: *Self) !void {
+            const mask = touched;
+            touched = 0;
+            for (self.shards, 0..) |sh, i| {
+                if (mask & (@as(u32, 1) << @intCast(i)) != 0) try sh.sync();
+            }
+        }
+
+        /// Makes every write accepted so far durable, from any thread.
+        pub fn syncAll(self: *Self) !void {
+            touched = 0;
             for (self.shards) |sh| try sh.sync();
+        }
+
+        fn touch(self: *const Self, sh: *Shard) void {
+            const i = std.mem.indexOfScalar(*Shard, self.shards, sh).?;
+            touched |= @as(u32, 1) << @intCast(i);
         }
 
         /// Rewrites every stream into a single run.
@@ -328,7 +357,7 @@ fn basicRoundTrip(comptime S: type) !void {
         try expectValue(db, "chat/2/a", "three");
         try expectValue(db, "loose", "misc");
         try expectValue(db, "chat/3/x", null);
-        try db.sync();
+        try db.syncAll();
     }
     {
         var db = try S.open(testing.allocator, io, tmp.dir, "db", .{ .sync_writes = false });

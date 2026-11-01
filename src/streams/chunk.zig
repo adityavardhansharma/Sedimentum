@@ -111,6 +111,7 @@ pub const Builder = struct {
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
     block_entries: u32 = 0,
+    misses: u8 = 0,
 
     pub fn init(gpa: Allocator, fmt: Format) Builder {
         return .{ .gpa = gpa, .fmt = fmt };
@@ -129,6 +130,7 @@ pub const Builder = struct {
         b.min_seq = std.math.maxInt(u64);
         b.max_seq = 0;
         b.block_entries = 0;
+        b.misses = 0;
     }
 
     pub fn isEmpty(b: *const Builder) bool {
@@ -191,13 +193,16 @@ pub const Builder = struct {
         const raw = b.block.items;
         var stored = raw;
         var flag: u32 = 0;
-        if (b.fmt.compress and raw.len > 64) {
+        // Data that didn't shrink twice in a row (random bytes, already
+        // compressed media) is not tried again until the next chunk.
+        if (b.fmt.compress and raw.len > 64 and b.misses < 2) {
             try b.scratch.resize(gpa, lz4.bound(raw.len));
             const n = lz4.compress(raw, b.scratch.items);
             if (n < raw.len - raw.len / 10) {
                 stored = b.scratch.items[0..n];
                 flag = compressed_bit;
-            }
+                b.misses = 0;
+            } else b.misses += 1;
         }
         const off: u32 = @intCast(b.out.items.len);
         try b.out.appendSlice(gpa, stored);
