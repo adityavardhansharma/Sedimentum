@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "stats")) {
         const st = db.spaceStats();
         try out.print("keys        {d}\nlast seq    {d}\nsegments    {d}\ndisk bytes  {d}\nlive bytes  {d}\nindex keys  {d} bytes\n", .{
-            db.count(), db.lastSeq(), st.segments, st.total_bytes, st.live_bytes, db.index.key_bytes,
+            db.count(), db.lastSeq(), st.segments, st.total_bytes, st.live_bytes, db.index.keyBytes(),
         });
     } else if (std.mem.eql(u8, cmd, "check")) {
         // Opening already verified every record while replaying. Reading
