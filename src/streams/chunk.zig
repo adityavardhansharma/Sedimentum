@@ -559,6 +559,13 @@ pub const Parsed = struct {
         p.kb.clearRetainingCapacity();
         const blk = try v.block(bi, gpa, &p.scratch);
         var it: BlockIter = .{ .raw = blk.entries };
+        // Size the lists once instead of growing them entry by entry.
+        if (blk.restartCount() > 0) {
+            const n = blk.restartCount() * restart_every;
+            try p.entries.ensureTotalCapacity(gpa, n);
+            try p.offs.ensureTotalCapacity(gpa, n);
+        }
+        try p.keys.ensureTotalCapacity(gpa, blk.entries.len);
         while (try it.next(gpa, &p.kb)) |e| {
             try p.offs.append(gpa, @intCast(p.keys.items.len));
             try p.keys.appendSlice(gpa, e.key);

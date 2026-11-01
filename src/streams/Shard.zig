@@ -344,7 +344,8 @@ pub fn Shard(comptime cfg: Config) type {
                 s.checkpoint() catch {};
             } else {
                 s.writePages(true) catch {};
-                s.data.sync(s.io) catch {};
+                // Seals and merges can leave records writePages skipped.
+                s.durablePoint(false) catch {};
             }
             s.lock.unlock(s.io);
             s.file_mutex.unlock(s.io);
@@ -1255,7 +1256,7 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         fn dropStream(s: *Self, st: *Stream) !void {
-            s.seq += 1;
+            @atomicStore(u64, &s.seq, s.seq + 1, .release);
             if (cfg.wal) {
                 var kb: std.ArrayList(u8) = .empty;
                 defer kb.deinit(s.gpa);
