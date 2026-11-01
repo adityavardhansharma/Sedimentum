@@ -5,7 +5,12 @@
 //! are removed from the index; their tombstones stay in the log until
 //! compaction.
 //!
-//! A `Db` is used from one thread at a time.
+//! Compaction rewrites the live records of a mostly dead sealed segment to
+//! the end of the log, keeping their sequence numbers, then deletes the old
+//! file. Recovery therefore resolves each key by the highest sequence
+//! number seen, not by file order.
+//!
+//! A `Db` is used from one thread at a time. See `Shared` for threads.
 
 const Db = @This();
 
@@ -21,6 +26,10 @@ pub const Options = struct {
     /// Sync after every write so a successful `put` or `delete` is durable.
     /// Turn off to batch writes and call `sync` yourself.
     sync_writes: bool = true,
+    /// Compact a sealed segment once at least this fraction of it is dead.
+    compact_dead_ratio: f64 = 0.5,
+    /// Check for segments to compact whenever the log starts a new segment.
+    auto_compact: bool = true,
 };
 
 /// What the index stores per key.
@@ -46,40 +55,107 @@ pub const Entry = struct {
 
 pub const Index = ordered.OrderedMap(Entry);
 
+/// Per-segment bookkeeping for compaction.
+const SegStat = struct {
+    /// Bytes of records the index still points to.
+    live: u64 = 0,
+    /// Lowest sequence number of any record in the segment.
+    min_seq: u64 = std.math.maxInt(u64),
+};
+
 gpa: Allocator,
 options: Options,
 log: Log,
 index: Index,
+seg_stats: std.AutoHashMapUnmanaged(u64, SegStat) = .empty,
 /// Scratch space for reading records.
 read_buf: std.ArrayList(u8) = .empty,
+compactions: u64 = 0,
 
 pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !Db {
     var idx = try Index.init(gpa);
     errdefer idx.deinit();
-    var loader: Loader = .{ .index = &idx };
+    var loader: Loader = .{ .gpa = gpa, .index = &idx };
+    defer loader.deinit();
     var log = try Log.open(gpa, io, parent, sub_path, options.log, &loader);
     errdefer log.close();
-    return .{ .gpa = gpa, .options = options, .log = log, .index = idx };
+
+    var db: Db = .{ .gpa = gpa, .options = options, .log = log, .index = idx, .seg_stats = loader.stats };
+    loader.stats = .empty;
+    errdefer db.seg_stats.deinit(gpa);
+    // Live bytes come from what the index ended up pointing to.
+    var c = db.index.first();
+    while (c.valid()) : (c.next()) {
+        const e = c.valuePtr().*;
+        (try db.statFor(e.segment)).live += e.len;
+    }
+    return db;
 }
 
 pub fn close(db: *Db) void {
     db.read_buf.deinit(db.gpa);
+    db.seg_stats.deinit(db.gpa);
     db.index.deinit();
     db.log.close();
     db.* = undefined;
 }
 
+/// Rebuilds the index during open. The highest sequence number wins.
 const Loader = struct {
+    gpa: Allocator,
     index: *Index,
+    /// Sequence of the newest tombstone seen per deleted key.
+    dead: std.StringHashMapUnmanaged(u64) = .empty,
+    stats: std.AutoHashMapUnmanaged(u64, SegStat) = .empty,
+
+    fn deinit(l: *Loader) void {
+        var it = l.dead.keyIterator();
+        while (it.next()) |k| l.gpa.free(k.*);
+        l.dead.deinit(l.gpa);
+        l.stats.deinit(l.gpa);
+    }
 
     pub fn onRecord(l: *Loader, loc: Log.Location, rec: record.Record) !void {
+        const st = try l.stats.getOrPut(l.gpa, loc.segment);
+        if (!st.found_existing) st.value_ptr.* = .{};
+        st.value_ptr.min_seq = @min(st.value_ptr.min_seq, rec.seq);
+
         switch (rec.kind) {
-            .put => try l.index.put(rec.key, Entry.from(loc, rec.seq)),
-            .delete => _ = l.index.remove(rec.key),
+            .put => {
+                if (l.dead.get(rec.key)) |dseq| if (dseq > rec.seq) return;
+                const slot = try l.index.getOrPut(rec.key);
+                if (slot.found_existing and slot.value_ptr.seq > rec.seq) return;
+                slot.value_ptr.* = Entry.from(loc, rec.seq);
+            },
+            .delete => {
+                if (l.index.getPtr(rec.key)) |e| {
+                    if (e.seq > rec.seq) return;
+                    _ = l.index.remove(rec.key);
+                }
+                const gop = try l.dead.getOrPut(l.gpa, rec.key);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = l.gpa.dupe(u8, rec.key) catch |err| {
+                        l.dead.removeByPtr(gop.key_ptr);
+                        return err;
+                    };
+                    gop.value_ptr.* = rec.seq;
+                } else gop.value_ptr.* = @max(gop.value_ptr.*, rec.seq);
+            },
             _ => return error.Corrupt,
         }
     }
 };
+
+fn statFor(db: *Db, segment: u64) !*SegStat {
+    const gop = try db.seg_stats.getOrPut(db.gpa, segment);
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    return gop.value_ptr;
+}
+
+/// Records that `e` is no longer referenced by the index.
+fn release(db: *Db, e: Entry) void {
+    if (db.seg_stats.getPtr(e.segment)) |st| st.live -|= e.len;
+}
 
 /// Number of live keys.
 pub fn count(db: *const Db) usize {
@@ -99,15 +175,38 @@ pub fn put(db: *Db, key: []const u8, value: []const u8) !void {
 /// Applies a put without syncing, whatever `sync_writes` says.
 pub fn putBuffered(db: *Db, key: []const u8, value: []const u8) !void {
     try record.validate(.{ .seq = 1, .kind = .put, .key = key, .value = value });
-    // Reserve the index slot first so a failed allocation can't leave a
-    // record in the log that the index never saw.
+    const segments_before = db.log.segments.items.len;
+    // Reserve the index slot and stats first so a failed allocation can't
+    // leave a record in the log that the index never saw.
     const slot = try db.index.getOrPut(key);
     const seq = db.log.last_seq + 1;
-    const loc = db.log.append(.{ .seq = seq, .kind = .put, .key = key, .value = value }) catch |err| {
+    const loc = db.appendTracked(.{ .seq = seq, .kind = .put, .key = key, .value = value }) catch |err| {
         if (!slot.found_existing) _ = db.index.remove(key);
         return err;
     };
+    if (slot.found_existing) db.release(slot.value_ptr.*);
     slot.value_ptr.* = Entry.from(loc, seq);
+    (db.seg_stats.getPtr(loc.segment).?).live += loc.len;
+    try db.afterAppend(segments_before);
+}
+
+/// Appends a record and makes sure its segment has stats.
+fn appendTracked(db: *Db, rec: record.Record) !Log.Location {
+    const loc = try db.log.append(rec);
+    const st = db.statFor(loc.segment) catch |err| {
+        // The record is in the log buffer but untracked. Poison so it
+        // can't be acknowledged in a state the index disagrees with.
+        db.log.poisoned = true;
+        return err;
+    };
+    st.min_seq = @min(st.min_seq, rec.seq);
+    return loc;
+}
+
+fn afterAppend(db: *Db, segments_before: usize) !void {
+    if (db.options.auto_compact and db.log.segments.items.len > segments_before) {
+        _ = try db.compact();
+    }
 }
 
 /// Deletes `key`. Returns whether it existed. Deleting a missing key
@@ -122,8 +221,10 @@ pub fn delete(db: *Db, key: []const u8) !bool {
 pub fn deleteBuffered(db: *Db, key: []const u8) !bool {
     if (key.len == 0) return error.EmptyKey;
     if (db.index.getPtr(key) == null) return false;
-    _ = try db.log.append(.{ .seq = db.log.last_seq + 1, .kind = .delete, .key = key });
-    _ = db.index.remove(key);
+    const segments_before = db.log.segments.items.len;
+    _ = try db.appendTracked(.{ .seq = db.log.last_seq + 1, .kind = .delete, .key = key });
+    db.release(db.index.remove(key).?);
+    try db.afterAppend(segments_before);
     return true;
 }
 
@@ -154,6 +255,96 @@ fn readValue(db: *Db, e: Entry) ![]const u8 {
 /// Makes every accepted write durable.
 pub fn sync(db: *Db) !void {
     try db.log.sync();
+}
+
+// ------------------------------------------------------------ compaction
+
+pub const SpaceStats = struct {
+    segments: usize,
+    total_bytes: u64,
+    live_bytes: u64,
+};
+
+pub fn spaceStats(db: *const Db) SpaceStats {
+    var total: u64 = 0;
+    var live: u64 = 0;
+    for (db.log.segments.items) |id| {
+        total += db.log.segmentSize(id);
+        if (db.seg_stats.get(id)) |st| live += st.live;
+    }
+    return .{ .segments = db.log.segments.items.len, .total_bytes = total, .live_bytes = live };
+}
+
+/// Compacts every sealed segment that is at least `compact_dead_ratio`
+/// dead. Returns how many segments were rewritten.
+pub fn compact(db: *Db) !usize {
+    return db.compactWithRatio(db.options.compact_dead_ratio);
+}
+
+/// Like `compact`, with an explicit threshold. 0 compacts every sealed
+/// segment that has any dead bytes.
+pub fn compactWithRatio(db: *Db, dead_ratio: f64) !usize {
+    // Copy the candidate list: compaction changes `segments`.
+    var candidates: std.ArrayList(u64) = .empty;
+    defer candidates.deinit(db.gpa);
+    for (db.log.segments.items) |id| {
+        if (id == db.log.active_id) continue;
+        const size = db.log.segmentSize(id);
+        if (size == 0) {
+            try candidates.append(db.gpa, id);
+            continue;
+        }
+        const live = if (db.seg_stats.get(id)) |st| st.live else 0;
+        const dead = 1.0 - @as(f64, @floatFromInt(live)) / @as(f64, @floatFromInt(size));
+        if (dead > 0 and dead >= dead_ratio) try candidates.append(db.gpa, id);
+    }
+    for (candidates.items) |id| try db.compactSegment(id);
+    return candidates.items.len;
+}
+
+fn compactSegment(db: *Db, id: u64) !void {
+    var scanner = try db.log.scanSegment(id);
+    defer scanner.deinit();
+    while (try scanner.next()) |item| {
+        const rec = item.record;
+        switch (rec.kind) {
+            .put => {
+                const e = db.index.getPtr(rec.key) orelse continue;
+                if (e.segment != id or e.offset != item.offset) continue;
+                const loc = try db.log.appendRaw(scanner.lastBytes());
+                const st = try db.statFor(loc.segment);
+                st.min_seq = @min(st.min_seq, rec.seq);
+                st.live += loc.len;
+                e.* = Entry.from(loc, rec.seq);
+            },
+            .delete => {
+                // A newer put already shadows anything older.
+                if (db.index.getPtr(rec.key) != null) continue;
+                if (!db.olderDataMayExist(id, rec.seq)) continue;
+                const loc = try db.log.appendRaw(scanner.lastBytes());
+                const st = try db.statFor(loc.segment);
+                st.min_seq = @min(st.min_seq, rec.seq);
+            },
+            _ => return error.Corrupt,
+        }
+    }
+    if (scanner.stop != .end) return error.Corrupt;
+    // Copies must be durable before the originals disappear.
+    try db.log.sync();
+    try db.log.removeSegment(id);
+    _ = db.seg_stats.remove(id);
+    db.compactions += 1;
+}
+
+/// Whether a segment other than `except` might hold a record older than
+/// `seq`, which a tombstone at `seq` would still need to hide.
+fn olderDataMayExist(db: *const Db, except: u64, seq: u64) bool {
+    for (db.log.segments.items) |id| {
+        if (id == except) continue;
+        const st = db.seg_stats.get(id) orelse continue;
+        if (st.min_seq < seq) return true;
+    }
+    return false;
 }
 
 // ------------------------------------------------------------ iteration
@@ -337,4 +528,58 @@ test "invalid input is rejected without side effects" {
     try testing.expectError(error.EmptyKey, db.put("", "x"));
     try testing.expectEqual(@as(usize, 0), db.count());
     try testing.expectEqual(@as(u64, 0), db.lastSeq());
+}
+
+test "compaction reclaims overwritten and deleted space and survives reopen" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opts: Options = .{ .sync_writes = false, .auto_compact = false, .log = .{ .segment_bytes = 4096 } };
+
+    var kb: [16]u8 = undefined;
+    {
+        var db = try Db.open(testing.allocator, io, tmp.dir, "db", opts);
+        defer db.close();
+        // 100 keys, each overwritten 10 times, then delete half.
+        for (0..10) |round| {
+            for (0..100) |k| {
+                var vb: [32]u8 = undefined;
+                try db.put(try std.fmt.bufPrint(&kb, "key{d:0>3}", .{k}), try std.fmt.bufPrint(&vb, "value-{d}-{d}", .{ k, round }));
+            }
+        }
+        for (0..50) |k| _ = try db.delete(try std.fmt.bufPrint(&kb, "key{d:0>3}", .{k * 2}));
+
+        const before = db.spaceStats();
+        const n = try db.compactWithRatio(0);
+        try testing.expect(n > 0);
+        const after = db.spaceStats();
+        try testing.expect(after.total_bytes < before.total_bytes / 3);
+        try testing.expectEqual(before.live_bytes, after.live_bytes);
+        try testing.expectEqual(@as(usize, 50), db.count());
+        try testing.expectEqualStrings("value-1-9", (try db.getView("key001")).?);
+        try testing.expect((try db.getView("key000")) == null);
+        try db.sync();
+    }
+
+    var db = try Db.open(testing.allocator, io, tmp.dir, "db", opts);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 50), db.count());
+    try testing.expect((try db.getView("key002")) == null);
+    try testing.expectEqualStrings("value-99-9", (try db.getView("key099")).?);
+    // Writes after reopen get sequence numbers above every copied record.
+    try db.put("key000", "back");
+    try testing.expectEqualStrings("back", (try db.getView("key000")).?);
+}
+
+test "auto compaction keeps disk use bounded under overwrites" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Db.open(testing.allocator, io, tmp.dir, "db", .{ .sync_writes = false, .log = .{ .segment_bytes = 8192 } });
+    defer db.close();
+    var kb: [16]u8 = undefined;
+    for (0..20_000) |i| try db.put(try std.fmt.bufPrint(&kb, "k{d}", .{i % 50}), "0123456789012345678901234567890123456789");
+    try testing.expect(db.compactions > 0);
+    try testing.expect(db.spaceStats().total_bytes < 64 * 1024);
+    try testing.expectEqual(@as(usize, 50), db.count());
 }
