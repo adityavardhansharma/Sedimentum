@@ -128,10 +128,30 @@ RAM. A question checks page fingerprints first and opens only pages that
 could score high enough. Text lives in a v3 store; rows, fingerprints and the
 rest are checkpointed and rebuilt from the store after a crash.
 
-Limits: matching is by words (with light stemming), not by meaning, so
-"login" does not find "auth" unless both appear.
+**Meaning (optional).** Load `models/holo-words.bin` (50,000 English word
+stems from ConceptNet Numberbatch, 16 MB) and pass it as `.meaning`:
 
-Benchmarks: `zig-out/bin/sedimentum-holo-bench <agent|recall> <new-dir> [memories]`.
+```zig
+const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "models/holo-words.bin", gpa, .unlimited);
+const words = try sdm.Holo.Meaning.load(gpa, bytes);
+const h = try sdm.Holo.open(gpa, io, dir, "memory", .{ .meaning = words });
+```
+
+A question then also looks for related words ("outage" finds "downtime"),
+and candidates are reranked by how close their words are in meaning to the
+question's. Nothing is stored per memory. `Query.expand = false` turns it off
+for one query.
+
+**Bulk writes.** `rememberMany` tokenizes and stores on every core.
+
+Limits: the word table covers common English; names and jargon outside it
+match by spelling only. Picking the single right fact among many about the
+same name, when the question uses other words, is still hard (see the hard
+benchmark).
+
+Benchmarks: `zig-out/bin/sedimentum-holo-bench <agent|recall|hard> <new-dir> [memories] [meaning-model]`.
+`hard` stores 20 facts per name in English chat filler and asks each in the
+fact's words and in other words, with and without meaning.
 
 ## Features
 
