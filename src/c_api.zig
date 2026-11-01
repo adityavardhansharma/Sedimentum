@@ -67,10 +67,15 @@ export fn sdm_last_error() [*:0]const u8 {
 }
 
 export fn sdm_open(path: ?[*]const u8, path_len: usize, sync_writes: c_int, out: ?*?*anyopaque) Status {
+    return sdm_open_capped(path, path_len, sync_writes, 0, out);
+}
+
+export fn sdm_open_capped(path: ?[*]const u8, path_len: usize, sync_writes: c_int, memory_budget: usize, out: ?*?*anyopaque) Status {
     if (path == null or path_len == 0 or out == null) return fail(error.InvalidArgument);
     ensureIo();
     const s = Shared.open(gpa, io_state.io(), std.Io.Dir.cwd(), path.?[0..path_len], .{
         .sync_writes = sync_writes != 0,
+        .memory_budget = memory_budget,
     }) catch |err| return fail(err);
     out.?.* = s;
     return .ok;
@@ -104,7 +109,7 @@ fn notFound() Status {
 }
 
 export fn sdm_seq_of(h: ?*anyopaque, k: ?[*]const u8, klen: usize, out_seq: *u64) Status {
-    out_seq.* = handle(h).seqOf(bytes(k, klen)) orelse return notFound();
+    out_seq.* = (handle(h).seqOf(bytes(k, klen)) catch |err| return fail(err)) orelse return notFound();
     return .ok;
 }
 

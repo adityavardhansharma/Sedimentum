@@ -76,12 +76,21 @@ fn dirBytes(io: Io, path: []const u8) u64 {
 }
 
 fn maxRssKb(io: Io) u64 {
+    return statusKb(io, "VmHWM:");
+}
+
+/// Current private memory (heap), leaving out file pages the OS can drop.
+fn anonKb(io: Io) u64 {
+    return statusKb(io, "RssAnon:");
+}
+
+fn statusKb(io: Io, field: []const u8) u64 {
     var buf: [4096]u8 = undefined;
     const text = Io.Dir.cwd().readFile(io, "/proc/self/status", &buf) catch return 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "VmHWM:")) continue;
-        var parts = std.mem.tokenizeAny(u8, line[6..], " \t");
+        if (!std.mem.startsWith(u8, line, field)) continue;
+        var parts = std.mem.tokenizeAny(u8, line[field.len..], " \t");
         return std.fmt.parseInt(u64, parts.next() orelse return 0, 10) catch 0;
     }
     return 0;
@@ -117,17 +126,23 @@ fn fatal(io: Io, msg: []const u8) !void {
     std.process.exit(2);
 }
 
+var memory_budget: usize = 0;
+
 fn open(gpa: std.mem.Allocator, io: Io, dir: []const u8) !*Shared {
-    return Shared.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
+    return Shared.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false, .memory_budget = memory_budget });
 }
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return fatal(io, "usage: sedimentum-bench <new-dir> [records]\n");
+    if (args.len < 2) return fatal(io, "usage: sedimentum-bench <new-dir> [records] [memory-budget-mb]\n");
     const dir = args[1];
     const n: u64 = if (args.len > 2) std.fmt.parseInt(u64, args[2], 10) catch 0 else 1_000_000;
+    if (args.len > 3) {
+        const mb = std.fmt.parseInt(usize, args[3], 10) catch return fatal(io, "memory budget must be a number of megabytes\n");
+        memory_budget = mb << 20;
+    }
     // latest10 needs at least 10 records per agent.
     if (n < 10 * agents) return fatal(io, "records must be a number of at least 640\n");
     out = Io.File.stdout().writerStreaming(io, &out_buf);
@@ -150,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
     var t = nowNs(io);
     for (order) |id| try db.put(key(&kb, id), value(&vb, id, 0));
     try db.sync();
-    try report("load", n, secondsSince(io, t), null, ",\"rss_kb\":{d}", .{maxRssKb(io)});
+    try report("load", n, secondsSince(io, t), null, ",\"rss_kb\":{d},\"anon_kb\":{d},\"cold_keys\":{d}", .{ maxRssKb(io), anonKb(io), if (db.db.cold) |c| c.entries else 0 });
 
     t = nowNs(io);
     _ = try db.compact();
@@ -159,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
     t = nowNs(io);
     db.close();
     db = try open(gpa, io, dir);
-    try report("reopen", 1, secondsSince(io, t), null, "", .{});
+    try report("reopen", 1, secondsSince(io, t), null, ",\"anon_kb\":{d}", .{anonKb(io)});
 
     var s: u64 = 7;
     {
@@ -231,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
     {
         t = nowNs(io);
         db.lock.lockSharedUncancelable(io);
-        var it = db.db.iterator(.{});
+        var it = try db.db.iterator(.{});
         var count: u64 = 0;
         var bytes: usize = 0;
         while (try it.next()) |p| {

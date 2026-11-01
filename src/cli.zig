@@ -53,8 +53,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "stats")) {
         const st = db.spaceStats();
-        try out.print("keys        {d}\nlast seq    {d}\nsegments    {d}\ndisk bytes  {d}\nlive bytes  {d}\nindex keys  {d} bytes\n", .{
-            db.count(), db.lastSeq(), st.segments, st.total_bytes, st.live_bytes, db.index.keyBytes(),
+        const cold_keys: u64 = if (db.cold) |c| c.entries else 0;
+        try out.print("keys        {d}\nlast seq    {d}\nsegments    {d}\ndisk bytes  {d}\nlive bytes  {d}\nin memory   {d} keys, about {d} bytes\non disk     {d} keys in the cold index\n", .{
+            db.count(), db.lastSeq(), st.segments, st.total_bytes, st.live_bytes, db.index.len(), db.memoryUsed(), cold_keys,
         });
     } else if (std.mem.eql(u8, cmd, "get")) {
         if (args.len < 4) return usageExit(io);
@@ -88,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
             } else prefix = a;
         }
         const end_buf = try arena.alloc(u8, prefix.len);
-        var it = db.prefixIterator(prefix, reverse, end_buf);
+        var it = try db.prefixIterator(prefix, reverse, end_buf);
         var n: usize = 0;
         while (n < limit) : (n += 1) {
             const p = (try it.next()) orelse break;
@@ -117,12 +118,13 @@ fn checkFiles(gpa: std.mem.Allocator, io: Io, path: []const u8, out: *Io.Writer)
     defer report.deinit(gpa);
     for (report.problems.items) |p| {
         var name_buf: [sdm.segment.name_len]u8 = undefined;
-        const name = sdm.segment.fileName(&name_buf, p.segment);
+        const name = if (p.kind == .bad_cold_index) "" else sdm.segment.fileName(&name_buf, p.segment);
         switch (p.kind) {
             .torn_tail => try out.print("{s}: damaged tail at byte {d} of {d} (opening the database will cut it off)\n", .{ name, p.offset, p.file_len }),
             .torn_sealed => try out.print("{s}: damaged tail at byte {d} of {d} in a sealed segment (opening will fail)\n", .{ name, p.offset, p.file_len }),
             .corrupt => try out.print("{s}: damaged record at byte {d} followed by valid records (opening will fail)\n", .{ name, p.offset }),
             .bad_batch => try out.print("{s}: batch at byte {d} has invalid contents (opening will fail)\n", .{ name, p.offset }),
+            .bad_cold_index => try out.print("{s}: damaged (opening may fail or reads may return errors)\n", .{sdm.cold.file_name}),
         }
     }
     const clean = report.problems.items.len == 0;
