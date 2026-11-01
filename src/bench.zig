@@ -217,6 +217,9 @@ const Counting = struct {
     }
 };
 const gpa: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{ .alloc = Counting.alloc, .resize = Counting.resize, .remap = Counting.remap, .free = Counting.free } };
+/// The driver's own buffers (key orders, latency samples) bypass the
+/// counter, so heap numbers show only what the engine holds.
+const driver = std.heap.c_allocator;
 
 /// v1: one ordered index in RAM over append-only segments.
 const V1 = struct {
@@ -398,8 +401,8 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
     var vb: [value_len]u8 = undefined;
 
     // load: n buffered puts in random order, then one sync.
-    const order = try shuffled(gpa, n, 1);
-    defer gpa.free(order);
+    const order = try shuffled(driver, n, 1);
+    defer driver.free(order);
     phaseStart("load", n);
     var t = nowNs(io);
     for (order) |id| {
@@ -424,8 +427,8 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
     {
         phaseStart("get_hit", n);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
-        try lat.ns.ensureTotalCapacity(gpa, n);
+        defer lat.ns.deinit(driver);
+        try lat.ns.ensureTotalCapacity(driver, n);
         t = nowNs(io);
         for (0..n) |_| {
             const k = key(&kb, splitmix(&s) % n);
@@ -440,8 +443,8 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
     {
         phaseStart("get_miss", n);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
-        try lat.ns.ensureTotalCapacity(gpa, n);
+        defer lat.ns.deinit(driver);
+        try lat.ns.ensureTotalCapacity(driver, n);
         t = nowNs(io);
         for (0..n) |_| {
             const k = key(&kb, n + splitmix(&s) % n);
@@ -462,8 +465,8 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
         const queries = 100_000;
         phaseStart("latest10", queries);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
-        try lat.ns.ensureTotalCapacity(gpa, queries);
+        defer lat.ns.deinit(driver);
+        try lat.ns.ensureTotalCapacity(driver, queries);
         t = nowNs(io);
         for (0..queries) |_| {
             const p = agentPrefix(&pb, splitmix(&s) % agents);
@@ -480,13 +483,13 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
         const queries = 200;
         phaseStart("last10_by_key", queries);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
+        defer lat.ns.deinit(driver);
         t = nowNs(io);
         for (0..queries) |_| {
             const p = agentPrefix(&pb, splitmix(&s) % agents);
             const a = nowNs(io);
             const got = try db.scanCount(p, true, 10);
-            try lat.ns.append(gpa, @intCast(nowNs(io) - a));
+            try lat.ns.append(driver, @intCast(nowNs(io) - a));
             if (got != 10) return error.Short;
             tick();
         }
@@ -527,13 +530,13 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
         const writes = 2000;
         phaseStart("durable_put_1thread", writes);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
+        defer lat.ns.deinit(driver);
         t = nowNs(io);
         for (0..writes) |i| {
             const id = 10 * n + i;
             const a = nowNs(io);
             try db.put(key(&kb, id), value(&vb, id, 0));
-            try lat.ns.append(gpa, @intCast(nowNs(io) - a));
+            try lat.ns.append(driver, @intCast(nowNs(io) - a));
             tick();
         }
         try report("durable_put_1thread", writes, secondsSince(io, t), &lat, "", .{});
@@ -573,13 +576,13 @@ fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
         var probe_buf: [48]u8 = undefined;
         const probe = key(&probe_buf, 30 * n + 5);
         var lat: Lat = .{};
-        defer lat.ns.deinit(gpa);
+        defer lat.ns.deinit(driver);
         t = nowNs(io);
         for (0..snaps) |_| {
             const a = nowNs(io);
             const v = (try db.snapGet(probe)) orelse return error.Missing;
             gpa.free(v);
-            try lat.ns.append(gpa, @intCast(nowNs(io) - a));
+            try lat.ns.append(driver, @intCast(nowNs(io) - a));
             tick();
         }
         try report("snapshot_dirty", snaps, secondsSince(io, t), &lat, "", .{});
@@ -756,7 +759,7 @@ fn runAgent(comptime E: type, io: Io, dir: []const u8) !void {
                     self.deletes += 1;
                 }
                 try d.sync();
-                try self.lat.ns.append(gpa, @intCast(nowNs(io_g) - a));
+                try self.lat.ns.append(driver, @intCast(nowNs(io_g) - a));
                 tick();
             }
         }
@@ -769,14 +772,14 @@ fn runAgent(comptime E: type, io: Io, dir: []const u8) !void {
     for (hs) |h| h.join();
     const secs = secondsSince(io, t);
     var all: Lat = .{};
-    defer all.ns.deinit(gpa);
+    defer all.ns.deinit(driver);
     var deletes: u64 = 0;
     var full_reads: u64 = 0;
     var ctx: u64 = 0;
     for (&ags) |*ag| {
         if (ag.failed) return error.AgentFailed;
-        try all.ns.appendSlice(gpa, ag.lat.ns.items);
-        ag.lat.ns.deinit(gpa);
+        try all.ns.appendSlice(driver, ag.lat.ns.items);
+        ag.lat.ns.deinit(driver);
         deletes += ag.deletes;
         full_reads += ag.full_reads;
         ctx += ag.context_msgs;

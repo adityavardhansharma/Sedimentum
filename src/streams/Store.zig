@@ -32,8 +32,21 @@ pub const Options = struct {
 
 pub const max_shards = 16;
 
-/// Shards this thread wrote to since its last `sync`, as a bit mask.
-threadlocal var touched: u32 = 0;
+/// Shards this thread wrote to since its last `sync`, per store handle.
+/// A handle that finds no free slot falls back to syncing every shard.
+const Touched = struct { owner: u64 = 0, mask: u32 = 0 };
+threadlocal var touched: [8]Touched = @splat(.{});
+var next_handle_id: std.atomic.Value(u64) = .init(1);
+
+fn touchedSlot(id: u64, create: bool) ?*Touched {
+    for (&touched) |*t| if (t.owner == id) return t;
+    if (!create) return null;
+    for (&touched) |*t| if (t.owner == 0) {
+        t.* = .{ .owner = id };
+        return t;
+    };
+    return null;
+}
 
 pub fn Store(comptime flavor: Flavor) type {
     const cfg: shard.Config = switch (flavor) {
@@ -63,10 +76,24 @@ pub fn Store(comptime flavor: Flavor) type {
         gpa: Allocator,
         io: Io,
         shards: []*Shard,
+        lock_file: Io.File,
+        /// Unique per open handle; keys this handle's touched-shard bits.
+        id: u64,
+        /// Set when this thread-local bookkeeping overflowed: the next
+        /// `sync` covers every shard.
+        sync_everything: std.atomic.Value(bool) = .init(false),
 
         pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !*Self {
             var dir = try parent.createDirPathOpen(io, sub_path, .{});
             defer dir.close(io);
+            // One process at a time, taken before reading or creating any
+            // store-level file.
+            const lock_file = dir.createFile(io, "LOCK", .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+                error.WouldBlock => return error.Locked,
+                else => |e| return e,
+            };
+            errdefer lock_file.close(io);
+            try checkFormat(io, dir);
             const n = try shardCount(io, dir, options);
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
@@ -80,8 +107,32 @@ pub fn Store(comptime flavor: Flavor) type {
                 sh.* = try Shard.open(gpa, io, dir, name, options.sync_writes);
                 opened += 1;
             }
-            self.* = .{ .gpa = gpa, .io = io, .shards = shards };
+            self.* = .{ .gpa = gpa, .io = io, .shards = shards, .lock_file = lock_file, .id = next_handle_id.fetchAdd(1, .monotonic) };
             return self;
+        }
+
+        const format_text = switch (flavor) {
+            .v2 => "v2\n",
+            .v3 => "v3\n",
+        };
+
+        /// Refuses a directory made by the other engine before touching
+        /// any of its files: v2 would cut off v3's pages as unowned space.
+        fn checkFormat(io: Io, dir: Io.Dir) !void {
+            if (try detectIn(io, dir)) |f| {
+                if (f != flavor) return error.WrongEngine;
+            }
+            var buf: [8]u8 = undefined;
+            _ = dir.readFile(io, "FORMAT", &buf) catch |err| switch (err) {
+                error.FileNotFound => {
+                    const f = try dir.createFile(io, "FORMAT", .{});
+                    defer f.close(io);
+                    try f.writePositionalAll(io, format_text, 0);
+                    try f.sync(io);
+                    return;
+                },
+                else => |e| return e,
+            };
         }
 
         fn shardCount(io: Io, dir: Io.Dir, options: Options) !usize {
@@ -94,20 +145,23 @@ pub fn Store(comptime flavor: Flavor) type {
                 error.FileNotFound => {},
                 else => |e| return e,
             }
+            if (options.shards) |want| if (want == 0 or want > max_shards) return error.InvalidArgument;
             const n: usize = switch (flavor) {
                 .v2 => 1,
-                .v3 => options.shards orelse @min(max_shards, std.Thread.getCpuCount() catch 4),
+                .v3 => options.shards orelse @max(1, @min(max_shards, std.Thread.getCpuCount() catch 4)),
             };
             const f = try dir.createFile(io, "SHARDS", .{});
             defer f.close(io);
             const text = std.fmt.bufPrint(&buf, "{d}\n", .{n}) catch unreachable;
             try f.writePositionalAll(io, text, 0);
             try f.sync(io);
-            return @max(1, @min(n, max_shards));
+            return n;
         }
 
         pub fn close(self: *Self) void {
             for (self.shards) |sh| sh.close();
+            if (touchedSlot(self.id, false)) |t| t.* = .{};
+            self.lock_file.close(self.io);
             self.gpa.free(self.shards);
             self.gpa.destroy(self);
         }
@@ -148,9 +202,19 @@ pub fn Store(comptime flavor: Flavor) type {
             return sh.get(gpa, key, snap.seqs[i]);
         }
 
+        /// A point-in-time view across every shard: all shard locks are
+        /// held while the sequence numbers are taken.
         pub fn snapshot(self: *Self) !Snapshot {
+            for (self.shards) |sh| sh.lock.lockUncancelable(self.io);
+            defer for (self.shards) |sh| sh.lock.unlock(self.io);
             var snap: Snapshot = .{};
-            for (self.shards, 0..) |sh, i| snap.seqs[i] = try sh.snapshot();
+            var taken: usize = 0;
+            errdefer for (self.shards[0..taken]) |sh| sh.releaseLocked(sh.seq);
+            for (self.shards, 0..) |sh, i| {
+                try sh.snaps.append(self.gpa, sh.seq);
+                snap.seqs[i] = sh.seq;
+                taken += 1;
+            }
             return snap;
         }
 
@@ -162,22 +226,33 @@ pub fn Store(comptime flavor: Flavor) type {
         /// wrote to). Writes from other threads are covered by their own
         /// `sync`, or by `syncAll`.
         pub fn sync(self: *Self) !void {
-            const mask = touched;
-            touched = 0;
-            for (self.shards, 0..) |sh, i| {
-                if (mask & (@as(u32, 1) << @intCast(i)) != 0) try sh.sync();
+            if (self.sync_everything.swap(false, .acq_rel)) {
+                errdefer self.sync_everything.store(true, .release);
+                return self.syncAll();
             }
+            const t = touchedSlot(self.id, false) orelse return;
+            for (self.shards, 0..) |sh, i| {
+                const bit = @as(u32, 1) << @intCast(i);
+                if (t.mask & bit == 0) continue;
+                // A bit is cleared only once its shard synced, so a retry
+                // after an error covers what is still pending.
+                try sh.sync();
+                t.mask &= ~bit;
+            }
+            t.* = .{};
         }
 
         /// Makes every write accepted so far durable, from any thread.
         pub fn syncAll(self: *Self) !void {
-            touched = 0;
             for (self.shards) |sh| try sh.sync();
+            if (touchedSlot(self.id, false)) |t| t.* = .{};
         }
 
-        fn touch(self: *const Self, sh: *Shard) void {
+        fn touch(self: *Self, sh: *Shard) void {
             const i = std.mem.indexOfScalar(*Shard, self.shards, sh).?;
-            touched |= @as(u32, 1) << @intCast(i);
+            if (touchedSlot(self.id, true)) |t| {
+                t.mask |= @as(u32, 1) << @intCast(i);
+            } else self.sync_everything.store(true, .release);
         }
 
         /// Rewrites every stream into a single run.
@@ -321,6 +396,41 @@ pub fn freePairs(gpa: Allocator, pairs: []const Pair) void {
         gpa.free(p.value);
     }
     gpa.free(pairs);
+}
+
+/// Which engine made the store at `sub_path`, or null when it is not a
+/// stream store (or does not exist).
+pub fn detect(io: Io, parent: Io.Dir, sub_path: []const u8) !?Flavor {
+    var dir = parent.openDir(io, sub_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+    return detectIn(io, dir);
+}
+
+fn detectIn(io: Io, dir: Io.Dir) !?Flavor {
+    var buf: [8]u8 = undefined;
+    if (dir.readFile(io, "FORMAT", &buf)) |text| {
+        const t = std.mem.trim(u8, text, " \n");
+        if (std.mem.eql(u8, t, "v2")) return .v2;
+        if (std.mem.eql(u8, t, "v3")) return .v3;
+        return error.Corrupt;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    }
+    // Stores made before FORMAT existed: v2 shards have a WAL directory.
+    _ = dir.readFile(io, "SHARDS", &buf) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
+    };
+    var wal = dir.openDir(io, "shard-0/wal", .{}) catch |err| switch (err) {
+        error.FileNotFound => return .v3,
+        else => |e| return e,
+    };
+    wal.close(io);
+    return .v2;
 }
 
 pub const V2 = Store(.v2);
@@ -567,6 +677,7 @@ fn crashTest(comptime S: type) !void {
         for (0..500) |i| try db.put(try std.fmt.bufPrint(&kb, "c/1/{d:0>5}", .{i}), &vb);
         const sh = db.shards[0];
         sh.freeMemoryForTest();
+        db.lock_file.close(io);
         gpa.free(db.shards);
         gpa.destroy(db);
     }
@@ -585,4 +696,64 @@ fn crashTest(comptime S: type) !void {
 test "synced records survive a crash without close" {
     try crashTest(V2);
     try crashTest(V3);
+}
+
+test "a store refuses the other engine and bad shard counts" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .shards = 2 });
+        try db.put("a/b/c", "v");
+        db.close();
+    }
+    try testing.expectError(error.WrongEngine, V2.open(gpa, io, tmp.dir, "db", .{}));
+    try testing.expectEqual(Flavor.v3, (try detect(io, tmp.dir, "db")).?);
+    try testing.expectError(error.InvalidArgument, V3.open(gpa, io, tmp.dir, "other", .{ .shards = 0 }));
+    try testing.expectError(error.InvalidArgument, V3.open(gpa, io, tmp.dir, "other2", .{ .shards = 99 }));
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    try testing.expectError(error.Locked, V3.open(gpa, io, tmp.dir, "db", .{}));
+    const v = (try db.get(gpa, "a/b/c")).?;
+    defer gpa.free(v);
+    try testing.expectEqualStrings("v", v);
+}
+
+test "two handles on one thread keep their own pending syncs" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a = try V3.open(gpa, io, tmp.dir, "a", .{ .sync_writes = false, .shards = 2 });
+    defer a.close();
+    var b = try V3.open(gpa, io, tmp.dir, "b", .{ .sync_writes = false, .shards = 2 });
+    defer b.close();
+    try a.put("x/y/1", "1");
+    try b.sync();
+    var pending = false;
+    for (a.shards) |sh| pending = pending or sh.needsSync();
+    try testing.expect(pending);
+    try a.sync();
+    for (a.shards) |sh| try testing.expect(!sh.needsSync());
+}
+
+test "deleting a whole stream then compacting keeps merges working" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = 1 });
+    defer db.close();
+    var kb: [32]u8 = undefined;
+    var vb: [600]u8 = @splat('z');
+    for (0..200) |i| try db.put(try std.fmt.bufPrint(&kb, "s/1/{d:0>5}", .{i}), &vb);
+    for (0..200) |i| try db.delete(try std.fmt.bufPrint(&kb, "s/1/{d:0>5}", .{i}));
+    try db.compact();
+    // Enough new runs to force a merge at the old tier.
+    for (0..2000) |i| try db.put(try std.fmt.bufPrint(&kb, "s/1/{d:0>5}", .{i}), &vb);
+    try db.compact();
+    const got = try db.scan(gpa, .{ .start = "s/1/", .end = "s/10" }, null, 10);
+    defer freePairs(gpa, got);
+    try testing.expectEqual(@as(usize, 10), got.len);
 }

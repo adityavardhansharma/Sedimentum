@@ -363,12 +363,30 @@ pub fn Shard(comptime cfg: Config) type {
 
         fn streamNamed(s: *Self, name: []const u8, log_it: bool) !*Stream {
             if (s.streams.get(name)) |st| return st;
+            const st = try s.newStream(name);
+            if (!cfg.wal) {
+                // v3: every stream gets a page, aligned so in-place writes
+                // don't straddle more disk pages than needed.
+                st.page_off = s.allocPage();
+            }
+            if (log_it) s.manStreamNew(st) catch |err| {
+                // The stream exists in memory but the manifest can't say so.
+                s.poisoned = true;
+                return err;
+            };
+            return st;
+        }
+
+        /// Adds an empty stream. Either it is fully registered or nothing
+        /// changed.
+        fn newStream(s: *Self, name: []const u8) !*Stream {
             const gpa = s.gpa;
+            try s.streams.ensureUnusedCapacity(gpa, 1);
+            if (name.len > 0) try s.named.ensureUnusedCapacity(gpa, 1);
             const st = try gpa.create(Stream);
             errdefer gpa.destroy(st);
             st.* = .{ .name = try gpa.dupe(u8, name) };
-            errdefer gpa.free(st.name);
-            try s.streams.put(gpa, st.name, st);
+            s.streams.putAssumeCapacity(st.name, st);
             if (name.len > 0) {
                 var lo: usize = 0;
                 var hi: usize = s.named.items.len;
@@ -376,14 +394,8 @@ pub fn Shard(comptime cfg: Config) type {
                     const mid = (lo + hi) / 2;
                     if (std.mem.order(u8, s.named.items[mid].name, name) == .lt) lo = mid + 1 else hi = mid;
                 }
-                try s.named.insert(gpa, lo, st);
+                s.named.insertAssumeCapacity(lo, st);
             }
-            if (!cfg.wal) {
-                // v3: every stream gets a page, aligned so in-place writes
-                // don't straddle more disk pages than needed.
-                st.page_off = s.allocPage();
-            }
-            if (log_it) try s.manStreamNew(st);
             return st;
         }
 
@@ -554,6 +566,7 @@ pub fn Shard(comptime cfg: Config) type {
                 // record a chunk of its own, newer than every run.
                 try s.seal(st);
                 var w = s.runWriter();
+                errdefer w.discard();
                 try w.add(.{ .key = key, .value = value, .seq = seq, .kind = kind });
                 try s.addRun(st, try w.finish());
                 return;
@@ -619,6 +632,7 @@ pub fn Shard(comptime cfg: Config) type {
             }
             const drop_tombstones = st.runs.items.len == 0 and !s.snapshotsOpen();
             var w = s.runWriter();
+            errdefer w.discard();
             for (st.idx.items) |off| {
                 const e = st.entry(off);
                 if (drop_tombstones and e.kind == .del) continue;
@@ -638,8 +652,15 @@ pub fn Shard(comptime cfg: Config) type {
         fn addRun(s: *Self, st: *Stream, run: Run) !void {
             for (run.chunks.items) |c| st.floor = @max(st.floor, c.max_seq);
             var r = run;
-            errdefer freeRun(s.gpa, &r);
-            try st.runs.append(s.gpa, r);
+            st.runs.append(s.gpa, r) catch |err| {
+                // The tail this run came from is already gone.
+                freeRun(s.gpa, &r);
+                s.poisoned = true;
+                return err;
+            };
+            // The run now belongs to the stream. If the manifest can't name
+            // it, memory and disk disagree: refuse further writes.
+            errdefer s.poisoned = true;
             try s.manAddRun(st, &st.runs.items[st.runs.items.len - 1]);
             try s.maybeMerge(st);
         }
@@ -682,9 +703,19 @@ pub fn Shard(comptime cfg: Config) type {
                 b.reset();
             }
 
+            /// Frees the chunks written so far and gives their space back.
+            fn discard(w: *RunWriter) void {
+                for (w.run.chunks.items) |*c| w.s.releaseNow(chunkExtent(c));
+                freeRun(w.s.gpa, &w.run);
+                w.run = .{};
+                w.s.builder.reset();
+            }
+
             fn finish(w: *RunWriter) !Run {
                 if (!w.s.builder.isEmpty()) try w.flush();
-                return w.run;
+                const r = w.run;
+                w.run = .{};
+                return r;
             }
         };
 
@@ -711,8 +742,6 @@ pub fn Shard(comptime cfg: Config) type {
         fn mergeRuns(s: *Self, st: *Stream, first: usize, count: usize, tier: u8) !void {
             const gpa = s.gpa;
             const runs = st.runs.items[first..][0..count];
-            var merged: Run = .{ .tier = tier };
-            errdefer freeRun(gpa, &merged);
 
             // Disjoint runs (time-ordered keys) are linked, not rewritten.
             const order = try gpa.alloc(usize, count);
@@ -723,29 +752,34 @@ pub fn Shard(comptime cfg: Config) type {
                     return std.mem.order(u8, rs[a].first(), rs[b].first()) == .lt;
                 }
             }.lt);
-            var disjoint = true;
+            var total: usize = 0;
             for (order[1..], 0..) |o, i| {
-                if (std.mem.order(u8, runs[order[i]].last(), runs[o].first()) != .lt) disjoint = false;
-            }
-            if (disjoint) {
-                for (order) |o| {
-                    try merged.chunks.appendSlice(gpa, runs[o].chunks.items);
-                    merged.bytes += runs[o].bytes;
+                if (std.mem.order(u8, runs[order[i]].last(), runs[o].first()) != .lt) {
+                    return s.mergeRunsRewrite(st, first, count, tier);
                 }
-                for (runs) |*r| r.chunks.deinit(gpa); // Chunks now belong to `merged`.
-                s.stats.linked_merges += 1;
-            } else {
-                merged.chunks.deinit(gpa);
-                return s.mergeRunsRewrite(st, first, count, tier);
             }
+            for (runs) |r| total += r.chunks.items.len;
+            var merged: Run = .{ .tier = tier };
+            // Reserve first so nothing can fail once chunks change owner.
+            try merged.chunks.ensureTotalCapacity(gpa, total);
+            for (order) |o| {
+                merged.chunks.appendSliceAssumeCapacity(runs[o].chunks.items);
+                merged.bytes += runs[o].bytes;
+            }
+            for (runs) |*r| r.chunks.deinit(gpa); // Chunks now belong to `merged`.
+            s.stats.linked_merges += 1;
             const has_chunks = merged.chunks.items.len > 0;
             if (has_chunks) {
                 st.runs.items[first] = merged;
                 st.runs.replaceRangeAssumeCapacity(first + 1, count - 1, &.{});
             } else {
+                merged.chunks.deinit(gpa);
                 st.runs.replaceRangeAssumeCapacity(first, count, &.{});
             }
-            try s.manMerge(st, first, count, if (has_chunks) &st.runs.items[first] else null);
+            s.manMerge(st, first, count, if (has_chunks) &st.runs.items[first] else null) catch |err| {
+                s.poisoned = true;
+                return err;
+            };
         }
 
         /// Walks several runs at once in key order, every version of each
@@ -859,6 +893,7 @@ pub fn Shard(comptime cfg: Config) type {
                 if (!cfg.wal) pages[i] = s.allocPage();
                 if (st.runs.items.len == 0) continue;
                 var w = s.runWriter();
+                errdefer w.discard();
                 var mc = try MergeCursor.init(s, st.runs.items);
                 defer mc.deinit();
                 while (try mc.nextKey()) |e| {
@@ -866,6 +901,11 @@ pub fn Shard(comptime cfg: Config) type {
                     try w.add(e);
                 }
                 var r = try w.finish();
+                if (r.chunks.items.len == 0) {
+                    // Everything was deleted: no run at all, not an empty one.
+                    r.chunks.deinit(gpa);
+                    continue;
+                }
                 r.tier = st.runs.items[st.runs.items.len - 1].tier;
                 fresh[i] = r;
             }
@@ -909,20 +949,31 @@ pub fn Shard(comptime cfg: Config) type {
             const runs = st.runs.items[first..][0..count];
             const drop = !s.snapshotsOpen();
             var w = s.runWriter();
-            var it = try MergeCursor.init(s, runs);
-            var ok = false;
-            defer if (!ok) it.deinit();
-            while (try it.nextKey()) |e| {
-                if (it.versions_seen > 1 and drop) continue;
-                if (drop and first == 0 and e.kind == .del) continue;
-                try w.add(e);
+            // Until the swap, a failure gives back the new chunks only.
+            errdefer w.discard();
+            {
+                var it = try MergeCursor.init(s, runs);
+                defer it.deinit();
+                while (try it.nextKey()) |e| {
+                    if (it.versions_seen > 1 and drop) continue;
+                    if (drop and first == 0 and e.kind == .del) continue;
+                    try w.add(e);
+                }
             }
-            it.deinit();
-            ok = true;
-            var merged = try w.finish();
+            if (!w.s.builder.isEmpty()) try w.flush();
+            var old_chunks: usize = 0;
+            for (runs) |r| old_chunks += r.chunks.items.len;
+            try s.pending_free.ensureUnusedCapacity(gpa, old_chunks);
+            // Nothing below fails before the manifest record.
+            var merged = w.run;
+            w.run = .{};
             merged.tier = tier;
             for (runs) |*r| {
-                for (r.chunks.items) |*c| try s.releaseLater(chunkExtent(c));
+                for (r.chunks.items) |*c| {
+                    const e = chunkExtent(c);
+                    s.pending_free.appendAssumeCapacity(e);
+                    s.pending_bytes += e.len;
+                }
                 freeRun(gpa, r);
             }
             s.stats.merges += 1;
@@ -931,9 +982,13 @@ pub fn Shard(comptime cfg: Config) type {
                 st.runs.items[first] = merged;
                 st.runs.replaceRangeAssumeCapacity(first + 1, count - 1, &.{});
             } else {
+                merged.chunks.deinit(gpa);
                 st.runs.replaceRangeAssumeCapacity(first, count, &.{});
             }
-            try s.manMerge(st, first, count, if (has_chunks) &st.runs.items[first] else null);
+            s.manMerge(st, first, count, if (has_chunks) &st.runs.items[first] else null) catch |err| {
+                s.poisoned = true;
+                return err;
+            };
         }
 
         // ---------------------------------------------------- drop prefix
@@ -1065,6 +1120,10 @@ pub fn Shard(comptime cfg: Config) type {
         pub fn release(s: *Self, at: u64) void {
             s.lock.lockUncancelable(s.io);
             defer s.lock.unlock(s.io);
+            s.releaseLocked(at);
+        }
+
+        pub fn releaseLocked(s: *Self, at: u64) void {
             for (s.snaps.items, 0..) |v, i| if (v == at) {
                 _ = s.snaps.swapRemove(i);
                 return;
@@ -1813,22 +1872,7 @@ pub fn Shard(comptime cfg: Config) type {
 
         fn streamNamedReplay(s: *Self, name: []const u8) !*Stream {
             if (s.streams.get(name)) |st| return st;
-            const gpa = s.gpa;
-            const st = try gpa.create(Stream);
-            errdefer gpa.destroy(st);
-            st.* = .{ .name = try gpa.dupe(u8, name) };
-            errdefer gpa.free(st.name);
-            try s.streams.put(gpa, st.name, st);
-            if (name.len > 0) {
-                var lo: usize = 0;
-                var hi: usize = s.named.items.len;
-                while (lo < hi) {
-                    const mid = (lo + hi) / 2;
-                    if (std.mem.order(u8, s.named.items[mid].name, name) == .lt) lo = mid + 1 else hi = mid;
-                }
-                try s.named.insert(gpa, lo, st);
-            }
-            return st;
+            return s.newStream(name);
         }
 
         // ------------------------------------------------------- recovery

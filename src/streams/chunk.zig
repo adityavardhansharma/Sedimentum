@@ -269,6 +269,10 @@ pub const View = struct {
         const meta_end = bytes.len - footer_len;
         if (index_off > keys_off or keys_off > meta_end) return error.Corrupt;
         if (@as(u64, nblocks) * index_entry != keys_off - index_off or nblocks == 0) return error.Corrupt;
+        // The block index and first-key table steer every lookup, so they
+        // are checked on every open (they are small); blocks are checked
+        // when they are read.
+        if (blockHash(bytes[index_off..meta_end]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
         return .{
             .bytes = bytes,
             .nblocks = nblocks,
@@ -278,11 +282,8 @@ pub const View = struct {
         };
     }
 
-    /// Checks the metadata hash and every block hash.
+    /// Checks every block hash (`open` already checked the metadata).
     pub fn verify(v: View) error{Corrupt}!void {
-        const f = v.bytes[v.bytes.len - footer_len ..];
-        const index_off = std.mem.readInt(u32, f[0..4], .little);
-        if (blockHash(v.bytes[index_off .. v.bytes.len - footer_len]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
         for (0..v.nblocks) |i| _ = try v.stored(i);
     }
 
