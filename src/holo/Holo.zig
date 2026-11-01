@@ -392,16 +392,19 @@ fn subjectKey(scope: u32, subject: []const u8) u64 {
     return std.hash.Wyhash.hash(scope, subject);
 }
 
-fn simhash(ts: *const text.TermSet, weights: []const f32) u32 {
-    var acc: [32]f32 = @splat(0);
-    for (ts.hashes[0..ts.len], weights) |x, w| {
-        for (0..32) |b| acc[b] += if ((x >> @intCast(b)) & 1 == 1) w else -w;
+/// 32-bit similarity hash over a memory's kept terms: near-copies land
+/// within a bit or two of each other.
+fn simhash(hashes: []const u64, order: []const u16) u32 {
+    const V = @Vector(32, i16);
+    var acc: V = @splat(0);
+    const shifts = std.simd.iota(u32, 32);
+    for (order) |o| {
+        const x: u32 = @truncate(hashes[o]);
+        const bits = (@as(@Vector(32, u32), @splat(x)) >> shifts) & @as(@Vector(32, u32), @splat(1));
+        acc += @as(V, @intCast(bits)) * @as(V, @splat(2)) - @as(V, @splat(1));
     }
-    var out: u32 = 0;
-    for (0..32) |b| if (acc[b] > 0) {
-        out |= @as(u32, 1) << @intCast(b);
-    };
-    return out;
+    const pos: @Vector(32, bool) = acc > @as(V, @splat(0));
+    return @bitCast(pos);
 }
 
 /// Adds one memory's row. Caller holds the write lock. Same code for new
@@ -413,19 +416,21 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     const scope = try h.intern(scope_name);
 
     // Keep the rarest terms: they are what tells memories apart.
-    var weights: [text.TermSet.cap]f32 = undefined;
-    for (ts.hashes[0..ts.len], 0..) |x, i| weights[i] = h.idf(x);
+    var dfs: [text.TermSet.cap]u32 = undefined;
     var order: [text.TermSet.cap]u16 = undefined;
-    for (0..ts.len) |i| order[i] = @intCast(i);
+    for (ts.hashes[0..ts.len], 0..) |x, i| {
+        order[i] = @intCast(i);
+        if (ts.len > max_terms) dfs[i] = h.df(x);
+    }
     const nt = @min(ts.len, max_terms);
     if (ts.len > max_terms) {
         const Ctx = struct {
-            w: []const f32,
+            d: []const u32,
             fn lt(c: @This(), a: u16, b: u16) bool {
-                return c.w[a] > c.w[b];
+                return c.d[a] < c.d[b];
             }
         };
-        std.mem.sortUnstable(u16, order[0..ts.len], Ctx{ .w = weights[0..ts.len] }, Ctx.lt);
+        std.mem.sortUnstable(u16, order[0..ts.len], Ctx{ .d = dfs[0..ts.len] }, Ctx.lt);
     }
 
     var r: Row = .{
@@ -435,7 +440,7 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
         .scope = scope,
         .prev = h.heads.items[scope],
         .len = @intCast(body.len),
-        .sim = simhash(ts, weights[0..ts.len]),
+        .sim = simhash(&ts.hashes, order[0..nt]),
         .nterms = @intCast(nt),
         .kind = 0,
     };
