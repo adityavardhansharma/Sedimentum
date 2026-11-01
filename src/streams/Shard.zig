@@ -111,6 +111,16 @@ const alloc_align = 256;
 const rec_header = 19;
 const max_seq = std.math.maxInt(u64);
 
+/// Syncs a file's contents and the metadata needed to read them back
+/// (its size), but not its timestamps: in-place page rewrites then cost
+/// one device flush instead of a journal commit too.
+fn dataSync(io: Io, file: Io.File) !void {
+    if (builtin.os.tag == .linux) {
+        return std.posix.fdatasync(file.handle);
+    }
+    return file.sync(io);
+}
+
 /// Set in a manifest chunk's bloom word count when the filter is blocked.
 const bloom_blocked_bit: u32 = 1 << 31;
 
@@ -173,6 +183,10 @@ pub fn Shard(comptime cfg: Config) type {
             dirty: bool = false,
             /// v3: the newest seq read back from the page at open.
             page_seq: u64 = 0,
+            /// v3: the page restarted at offset 0 (the tail was sealed) in
+            /// this durable-point epoch, so the manifest that holds its old
+            /// records must be durable before the page is written again.
+            reset_epoch: u64 = 0,
 
             fn recKey(st: *const Stream, off: u32) []const u8 {
                 const h = st.buf.items[off..];
@@ -235,9 +249,17 @@ pub fn Shard(comptime cfg: Config) type {
         /// RAM held by all tail buffers.
         tail_bytes: usize = 0,
         seq: u64 = 0,
-        snaps: std.ArrayList(u64) = .empty,
+        /// Open snapshots. Raised under the lock (so a writer holding it
+        /// sees it), lowered without one.
+        open_snaps: std.atomic.Value(usize) = .init(0),
         wal: if (cfg.wal) Log else void = undefined,
         needs_checkpoint: bool = false,
+        /// Counts durable points; see `Stream.reset_epoch`.
+        durable_epoch: u64 = 0,
+        /// The pending manifest records hold something a commit must make
+        /// durable: anything but seals and merges, which only move records
+        /// that their pages still hold.
+        man_required: bool = false,
         /// Data file generation; compaction moves to the next one.
         gen: u64 = 0,
         /// Set when memory and disk may disagree. Writes are refused.
@@ -366,7 +388,6 @@ pub fn Shard(comptime cfg: Config) type {
             s.free.deinit(gpa);
             s.pending_free.deinit(gpa);
             s.man_buf.deinit(gpa);
-            s.snaps.deinit(gpa);
             s.value_buf.deinit(gpa);
             for (s.torn_tails.items) |n| gpa.free(n);
             s.torn_tails.deinit(gpa);
@@ -560,7 +581,7 @@ pub fn Shard(comptime cfg: Config) type {
         // ------------------------------------------------------- writing
 
         fn snapshotsOpen(s: *const Self) bool {
-            return s.snaps.items.len > 0;
+            return s.open_snaps.load(.acquire) > 0;
         }
 
         pub fn now(s: *const Self) u64 {
@@ -725,13 +746,13 @@ pub fn Shard(comptime cfg: Config) type {
             const value = try s.storedValue(op);
             // The seq moves only after the tail takes the record: a seal it
             // triggers must not count this record as already sealed.
-            errdefer s.seq = seq;
+            errdefer @atomicStore(u64, &s.seq, seq, .release);
             try s.tailAdd(st, op.key, value, seq, op.kind);
-            s.seq = seq;
+            @atomicStore(u64, &s.seq, seq, .release);
             if (cfg.wal) {
                 if (s.wal.segments.items.len > 2) s.needs_checkpoint = true;
             }
-            if (s.pending_bytes > 64 * 1024 * 1024 or s.man_buf.items.len > 4 * 1024 * 1024) s.needs_checkpoint = true;
+            if (s.pending_bytes > 64 * 1024 * 1024 or s.man_buf.items.len > 256 * 1024) s.needs_checkpoint = true;
         }
 
         fn tailAdd(s: *Self, st: *Stream, key: []const u8, value: []const u8, seq: u64, kind: chunk.Kind) !void {
@@ -793,10 +814,15 @@ pub fn Shard(comptime cfg: Config) type {
             }
             s.tail_bytes += st.buf.capacity;
             st.written = 0;
+            st.reset_epoch = s.durable_epoch + 1;
         }
 
         /// Moves the tail into a new run.
         fn seal(s: *Self, st: *Stream) !void {
+            // A seal's manifest records only move records the page still
+            // holds until the page is written again (see `writePages`).
+            const required = s.man_required;
+            defer s.man_required = required;
             if (st.idx.items.len == 0) {
                 if (st.buf.items.len > 0) {
                     st.floor = s.seq;
@@ -913,6 +939,9 @@ pub fn Shard(comptime cfg: Config) type {
         // --------------------------------------------------------- merges
 
         fn maybeMerge(s: *Self, st: *Stream) !void {
+            // Merges only rearrange durable chunks.
+            const required = s.man_required;
+            defer s.man_required = required;
             while (st.runs.items.len >= cfg.fanout) {
                 const n = st.runs.items.len;
                 const tier = st.runs.items[n - 1].tier;
@@ -1351,24 +1380,29 @@ pub fn Shard(comptime cfg: Config) type {
             return &cs[lo];
         }
 
-        pub fn snapshot(s: *Self) !u64 {
-            s.lock.lockUncancelable(s.io);
-            defer s.lock.unlock(s.io);
-            try s.snaps.append(s.gpa, s.seq);
+        pub fn snapshot(s: *Self) u64 {
+            s.lock.lockSharedUncancelable(s.io);
+            defer s.lock.unlockShared(s.io);
+            _ = s.open_snaps.fetchAdd(1, .acq_rel);
             return s.seq;
         }
 
-        pub fn release(s: *Self, at: u64) void {
-            s.lock.lockUncancelable(s.io);
-            defer s.lock.unlock(s.io);
-            s.releaseLocked(at);
+        /// Registers a snapshot whose seq is read later: from then on no
+        /// writer replaces or drops versions in place.
+        pub fn pin(s: *Self) void {
+            s.lock.lockSharedUncancelable(s.io);
+            defer s.lock.unlockShared(s.io);
+            _ = s.open_snaps.fetchAdd(1, .acq_rel);
         }
 
-        pub fn releaseLocked(s: *Self, at: u64) void {
-            for (s.snaps.items, 0..) |v, i| if (v == at) {
-                _ = s.snaps.swapRemove(i);
-                return;
-            };
+        /// The newest applied seq, read without the lock.
+        pub fn visibleSeq(s: *const Self) u64 {
+            return @atomicLoad(u64, &s.seq, .acquire);
+        }
+
+        pub fn release(s: *Self, at: u64) void {
+            _ = at;
+            _ = s.open_snaps.fetchSub(1, .acq_rel);
         }
 
         // ------------------------------------------------------ cursors
@@ -1788,7 +1822,7 @@ pub fn Shard(comptime cfg: Config) type {
                     file = s.data;
                 }
             }
-            const result = file.sync(s.io);
+            const result = if (cfg.wal) file.sync(s.io) else dataSync(s.io, file);
             if (cfg.wal) {
                 s.lock.lockUncancelable(s.io);
                 s.wal.unpinSync();
@@ -1806,7 +1840,16 @@ pub fn Shard(comptime cfg: Config) type {
         fn writePages(s: *Self, sync_data: bool) !void {
             // A journaled batch must be durable before any part of it is.
             if (s.journal) |j| try j.syncIfNeeded();
-            if (s.man_buf.items.len > 0) try s.durablePoint(false);
+            if (s.man_buf.items.len > 0) {
+                // Only needed when the records say something new, or when a
+                // page that restarted would overwrite records that only the
+                // pending manifest moves into chunks.
+                var need = s.man_required;
+                for (s.dirty.items) |st| {
+                    if (st.reset_epoch > s.durable_epoch) need = true;
+                }
+                if (need) try s.durablePoint(false);
+            }
             for (s.dirty.items) |st| {
                 if (st.written < st.buf.items.len) {
                     try s.writeAt(st.buf.items[st.written..], st.page_off + st.written);
@@ -1815,7 +1858,7 @@ pub fn Shard(comptime cfg: Config) type {
                 st.dirty = false;
             }
             s.dirty.clearRetainingCapacity();
-            if (sync_data) try s.data.sync(s.io);
+            if (sync_data) try dataSync(s.io, s.data);
         }
 
         /// v2: seals every tail so the whole WAL is covered by chunks, makes
@@ -1846,7 +1889,7 @@ pub fn Shard(comptime cfg: Config) type {
             s.needs_checkpoint = false;
             if (s.man_buf.items.len == 0 and !force_rewrite and s.pending_free.items.len == 0) return;
             if (s.journal) |j| try j.syncIfNeeded();
-            try s.data.sync(s.io);
+            try dataSync(s.io, s.data);
             try s.manSeq();
             if (force_rewrite or s.man_len > 2 * s.man_base + 8 * 1024 * 1024) {
                 try s.rewriteManifest();
@@ -1856,6 +1899,8 @@ pub fn Shard(comptime cfg: Config) type {
                 s.man_len += s.man_buf.items.len;
             }
             s.man_buf.clearRetainingCapacity();
+            s.man_required = false;
+            s.durable_epoch += 1;
             for (s.pending_free.items) |e| s.releaseNow(e);
             s.pending_free.clearRetainingCapacity();
             s.pending_bytes = 0;
@@ -1866,6 +1911,7 @@ pub fn Shard(comptime cfg: Config) type {
         const ManOp = enum(u8) { stream = 1, add_run = 2, merge = 3, drop = 4, floor = 5, seq = 6, gen = 7, _ };
 
         fn manBegin(s: *Self, op: ManOp) !usize {
+            s.man_required = true;
             const start = s.man_buf.items.len;
             try s.man_buf.appendNTimes(s.gpa, 0, 8);
             try s.man_buf.append(s.gpa, @backingInt(op));
