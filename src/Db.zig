@@ -18,6 +18,9 @@ const ordered = @import("index.zig");
 
 pub const Options = struct {
     log: Log.Options = .{},
+    /// Sync after every write so a successful `put` or `delete` is durable.
+    /// Turn off to batch writes and call `sync` yourself.
+    sync_writes: bool = true,
 };
 
 /// What the index stores per key.
@@ -27,7 +30,7 @@ pub const Entry = struct {
     len: u32,
     seq: u64,
 
-    fn location(e: Entry) Log.Location {
+    pub fn location(e: Entry) Log.Location {
         return .{ .segment = e.segment, .offset = e.offset, .len = e.len };
     }
 
@@ -44,6 +47,7 @@ pub const Entry = struct {
 pub const Index = ordered.OrderedMap(Entry);
 
 gpa: Allocator,
+options: Options,
 log: Log,
 index: Index,
 /// Scratch space for reading records.
@@ -55,7 +59,7 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     var loader: Loader = .{ .index = &idx };
     var log = try Log.open(gpa, io, parent, sub_path, options.log, &loader);
     errdefer log.close();
-    return .{ .gpa = gpa, .log = log, .index = idx };
+    return .{ .gpa = gpa, .options = options, .log = log, .index = idx };
 }
 
 pub fn close(db: *Db) void {
@@ -88,6 +92,12 @@ pub fn lastSeq(db: *const Db) u64 {
 }
 
 pub fn put(db: *Db, key: []const u8, value: []const u8) !void {
+    try db.putBuffered(key, value);
+    if (db.options.sync_writes) try db.log.sync();
+}
+
+/// Applies a put without syncing, whatever `sync_writes` says.
+pub fn putBuffered(db: *Db, key: []const u8, value: []const u8) !void {
     try record.validate(.{ .seq = 1, .kind = .put, .key = key, .value = value });
     // Reserve the index slot first so a failed allocation can't leave a
     // record in the log that the index never saw.
@@ -103,6 +113,13 @@ pub fn put(db: *Db, key: []const u8, value: []const u8) !void {
 /// Deletes `key`. Returns whether it existed. Deleting a missing key
 /// writes nothing.
 pub fn delete(db: *Db, key: []const u8) !bool {
+    const existed = try db.deleteBuffered(key);
+    if (existed and db.options.sync_writes) try db.log.sync();
+    return existed;
+}
+
+/// Applies a delete without syncing, whatever `sync_writes` says.
+pub fn deleteBuffered(db: *Db, key: []const u8) !bool {
     if (key.len == 0) return error.EmptyKey;
     if (db.index.getPtr(key) == null) return false;
     _ = try db.log.append(.{ .seq = db.log.last_seq + 1, .kind = .delete, .key = key });
@@ -128,6 +145,7 @@ pub fn getView(db: *Db, key: []const u8) !?[]const u8 {
 }
 
 fn readValue(db: *Db, e: Entry) ![]const u8 {
+    if (try db.log.view(e.location())) |rec| return rec.value;
     try db.read_buf.resize(db.gpa, e.len);
     const rec = try db.log.read(e.location(), db.read_buf.items);
     return rec.value;

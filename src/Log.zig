@@ -3,7 +3,12 @@
 //! Records are only ever appended to the newest ("active") segment. When it
 //! reaches `Options.segment_bytes` it is synced, sealed, and a new segment is
 //! started. Opening a log replays every record in order to a visitor, which
-//! is how the in-memory index will be rebuilt.
+//! is how the in-memory index is rebuilt.
+//!
+//! Appends go into a user-space buffer first and reach the file when the
+//! buffer fills, on `flush`, or on `sync`. Reads see buffered records too.
+//! Segments are memory-mapped for reading when `Options.mmap` is on, so a
+//! read of a flushed record needs no system call.
 //!
 //! Recovery rules:
 //! - A sealed segment was synced before the next one was created, so any
@@ -15,14 +20,23 @@
 const Log = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const record = @import("record.zig");
 const segment = @import("segment.zig");
 
+const page_align = std.heap.page_size_min;
+const Map = []align(page_align) const u8;
+
 pub const Options = struct {
     /// A segment is sealed once appending would grow it past this size.
     segment_bytes: u64 = 64 * 1024 * 1024,
+    /// Appends are written to the file once this many bytes are buffered.
+    write_buffer_bytes: usize = 256 * 1024,
+    /// Memory-map segments for reads. Falls back to `pread` when off or
+    /// when mapping fails.
+    mmap: bool = true,
 };
 
 /// Where a record lives on disk. The index stores this per key.
@@ -35,6 +49,11 @@ pub const Location = struct {
 pub const OpenError = error{ Locked, Corrupt, OutOfOrder };
 pub const WriteError = error{ Poisoned, SequenceNotIncreasing };
 
+const Seg = struct {
+    file: Io.File,
+    map: ?Map = null,
+};
+
 gpa: Allocator,
 io: Io,
 options: Options,
@@ -42,12 +61,16 @@ dir: Io.Dir,
 lock_file: Io.File,
 active: Io.File,
 active_id: u64,
+/// Logical end of the active segment, including buffered bytes.
 active_end: u64,
-/// Read handles for sealed segments, opened on first use.
-readers: std.AutoHashMapUnmanaged(u64, Io.File) = .empty,
+/// How much of the active segment has been written to the file.
+flushed_end: u64,
+/// Appended records not yet written to the file.
+wbuf: std.ArrayList(u8) = .empty,
+/// Open handle and optional mapping for every live segment, active included.
+segs: std.AutoHashMapUnmanaged(u64, Seg) = .empty,
 /// Every live segment id, oldest first. The last one is `active_id`.
 segments: std.ArrayList(u64) = .empty,
-scratch: std.ArrayList(u8) = .empty,
 last_seq: u64 = 0,
 /// Set after a failed write or sync. The file may hold a partial record,
 /// so further appends would bury it in the middle of the log.
@@ -90,11 +113,9 @@ pub fn open(
         .active = undefined,
         .active_id = 0,
         .active_end = 0,
+        .flushed_end = 0,
     };
-    errdefer {
-        log.segments.deinit(gpa);
-        log.scratch.deinit(gpa);
-    }
+    errdefer log.releaseSegs();
 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -104,9 +125,14 @@ pub fn open(
     std.mem.sortUnstable(u64, log.segments.items, {}, std.sort.asc(u64));
 
     if (log.segments.items.len == 0) {
-        log.active_id = 1;
-        log.active = try log.createSegment(1);
+        const file = try log.createSegment(1);
+        log.addSeg(1, file, true) catch |err| {
+            file.close(io);
+            return err;
+        };
         try log.segments.append(gpa, 1);
+        log.active = file;
+        log.active_id = 1;
         return log;
     }
 
@@ -117,18 +143,54 @@ pub fn open(
         const file = try dir.openFile(io, segment.fileName(&name_buf, id), .{
             .mode = if (is_active) .read_write else .read_only,
         });
-        var keep_open = false;
-        defer if (!keep_open) file.close(io);
-
-        const end = try log.replaySegment(file, id, is_active, visitor);
+        const end = log.replaySegment(file, id, is_active, visitor) catch |err| {
+            file.close(io);
+            return err;
+        };
+        log.addSeg(id, file, is_active) catch |err| {
+            file.close(io);
+            return err;
+        };
         if (is_active) {
             log.active = file;
             log.active_id = id;
             log.active_end = end;
-            keep_open = true;
+            log.flushed_end = end;
         }
     }
     return log;
+}
+
+fn addSeg(log: *Log, id: u64, file: Io.File, is_active: bool) !void {
+    var seg: Seg = .{ .file = file };
+    if (log.options.mmap) {
+        const len = if (is_active)
+            @max(log.options.segment_bytes, try file.length(log.io))
+        else
+            try file.length(log.io);
+        if (len > 0) seg.map = mapFile(file, len);
+    }
+    log.segs.put(log.gpa, id, seg) catch |err| {
+        if (seg.map) |m| std.posix.munmap(m);
+        return err;
+    };
+}
+
+fn mapFile(file: Io.File, len: u64) ?Map {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    return std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch null;
+}
+
+fn releaseSegs(log: *Log) void {
+    const io = log.io;
+    var it = log.segs.valueIterator();
+    while (it.next()) |s| {
+        if (s.map) |m| std.posix.munmap(m);
+        s.file.close(io);
+    }
+    log.segs.deinit(log.gpa);
+    log.segments.deinit(log.gpa);
+    log.wbuf.deinit(log.gpa);
 }
 
 fn replaySegment(log: *Log, file: Io.File, id: u64, is_active: bool, visitor: anytype) !u64 {
@@ -155,17 +217,12 @@ fn replaySegment(log: *Log, file: Io.File, id: u64, is_active: bool, visitor: an
     return scanner.pos;
 }
 
+/// Writes buffered records, syncs, and releases everything.
 pub fn close(log: *Log) void {
-    const io = log.io;
-    if (!log.poisoned) log.active.sync(io) catch {};
-    log.active.close(io);
-    var it = log.readers.valueIterator();
-    while (it.next()) |f| f.close(io);
-    log.readers.deinit(log.gpa);
-    log.segments.deinit(log.gpa);
-    log.scratch.deinit(log.gpa);
-    log.lock_file.close(io);
-    log.dir.close(io);
+    if (!log.poisoned) log.sync() catch {};
+    log.releaseSegs();
+    log.lock_file.close(log.io);
+    log.dir.close(log.io);
     log.* = undefined;
 }
 
@@ -180,35 +237,76 @@ pub fn append(log: *Log, rec: record.Record) !Location {
         try log.rollover();
     }
 
-    try log.scratch.resize(log.gpa, len);
-    record.encode(log.scratch.items, rec);
-    log.active.writePositionalAll(log.io, log.scratch.items, log.active_end) catch |err| {
-        log.poisoned = true;
-        return err;
-    };
+    const start = log.wbuf.items.len;
+    try log.wbuf.resize(log.gpa, start + len);
+    record.encode(log.wbuf.items[start..], rec);
 
     const loc: Location = .{ .segment = log.active_id, .offset = log.active_end, .len = @intCast(len) };
     log.active_end += len;
     log.last_seq = rec.seq;
+
+    if (log.wbuf.items.len >= log.options.write_buffer_bytes) try log.flush();
     return loc;
+}
+
+/// Writes buffered records to the file without syncing.
+pub fn flush(log: *Log) !void {
+    if (log.poisoned) return error.Poisoned;
+    if (log.wbuf.items.len == 0) return;
+    log.active.writePositionalAll(log.io, log.wbuf.items, log.flushed_end) catch |err| {
+        log.poisoned = true;
+        return err;
+    };
+    log.flushed_end = log.active_end;
+    log.wbuf.clearRetainingCapacity();
 }
 
 /// Makes every appended record durable.
 pub fn sync(log: *Log) !void {
-    if (log.poisoned) return error.Poisoned;
+    try log.flush();
     log.active.sync(log.io) catch |err| {
         log.poisoned = true;
         return err;
     };
 }
 
+/// Returns the record at `loc` without copying when it is buffered or
+/// mapped, or null when it must be read with `read`. The result stays
+/// valid until the next append or until the segment is removed.
+pub fn view(log: *const Log, loc: Location) !?record.Record {
+    const full: []const u8 = blk: {
+        if (loc.segment == log.active_id and loc.offset >= log.flushed_end) {
+            const start: usize = @intCast(loc.offset - log.flushed_end);
+            break :blk log.wbuf.items[start..][0..loc.len];
+        }
+        const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
+        const map = seg.map orelse return null;
+        if (loc.offset + loc.len > map.len) return null;
+        break :blk map[@intCast(loc.offset)..][0..loc.len];
+    };
+    return try verify(full);
+}
+
 /// Reads and verifies the record at `loc`. The result borrows `buf`,
 /// which must be at least `loc.len` bytes.
-pub fn read(log: *Log, loc: Location, buf: []u8) !record.Record {
+pub fn read(log: *const Log, loc: Location, buf: []u8) !record.Record {
+    if (try log.view(loc)) |rec| {
+        // Copy so the result has the same lifetime as `buf`.
+        const full = buf[0..loc.len];
+        const key_off = record.header_len;
+        @memcpy(full[key_off..][0..rec.key.len], rec.key);
+        @memcpy(full[key_off + rec.key.len ..][0..rec.value.len], rec.value);
+        return .{ .seq = rec.seq, .kind = rec.kind, .key = full[key_off..][0..rec.key.len], .value = full[key_off + rec.key.len ..][0..rec.value.len] };
+    }
     const full = buf[0..loc.len];
-    const file = try log.fileFor(loc.segment);
-    const got = try file.readPositionalAll(log.io, full, loc.offset);
+    const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
+    const got = try seg.file.readPositionalAll(log.io, full, loc.offset);
     if (got != full.len) return error.Corrupt;
+    return try verify(full);
+}
+
+fn verify(full: []const u8) !record.Record {
+    if (full.len < record.header_len) return error.Corrupt;
     const h = record.decodeHeader(full[0..record.header_len]);
     if (!h.isPlausible() or h.totalLen() != full.len or !record.checksumMatches(h, full)) {
         return error.Corrupt;
@@ -216,38 +314,27 @@ pub fn read(log: *Log, loc: Location, buf: []u8) !record.Record {
     return record.view(h, full);
 }
 
-fn fileFor(log: *Log, id: u64) !Io.File {
-    if (id == log.active_id) return log.active;
-    const gop = try log.readers.getOrPut(log.gpa, id);
-    if (!gop.found_existing) {
-        var name_buf: [segment.name_len]u8 = undefined;
-        gop.value_ptr.* = log.dir.openFile(log.io, segment.fileName(&name_buf, id), .{}) catch |err| {
-            log.readers.removeByPtr(gop.key_ptr);
-            return err;
-        };
-    }
-    return gop.value_ptr.*;
-}
-
 fn rollover(log: *Log) !void {
-    log.sync() catch |err| return err;
+    try log.sync();
     const next_id = log.active_id + 1;
     const next = log.createSegment(next_id) catch |err| {
         log.poisoned = true;
         return err;
     };
-    try log.segments.append(log.gpa, next_id);
-    // Keep the sealed file open for reads instead of reopening it.
-    log.readers.put(log.gpa, log.active_id, log.active) catch |err| {
-        log.active.close(log.io);
-        log.active = next;
-        log.active_id = next_id;
-        log.active_end = 0;
+    log.addSeg(next_id, next, true) catch |err| {
+        next.close(log.io);
+        log.poisoned = true;
         return err;
     };
+    log.segments.append(log.gpa, next_id) catch |err| {
+        log.poisoned = true;
+        return err;
+    };
+    // The sealed segment keeps its handle and mapping in `segs` for reads.
     log.active = next;
     log.active_id = next_id;
     log.active_end = 0;
+    log.flushed_end = 0;
 }
 
 /// Creates an empty segment and makes its directory entry durable.
@@ -398,6 +485,7 @@ test "damage in the middle of the active segment refuses to open" {
         defer log.close();
         _ = try log.append(.{ .seq = 1, .kind = .put, .key = "a", .value = "1" });
         _ = try log.append(.{ .seq = 2, .kind = .put, .key = "b", .value = "2" });
+        try log.flush();
         try log.active.writePositionalAll(io, "Z", record.header_len);
         try log.sync();
     }
@@ -431,10 +519,44 @@ test "read detects a damaged record" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{}, NoVisitor{});
+    for ([_]bool{ true, false }) |use_mmap| {
+        try readDetectsDamage(io, tmp.dir, use_mmap);
+    }
+}
+
+fn readDetectsDamage(io: Io, parent: Io.Dir, use_mmap: bool) !void {
+    const sub = if (use_mmap) "mapped" else "plain";
+    var log = try Log.open(testing.allocator, io, parent, sub, .{ .mmap = use_mmap }, NoVisitor{});
     defer log.close();
     const loc = try log.append(.{ .seq = 1, .kind = .put, .key = "a", .value = "hello" });
+    try log.flush();
     try log.active.writePositionalAll(io, "J", loc.offset + loc.len - 1);
     var buf: [64]u8 = undefined;
     try testing.expectError(error.Corrupt, log.read(loc, &buf));
+}
+
+test "buffered, flushed and mapped reads all see the same records" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var log = try Log.open(testing.allocator, io, tmp.dir, "db", .{ .write_buffer_bytes = 100, .segment_bytes = 4096 }, NoVisitor{});
+    defer log.close();
+
+    var locs: std.ArrayList(Location) = .empty;
+    defer locs.deinit(testing.allocator);
+    for (0..200) |i| {
+        var kb: [16]u8 = undefined;
+        try locs.append(testing.allocator, try log.append(.{ .seq = i + 1, .kind = .put, .key = try std.fmt.bufPrint(&kb, "key{d}", .{i}), .value = "some value bytes" }));
+    }
+    try testing.expect(log.segments.items.len > 1);
+    try testing.expect(log.wbuf.items.len > 0);
+
+    var buf: [128]u8 = undefined;
+    for (locs.items, 0..) |loc, i| {
+        var kb: [16]u8 = undefined;
+        const want = try std.fmt.bufPrint(&kb, "key{d}", .{i});
+        const rec = try log.read(loc, &buf);
+        try testing.expectEqualStrings(want, rec.key);
+        if (try log.view(loc)) |v| try testing.expectEqualStrings(want, v.key);
+    }
 }
