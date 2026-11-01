@@ -393,7 +393,7 @@ pub fn main(init: std.process.Init) !void {
 // ------------------------------------------------------------ std workload
 
 fn runStd(comptime E: type, io: Io, dir: []const u8, n: u64) !void {
-    prog_phases = 12;
+    prog_phases = 13;
     var db = try E.open(io, dir);
     var kb: [48]u8 = undefined;
     var vb: [value_len]u8 = undefined;

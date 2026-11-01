@@ -201,7 +201,7 @@ fn main() {
 
 fn run_std(dir: &Path, n: u64) {
     let dir = dir.to_path_buf();
-    set_phases(12);
+    set_phases(13);
     let mut db = open(&dir);
 
     // load: n buffered puts in random order, then one sync.
