@@ -29,6 +29,9 @@ const char *sdm_last_error(void);
 
 /* sync_writes != 0 makes every successful write durable (the default). */
 sdm_status sdm_open(const char *path, size_t path_len, int sync_writes, sdm_db **out);
+/* Like sdm_open, but once the in-memory index passes memory_budget bytes,
+   entries for older data move to an index file on disk. 0 means no limit. */
+sdm_status sdm_open_capped(const char *path, size_t path_len, int sync_writes, size_t memory_budget, sdm_db **out);
 void sdm_close(sdm_db *db);
 
 sdm_status sdm_put(sdm_db *db, const uint8_t *key, size_t key_len, const uint8_t *value, size_t value_len);

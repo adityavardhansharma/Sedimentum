@@ -25,6 +25,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const record = @import("record.zig");
 const segment = @import("segment.zig");
+const cold = @import("cold.zig");
 
 const page_align = std.heap.page_size_min;
 const Map = []align(page_align) const u8;
@@ -128,6 +129,16 @@ pub fn open(
     };
     errdefer log.releaseSegs();
 
+    // A visitor with `prepare(dir) !u64` can name the last segment it
+    // already knows about from elsewhere; those sealed segments are mapped
+    // but not replayed.
+    const V = @TypeOf(visitor);
+    const T = switch (@typeInfo(V)) {
+        .pointer => |ptr| ptr.child,
+        else => V,
+    };
+    const skip_through: u64 = if (@hasDecl(T, "prepare")) try visitor.prepare(dir) else 0;
+
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
@@ -156,7 +167,8 @@ pub fn open(
         const file = try dir.openFile(io, segment.fileName(&name_buf, id), .{
             .mode = if (is_active) .read_write else .read_only,
         });
-        const end = log.replaySegment(file, id, is_active, visitor) catch |err| {
+        const skip = !is_active and id <= skip_through;
+        const end = (if (skip) file.length(io) else log.replaySegment(file, id, is_active, visitor)) catch |err| {
             file.close(io);
             return err;
         };
@@ -405,6 +417,8 @@ pub const Problem = struct {
         corrupt,
         /// A batch whose checksum matches but whose contents are invalid.
         bad_batch,
+        /// The cold index file is damaged. `segment` and `offset` are 0.
+        bad_cold_index,
     };
 };
 
@@ -485,6 +499,17 @@ pub fn check(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8) !Chec
             .file_len = scanner.file_len,
         });
     }
+    var damaged = false;
+    if (cold.Reader.open(gpa, io, dir)) |maybe| {
+        if (maybe) |r| {
+            var reader = r;
+            defer reader.close();
+            reader.verify() catch {
+                damaged = true;
+            };
+        }
+    } else |_| damaged = true;
+    if (damaged) try report.problems.append(gpa, .{ .segment = 0, .kind = .bad_cold_index, .offset = 0, .file_len = 0 });
     return report;
 }
 

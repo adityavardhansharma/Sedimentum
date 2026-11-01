@@ -21,8 +21,27 @@ log-structured hash/tree store:
 - **Snapshots** are sequence numbers plus per-key version chains. Taking one
   copies nothing.
 
-The trade-off: every key must fit in memory. With 40-byte keys that is about
-200 bytes per live record (1M records use about 210 MB of RAM).
+By default every key lives in memory: with 40-byte keys that is about 200
+bytes per live record (1M records use about 210 MB of RAM).
+
+## More data than RAM
+
+Set `memory_budget` (bytes) to cap the in-memory index. When it grows past the
+budget, the entries for sealed segments are merged into **the cold index**
+(`cold.idx`), a sorted file with a bloom filter and a one-key-per-block summary,
+and dropped from memory:
+
+- Recent data stays in memory and is as fast as before. A read of older data
+  checks the bloom filter (no disk access when the key is absent), then reads
+  one 4 KB block through a memory map.
+- Writing a key that only the cold index knows first copies its entry into
+  memory, so writes, batches, CAS and compaction all work as before.
+- Opening skips the segments the cold index covers, so reopening a large
+  database takes a fraction of the time.
+- Merges pause while a snapshot is open and run when the log starts a new
+  segment.
+
+`cold.idx` is part of the database: keep it with the segment files.
 
 ## Features
 
@@ -36,6 +55,7 @@ The trade-off: every key must fit in memory. With 40-byte keys that is about
 - `Shared`: a thread-safe handle with readers in parallel and group commit
 - A C ABI (`libsedimentum`, `include/sedimentum.h`) for other languages
 - A `sedimentum` CLI: `stats`, `check`, `get`, `put`, `delete`, `scan`, `compact`
+- An optional memory cap that moves older index entries to disk
 
 ## Recovery rules
 
@@ -72,7 +92,8 @@ target/release/kiban-bench /tmp/kiban 1000000
 ```
 
 Each needs a new or empty directory and at least 640 records, and prints one
-JSON line per phase. Results from three 1M-record rounds: Sedimentum was faster
+JSON line per phase. A third argument to `sedimentum-bench` sets a memory
+budget in MB. Results from three 1M-record rounds: Sedimentum was faster
 in 9 of 12 workloads; kiban was faster to reopen and to scan everything in key
 order.
 

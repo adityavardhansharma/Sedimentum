@@ -9,6 +9,7 @@ pub const Log = @import("Log.zig");
 pub const record = @import("record.zig");
 pub const segment = @import("segment.zig");
 pub const index = @import("index.zig");
+pub const cold = @import("cold.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
