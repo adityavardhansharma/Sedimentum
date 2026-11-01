@@ -46,12 +46,14 @@ pub const Location = struct {
     len: u32,
 };
 
-pub const OpenError = error{ Locked, Corrupt, OutOfOrder };
+pub const OpenError = error{ Locked, Corrupt };
 pub const WriteError = error{ Poisoned, SequenceNotIncreasing };
 
 const Seg = struct {
     file: Io.File,
     map: ?Map = null,
+    /// Final size once sealed. Unused for the active segment.
+    size: u64 = 0,
 };
 
 gpa: Allocator,
@@ -151,6 +153,7 @@ pub fn open(
             file.close(io);
             return err;
         };
+        log.segs.getPtr(id).?.size = end;
         if (is_active) {
             log.active = file;
             log.active_id = id;
@@ -197,8 +200,9 @@ fn replaySegment(log: *Log, file: Io.File, id: u64, is_active: bool, visitor: an
     var scanner = try segment.Scanner.init(log.gpa, log.io, file);
     defer scanner.deinit();
     while (try scanner.next()) |item| {
-        if (item.record.seq <= log.last_seq) return error.OutOfOrder;
-        log.last_seq = item.record.seq;
+        // Compaction copies live records forward with their original
+        // sequence numbers, so file order is not sequence order.
+        log.last_seq = @max(log.last_seq, item.record.seq);
         try visitor.onRecord(Location{
             .segment = id,
             .offset = item.offset,
@@ -247,6 +251,49 @@ pub fn append(log: *Log, rec: record.Record) !Location {
 
     if (log.wbuf.items.len >= log.options.write_buffer_bytes) try log.flush();
     return loc;
+}
+
+/// Appends an already encoded, already verified record unchanged. Used by
+/// compaction to move live records out of old segments.
+pub fn appendRaw(log: *Log, bytes: []const u8) !Location {
+    if (log.poisoned) return error.Poisoned;
+    if (log.active_end > 0 and log.active_end + bytes.len > log.options.segment_bytes) {
+        try log.rollover();
+    }
+    try log.wbuf.appendSlice(log.gpa, bytes);
+    const loc: Location = .{ .segment = log.active_id, .offset = log.active_end, .len = @intCast(bytes.len) };
+    log.active_end += bytes.len;
+    if (log.wbuf.items.len >= log.options.write_buffer_bytes) try log.flush();
+    return loc;
+}
+
+/// Size in bytes of a segment, including buffered bytes for the active one.
+pub fn segmentSize(log: *const Log, id: u64) u64 {
+    if (id == log.active_id) return log.active_end;
+    return if (log.segs.get(id)) |seg| seg.size else 0;
+}
+
+/// Starts a checksum-verifying scan of a sealed segment.
+pub fn scanSegment(log: *const Log, id: u64) !segment.Scanner {
+    std.debug.assert(id != log.active_id);
+    const seg = log.segs.get(id) orelse return error.Corrupt;
+    return segment.Scanner.init(log.gpa, log.io, seg.file);
+}
+
+/// Deletes a sealed segment. The caller must have made every record it
+/// still needs durable elsewhere first.
+pub fn removeSegment(log: *Log, id: u64) !void {
+    std.debug.assert(id != log.active_id);
+    const kv = log.segs.fetchRemove(id) orelse return;
+    if (kv.value.map) |m| std.posix.munmap(m);
+    kv.value.file.close(log.io);
+    for (log.segments.items, 0..) |sid, i| if (sid == id) {
+        _ = log.segments.orderedRemove(i);
+        break;
+    };
+    var name_buf: [segment.name_len]u8 = undefined;
+    try log.dir.deleteFile(log.io, segment.fileName(&name_buf, id));
+    try syncDir(log.io, log.dir);
 }
 
 /// Writes buffered records to the file without syncing.
@@ -331,6 +378,7 @@ fn rollover(log: *Log) !void {
         return err;
     };
     // The sealed segment keeps its handle and mapping in `segs` for reads.
+    log.segs.getPtr(log.active_id).?.size = log.active_end;
     log.active = next;
     log.active_id = next_id;
     log.active_end = 0;

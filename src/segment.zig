@@ -51,6 +51,8 @@ pub const Scanner = struct {
     /// of the last valid record.
     pos: u64 = 0,
     stop: Stop = .end,
+    /// Raw bytes of the record most recently returned by `next`.
+    last: []const u8 = &.{},
 
     const initial_buf = 256 * 1024;
 
@@ -84,6 +86,12 @@ pub const Scanner = struct {
         return null;
     }
 
+    /// The encoded bytes of the record most recently returned by `next`,
+    /// valid until the next call.
+    pub fn lastBytes(s: *const Scanner) []const u8 {
+        return s.last;
+    }
+
     /// Returns the record at `offset` if a complete, checksummed record is there.
     fn recordAt(s: *Scanner, offset: u64) !?record.Record {
         if (s.file_len - offset < record.header_len) return null;
@@ -93,6 +101,7 @@ pub const Scanner = struct {
         if (s.file_len - offset < h.totalLen()) return null;
         const full = try s.window(offset, h.totalLen());
         if (!record.checksumMatches(h, full)) return null;
+        s.last = full;
         return record.view(h, full);
     }
 

@@ -22,6 +22,9 @@ lock: Io.RwLock = .init,
 commit_mutex: Io.Mutex = .init,
 /// Every write with seq <= this is durable. Guarded by `commit_mutex`.
 synced_seq: u64 = 0,
+/// Compaction runs here rather than inside `Db` so it can hold the
+/// commit lock: it closes files a group commit might be syncing.
+auto_compact: bool = true,
 stats: Stats = .{},
 
 pub const Stats = struct {
@@ -32,7 +35,14 @@ pub const Stats = struct {
 pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Db.Options) !*Shared {
     const s = try gpa.create(Shared);
     errdefer gpa.destroy(s);
-    s.* = .{ .gpa = gpa, .io = io, .db = try Db.open(gpa, io, parent, sub_path, options) };
+    var db_options = options;
+    db_options.auto_compact = false;
+    s.* = .{
+        .gpa = gpa,
+        .io = io,
+        .db = try Db.open(gpa, io, parent, sub_path, db_options),
+        .auto_compact = options.auto_compact,
+    };
     s.synced_seq = s.db.lastSeq();
     return s;
 }
@@ -44,25 +54,45 @@ pub fn close(s: *Shared) void {
 }
 
 pub fn put(s: *Shared, key: []const u8, value: []const u8) !void {
+    var rolled = false;
     const seq = blk: {
         s.lock.lockUncancelable(s.io);
         defer s.lock.unlock(s.io);
+        const before = s.db.log.segments.items.len;
         try s.db.putBuffered(key, value);
+        rolled = s.db.log.segments.items.len > before;
         break :blk s.db.lastSeq();
     };
     if (s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
+}
+
+/// Rewrites mostly dead segments. Blocks writers and readers while it runs.
+pub fn compact(s: *Shared) !usize {
+    s.commit_mutex.lockUncancelable(s.io);
+    defer s.commit_mutex.unlock(s.io);
+    s.lock.lockUncancelable(s.io);
+    defer s.lock.unlock(s.io);
+    const n = try s.db.compact();
+    // Compaction syncs the log, so everything accepted so far is durable.
+    s.synced_seq = s.db.lastSeq();
+    return n;
 }
 
 pub fn delete(s: *Shared, key: []const u8) !bool {
     var seq: u64 = 0;
+    var rolled = false;
     const existed = blk: {
         s.lock.lockUncancelable(s.io);
         defer s.lock.unlock(s.io);
+        const before = s.db.log.segments.items.len;
         const existed = try s.db.deleteBuffered(key);
+        rolled = s.db.log.segments.items.len > before;
         seq = s.db.lastSeq();
         break :blk existed;
     };
     if (existed and s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
     return existed;
 }
 
