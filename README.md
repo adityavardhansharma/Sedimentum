@@ -1,4 +1,4 @@
-# t3kv
+# Sedimentum
 
 A small embedded key-value store written in Zig, built for agent memory: many
 small records, grouped by an agent or conversation prefix, read by key or as

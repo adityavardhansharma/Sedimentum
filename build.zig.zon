@@ -1,7 +1,7 @@
 .{
-    .name = .t3kv,
+    .name = .sedimentum,
     .version = "0.0.1",
-    .fingerprint = 0xdc5bd57b31aa5bbe,
+    .fingerprint = 0xae7d01229e753bab,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "LICENSE" },
