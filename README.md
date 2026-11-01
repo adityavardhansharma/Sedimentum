@@ -97,6 +97,42 @@ already hold (by sequence number) is put back, then the journal is emptied.
 `compact` copies live data into a fresh file and deletes the old one;
 expired values are dropped there and in merges.
 
+## Holo: memory that briefs the agent
+
+`Holo` (in `src/holo/`) is a different take on agent memory. The other
+engines store records an agent fetches by key. Holo answers the question an
+agent actually has: "what do I need to know right now?"
+
+```zig
+const h = try sdm.Holo.open(gpa, io, dir, "memory", .{});
+_ = try h.remember("ledger/chat/42", "we moved the deploy to friday", .{});
+_ = try h.remember("ledger/decisions", "auth tokens refresh every 60 minutes", .{ .subject = "auth-refresh" });
+
+const hits = try h.recall(gpa, .{ .about = "when do we deploy?", .scope = "ledger" });
+const b = try h.brief(gpa, "user asks why login keeps expiring", "ledger", 2000); // fits 2000 tokens
+```
+
+- **remember / recent / current / get / forget / forgetScope / settle**
+- **recall** ranks memories by how much of the question they match, then by
+  recency; "ledger" covers every scope under it.
+- **brief** packs the relevant and the recent memories into a token budget.
+- **Sedimentation:** a newer memory with the same subject buries the old one;
+  a near-copy of a recent memory buries the copy; among equally good answers
+  the newest wins and the older ones drop out of briefs; `settle` adds a
+  summary and sinks what it covers. Buried memories stay reachable with `deep`.
+
+How it stays small: each memory keeps its 32 rarest terms as 16-bit tags in a
+96-byte row on disk. Every 128 rows share one 4096-bit page fingerprint, and
+those fingerprints (about 4 bytes per memory) are the only per-memory data in
+RAM. A question checks page fingerprints first and opens only pages that
+could score high enough. Text lives in a v3 store; rows, fingerprints and the
+rest are checkpointed and rebuilt from the store after a crash.
+
+Limits: matching is by words (with light stemming), not by meaning, so
+"login" does not find "auth" unless both appear.
+
+Benchmarks: `zig-out/bin/sedimentum-holo-bench <agent|recall> <new-dir> [memories]`.
+
 ## Features
 
 - `put`, `get`, `delete`, durable or buffered

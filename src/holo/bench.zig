@@ -629,6 +629,10 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
                     const b = try h.brief(gpa, question, proj, 2000);
                     lat.ns.append(driver, @intCast(nowNs(io) - a)) catch {};
                     defer b.deinit(gpa);
+                    if (!sample_printed) {
+                        sample_printed = true;
+                        std.debug.print("BRIEF-SAMPLE brief(\"{s}\", \"{s}\", 2000)\n{s}BRIEF-END\n", .{ question, proj, b.text });
+                    }
                     tokens += b.tokens;
                     if (std.mem.indexOf(u8, b.text, want) != null) found_any += 1;
                     if (old) |o| if (std.mem.indexOf(u8, b.text, o) != null) {
@@ -687,6 +691,8 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
     }
     h.close();
 }
+
+var sample_printed = false;
 
 fn ratio(a: u64, b: u64) f64 {
     return @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(@max(b, 1)));
