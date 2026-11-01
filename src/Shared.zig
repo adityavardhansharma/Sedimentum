@@ -49,6 +49,10 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
         .db = try Db.open(gpa, io, parent, sub_path, db_options),
         .auto_compact = options.auto_compact,
     };
+    errdefer s.db.close();
+    // Recovered records may still be only in the OS cache if the last
+    // process died before syncing. Sync before calling them durable.
+    try s.db.log.sync();
     s.synced_seq = s.db.lastSeq();
     return s;
 }
@@ -191,15 +195,16 @@ fn syncNow(s: *Shared) !u64 {
         defer s.lock.unlock(s.io);
         try s.db.log.flush();
         target = s.db.lastSeq();
-        file = s.db.log.active;
+        // A writer may roll over while we sync; the pin keeps this handle open.
+        file = s.db.log.pinSyncHandle();
     }
     // Earlier segments were synced when they were sealed.
-    file.sync(s.io) catch |err| {
-        s.lock.lockUncancelable(s.io);
-        s.db.log.poisoned = true;
-        s.lock.unlock(s.io);
-        return err;
-    };
+    const result = file.sync(s.io);
+    s.lock.lockUncancelable(s.io);
+    s.db.log.unpinSync();
+    if (result) |_| {} else |_| s.db.log.poisoned = true;
+    s.lock.unlock(s.io);
+    try result;
     _ = s.stats.syncs.fetchAdd(1, .monotonic);
     return target;
 }
@@ -282,26 +287,22 @@ pub fn getAt(s: *Shared, gpa: Allocator, snap: Db.Snapshot, key: []const u8) !?[
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
     const e = s.db.index.getPtr(key) orelse return null;
-    var v: ?*const Db.Entry = e;
-    while (v) |cur| : (v = cur.older) {
-        if (cur.seq <= snap.seq) {
-            if (cur.deleted) return null;
-            return try s.copyValue(gpa, cur.*);
-        }
-    }
-    return null;
+    const v = e.resolve(snap.seq, s.db.now()) orelse return null;
+    return try s.copyValue(gpa, v.*);
 }
 
 /// Copies up to `limit` pairs from `range`, at `snap` if given. Free the
 /// result with `Db.freePairs`.
 pub fn scan(s: *Shared, gpa: Allocator, range: Db.Range, snap: ?Db.Snapshot, limit: usize) ![]Db.Pair {
-    // Iteration may fall back to Db's scratch buffer when mmap is off, so
-    // take the exclusive lock in that case.
-    const exclusive = !s.db.options.log.mmap;
-    if (exclusive) s.lock.lockUncancelable(s.io) else s.lock.lockSharedUncancelable(s.io);
-    defer if (exclusive) s.lock.unlock(s.io) else s.lock.unlockShared(s.io);
+    // Each scan reads into its own buffer, so scans can share the lock.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    s.lock.lockSharedUncancelable(s.io);
+    defer s.lock.unlockShared(s.io);
     var it = s.db.iterator(range);
     if (snap) |sn| it.at = sn.seq;
+    it.buf = &buf;
+    it.buf_gpa = gpa;
     return Db.collect(gpa, &it, limit);
 }
 

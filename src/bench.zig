@@ -112,6 +112,11 @@ fn report(phase: []const u8, ops: u64, secs: f64, lat: ?*Lat, comptime extra_fmt
     try w.flush();
 }
 
+fn fatal(io: Io, msg: []const u8) !void {
+    try Io.File.stderr().writeStreamingAll(io, msg);
+    std.process.exit(2);
+}
+
 fn open(gpa: std.mem.Allocator, io: Io, dir: []const u8) !*Shared {
     return Shared.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
 }
@@ -120,11 +125,20 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len < 2) return fatal(io, "usage: sedimentum-bench <new-dir> [records]\n");
     const dir = args[1];
-    const n: u64 = if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else 1_000_000;
+    const n: u64 = if (args.len > 2) std.fmt.parseInt(u64, args[2], 10) catch 0 else 1_000_000;
+    // latest10 needs at least 10 records per agent.
+    if (n < 10 * agents) return fatal(io, "records must be a number of at least 640\n");
     out = Io.File.stdout().writerStreaming(io, &out_buf);
 
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // Never delete anything: the benchmark needs a new or empty directory.
+    if (Io.Dir.cwd().openDir(io, dir, .{ .iterate = true })) |existing| {
+        var d = existing;
+        defer d.close(io);
+        var it = d.iterate();
+        if (try it.next(io) != null) return fatal(io, "the benchmark directory must be new or empty\n");
+    } else |_| {}
     var db = try open(gpa, io, dir);
 
     var kb: [48]u8 = undefined;

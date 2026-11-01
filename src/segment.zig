@@ -53,6 +53,8 @@ pub const Scanner = struct {
     stop: Stop = .end,
     /// Raw bytes of the record most recently returned by `next`.
     last: []const u8 = &.{},
+    /// Close `file` in `deinit`.
+    owns_file: bool = false,
 
     const initial_buf = 256 * 1024;
 
@@ -69,6 +71,7 @@ pub const Scanner = struct {
 
     pub fn deinit(s: *Scanner) void {
         s.gpa.free(s.buf);
+        if (s.owns_file) s.file.close(s.io);
         s.* = undefined;
     }
 
@@ -122,8 +125,11 @@ pub const Scanner = struct {
             return s.buf[start..][0..len];
         }
         if (len > s.buf.len) {
+            // Allocate first so a failure leaves the old buffer for deinit.
+            const bigger = try s.gpa.alloc(u8, len);
             s.gpa.free(s.buf);
-            s.buf = try s.gpa.alloc(u8, len);
+            s.buf = bigger;
+            s.buf_len = 0;
         }
         const want: usize = @intCast(@min(s.buf.len, s.file_len - offset));
         const got = try s.file.readPositionalAll(s.io, s.buf[0..want], offset);

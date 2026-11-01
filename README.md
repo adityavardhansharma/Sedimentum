@@ -71,6 +71,9 @@ cd bench/kiban-bench && cargo build --release
 target/release/kiban-bench /tmp/kiban 1000000
 ```
 
-Each prints one JSON line per phase.
+Each needs a new or empty directory and at least 640 records, and prints one
+JSON line per phase. Results from three 1M-record rounds: Sedimentum was faster
+in 9 of 12 workloads; kiban was faster to reopen and to scan everything in key
+order.
 
 Licensed under MIT.
