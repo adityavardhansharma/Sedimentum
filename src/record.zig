@@ -97,13 +97,19 @@ pub const Header = struct {
     }
 };
 
-pub const ValidateError = error{ EmptyKey, KeyTooLarge, ValueTooLarge, DeleteWithValue, MissingExpiry };
+pub const ValidateError = error{ EmptyKey, KeyTooLarge, ValueTooLarge, DeleteWithValue, MissingExpiry, InvalidKind };
 
+/// Checks a top-level record before it is written, so that everything
+/// `append` accepts is something recovery will read back.
 pub fn validate(rec: Record) ValidateError!void {
-    std.debug.assert(rec.kind != .batch);
+    switch (rec.kind) {
+        .put, .delete, .put_ttl => {},
+        else => return error.InvalidKind,
+    }
     if (rec.key.len == 0) return error.EmptyKey;
     if (rec.key.len > max_key_len) return error.KeyTooLarge;
-    if (rec.value.len > max_value_len) return error.ValueTooLarge;
+    const ttl: usize = if (hasTtl(rec.kind)) ttl_prefix_len else 0;
+    if (rec.value.len + ttl > max_value_len) return error.ValueTooLarge;
     if (rec.kind == .delete and rec.value.len != 0) return error.DeleteWithValue;
     if (rec.kind == .put_ttl and rec.expires == 0) return error.MissingExpiry;
 }
@@ -275,4 +281,13 @@ test "zeroed bytes never look like a record" {
 test "validate rejects bad input" {
     try std.testing.expectError(error.EmptyKey, validate(.{ .seq = 1, .kind = .put, .key = "" }));
     try std.testing.expectError(error.DeleteWithValue, validate(.{ .seq = 1, .kind = .delete, .key = "k", .value = "x" }));
+}
+
+test "validate rejects what recovery would not read back" {
+    try std.testing.expectError(error.InvalidKind, validate(.{ .seq = 1, .kind = @fromBackingInt(@intCast(9)), .key = "k" }));
+    try std.testing.expectError(error.InvalidKind, validate(.{ .seq = 1, .kind = .batch_put, .key = "k" }));
+    // validate only looks at the length, so the bytes are never read.
+    var fake: [1]u8 = .{0};
+    const too_big: []const u8 = (&fake).ptr[0 .. max_value_len - ttl_prefix_len + 1];
+    try std.testing.expectError(error.ValueTooLarge, validate(.{ .seq = 1, .kind = .put_ttl, .key = "k", .value = too_big, .expires = 5 }));
 }

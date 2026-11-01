@@ -50,7 +50,10 @@ pub const OpenError = error{ Locked, Corrupt };
 pub const WriteError = error{ Poisoned, SequenceNotIncreasing };
 
 const Seg = struct {
-    file: Io.File,
+    /// Open handle. A sealed segment that is fully mapped drops its handle,
+    /// so the number of open files does not grow with the number of
+    /// segments. Without a mapping (mmap off or failed) the handle stays.
+    file: ?Io.File,
     map: ?Map = null,
     /// Final size once sealed. Unused for the active segment.
     size: u64 = 0,
@@ -69,7 +72,7 @@ active_end: u64,
 flushed_end: u64,
 /// Appended records not yet written to the file.
 wbuf: std.ArrayList(u8) = .empty,
-/// Open handle and optional mapping for every live segment, active included.
+/// Optional handle and mapping for every live segment, active included.
 segs: std.AutoHashMapUnmanaged(u64, Seg) = .empty,
 /// Every live segment id, oldest first. The last one is `active_id`.
 segments: std.ArrayList(u64) = .empty,
@@ -95,6 +98,9 @@ pub fn open(
 ) !Log {
     var dir = try parent.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
     errdefer dir.close(io);
+    // The directory itself may be new. Sync its parent so the entry
+    // survives a power loss along with the segments inside it.
+    try syncParentDir(io, dir);
 
     const lock_file = dir.createFile(io, "LOCK", .{
         .truncate = false,
@@ -127,12 +133,14 @@ pub fn open(
     std.mem.sortUnstable(u64, log.segments.items, {}, std.sort.asc(u64));
 
     if (log.segments.items.len == 0) {
+        try log.segments.ensureUnusedCapacity(gpa, 1);
         const file = try log.createSegment(1);
         log.addSeg(1, file, true) catch |err| {
             file.close(io);
+            log.deleteSegmentFile(1);
             return err;
         };
-        try log.segments.append(gpa, 1);
+        log.segments.appendAssumeCapacity(1);
         log.active = file;
         log.active_id = 1;
         return log;
@@ -153,7 +161,9 @@ pub fn open(
             file.close(io);
             return err;
         };
-        log.segs.getPtr(id).?.size = end;
+        const seg = log.segs.getPtr(id).?;
+        seg.size = end;
+        if (!is_active) dropHandleIfMapped(io, seg);
         if (is_active) {
             log.active = file;
             log.active_id = id;
@@ -165,6 +175,7 @@ pub fn open(
 }
 
 fn addSeg(log: *Log, id: u64, file: Io.File, is_active: bool) !void {
+    try log.segs.ensureUnusedCapacity(log.gpa, 1);
     var seg: Seg = .{ .file = file };
     if (log.options.mmap) {
         const len = if (is_active)
@@ -173,10 +184,26 @@ fn addSeg(log: *Log, id: u64, file: Io.File, is_active: bool) !void {
             try file.length(log.io);
         if (len > 0) seg.map = mapFile(file, len);
     }
-    log.segs.put(log.gpa, id, seg) catch |err| {
-        if (seg.map) |m| std.posix.munmap(m);
-        return err;
-    };
+    log.segs.putAssumeCapacity(id, seg);
+}
+
+/// Closes a sealed segment's handle when its mapping covers the whole file.
+fn dropHandleIfMapped(io: Io, seg: *Seg) void {
+    const map = seg.map orelse return;
+    if (map.len < seg.size) return;
+    if (seg.file) |f| f.close(io);
+    seg.file = null;
+}
+
+/// Opens a sealed segment for reading when it has no open handle.
+fn openSegment(log: *const Log, id: u64) !Io.File {
+    var name_buf: [segment.name_len]u8 = undefined;
+    return log.dir.openFile(log.io, segment.fileName(&name_buf, id), .{});
+}
+
+fn deleteSegmentFile(log: *Log, id: u64) void {
+    var name_buf: [segment.name_len]u8 = undefined;
+    log.dir.deleteFile(log.io, segment.fileName(&name_buf, id)) catch {};
 }
 
 fn mapFile(file: Io.File, len: u64) ?Map {
@@ -189,7 +216,7 @@ fn releaseSegs(log: *Log) void {
     var it = log.segs.valueIterator();
     while (it.next()) |s| {
         if (s.map) |m| std.posix.munmap(m);
-        s.file.close(io);
+        if (s.file) |f| f.close(io);
     }
     log.segs.deinit(log.gpa);
     log.segments.deinit(log.gpa);
@@ -329,26 +356,35 @@ pub fn segmentSize(log: *const Log, id: u64) u64 {
     return if (log.segs.get(id)) |seg| seg.size else 0;
 }
 
-/// Starts a checksum-verifying scan of a sealed segment.
+/// Starts a checksum-verifying scan of a sealed segment. The scanner owns
+/// its own file handle; `deinit` closes it.
 pub fn scanSegment(log: *const Log, id: u64) !segment.Scanner {
     std.debug.assert(id != log.active_id);
-    const seg = log.segs.get(id) orelse return error.Corrupt;
-    return segment.Scanner.init(log.gpa, log.io, seg.file);
+    if (!log.segs.contains(id)) return error.Corrupt;
+    const file = try log.openSegment(id);
+    errdefer file.close(log.io);
+    var scanner = try segment.Scanner.init(log.gpa, log.io, file);
+    scanner.owns_file = true;
+    return scanner;
 }
 
 /// Deletes a sealed segment. The caller must have made every record it
 /// still needs durable elsewhere first.
 pub fn removeSegment(log: *Log, id: u64) !void {
     std.debug.assert(id != log.active_id);
-    const kv = log.segs.fetchRemove(id) orelse return;
+    if (!log.segs.contains(id)) return;
+    // Delete the file before forgetting the segment. If deleting fails the
+    // segment stays tracked, so compaction keeps treating its records as
+    // possibly live and never drops a tombstone that still shadows them.
+    var name_buf: [segment.name_len]u8 = undefined;
+    try log.dir.deleteFile(log.io, segment.fileName(&name_buf, id));
+    const kv = log.segs.fetchRemove(id).?;
     if (kv.value.map) |m| std.posix.munmap(m);
-    kv.value.file.close(log.io);
+    if (kv.value.file) |f| f.close(log.io);
     for (log.segments.items, 0..) |sid, i| if (sid == id) {
         _ = log.segments.orderedRemove(i);
         break;
     };
-    var name_buf: [segment.name_len]u8 = undefined;
-    try log.dir.deleteFile(log.io, segment.fileName(&name_buf, id));
     try syncDir(log.io, log.dir);
 }
 
@@ -400,7 +436,13 @@ pub fn read(log: *const Log, loc: Location, buf: []u8) !record.Record {
         @memcpy(full, raw);
     } else {
         const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
-        const got = try seg.file.readPositionalAll(log.io, full, loc.offset);
+        const got = if (seg.file) |f|
+            try f.readPositionalAll(log.io, full, loc.offset)
+        else blk: {
+            const f = try log.openSegment(loc.segment);
+            defer f.close(log.io);
+            break :blk try f.readPositionalAll(log.io, full, loc.offset);
+        };
         if (got != full.len) return error.Corrupt;
     }
     return try verify(full);
@@ -418,6 +460,8 @@ fn verify(full: []const u8) !record.Record {
 
 fn rollover(log: *Log) !void {
     try log.sync();
+    // Reserve list space first so nothing can fail after the file exists.
+    try log.segments.ensureUnusedCapacity(log.gpa, 1);
     const next_id = log.active_id + 1;
     const next = log.createSegment(next_id) catch |err| {
         log.poisoned = true;
@@ -425,15 +469,14 @@ fn rollover(log: *Log) !void {
     };
     log.addSeg(next_id, next, true) catch |err| {
         next.close(log.io);
-        log.poisoned = true;
+        log.deleteSegmentFile(next_id);
         return err;
     };
-    log.segments.append(log.gpa, next_id) catch |err| {
-        log.poisoned = true;
-        return err;
-    };
-    // The sealed segment keeps its handle and mapping in `segs` for reads.
-    log.segs.getPtr(log.active_id).?.size = log.active_end;
+    log.segments.appendAssumeCapacity(next_id);
+    // The sealed segment keeps its mapping in `segs` for reads.
+    const sealed = log.segs.getPtr(log.active_id).?;
+    sealed.size = log.active_end;
+    dropHandleIfMapped(log.io, sealed);
     log.active = next;
     log.active_id = next_id;
     log.active_end = 0;
@@ -450,6 +493,13 @@ fn createSegment(log: *Log, id: u64) !Io.File {
     errdefer file.close(log.io);
     try syncDir(log.io, log.dir);
     return file;
+}
+
+fn syncParentDir(io: Io, dir: Io.Dir) !void {
+    if (builtin.os.tag == .windows) return;
+    const parent = try dir.openFile(io, "..", .{});
+    defer parent.close(io);
+    try parent.sync(io);
 }
 
 fn syncDir(io: Io, dir: Io.Dir) !void {
@@ -714,4 +764,30 @@ test "a torn batch is dropped as a whole" {
     defer log.close();
     try testing.expectEqual(@as(usize, 1), c.keys.items.len);
     try testing.expectEqual(@as(u64, 1), log.last_seq);
+}
+
+test "sealed mapped segments hold no file handle" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var log = try Log.open(std.testing.allocator, io, tmp.dir, "log", .{ .segment_bytes = 128 }, NoVisitor{});
+    defer log.close();
+    var seq: u64 = 1;
+    var first: Location = undefined;
+    while (log.segments.items.len < 5) : (seq += 1) {
+        const loc = try log.append(.{ .seq = seq, .kind = .put, .key = "key", .value = "some value bytes" });
+        if (seq == 1) first = loc;
+    }
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        for (log.segments.items) |id| {
+            const seg = log.segs.get(id).?;
+            if (id == log.active_id) try std.testing.expect(seg.file != null) else try std.testing.expect(seg.file == null);
+        }
+    }
+    var buf: [128]u8 = undefined;
+    const rec = try log.read(first, &buf);
+    try std.testing.expectEqualStrings("some value bytes", rec.value);
+    var scanner = try log.scanSegment(log.segments.items[0]);
+    defer scanner.deinit();
+    try std.testing.expect(try scanner.next() != null);
 }

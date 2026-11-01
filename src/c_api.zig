@@ -42,10 +42,11 @@ fn fail(err: anyerror) Status {
     last_error_buf[n] = 0;
     last_error_len = n;
     return switch (err) {
+        error.NotFound => .not_found,
         error.Conflict => .conflict,
         error.Locked => .locked,
         error.Corrupt => .corrupt,
-        error.EmptyKey, error.KeyTooLarge, error.ValueTooLarge, error.BatchTooLarge, error.InvalidArgument => .invalid_argument,
+        error.EmptyKey, error.KeyTooLarge, error.ValueTooLarge, error.BatchTooLarge, error.InvalidArgument, error.SegmentTooLarge => .invalid_argument,
         error.OutOfMemory => .out_of_memory,
         error.Poisoned => .poisoned,
         else => .io_error,
@@ -97,14 +98,19 @@ export fn sdm_put_if(h: ?*anyopaque, k: ?[*]const u8, klen: usize, v: ?[*]const 
     return .ok;
 }
 
+/// Sets the error text for a missing key and returns `.not_found`.
+fn notFound() Status {
+    return fail(error.NotFound);
+}
+
 export fn sdm_seq_of(h: ?*anyopaque, k: ?[*]const u8, klen: usize, out_seq: *u64) Status {
-    out_seq.* = handle(h).seqOf(bytes(k, klen)) orelse return .not_found;
+    out_seq.* = handle(h).seqOf(bytes(k, klen)) orelse return notFound();
     return .ok;
 }
 
 export fn sdm_delete(h: ?*anyopaque, k: ?[*]const u8, klen: usize) Status {
     const existed = handle(h).delete(bytes(k, klen)) catch |err| return fail(err);
-    return if (existed) .ok else .not_found;
+    return if (existed) .ok else notFound();
 }
 
 export fn sdm_delete_prefix(h: ?*anyopaque, p: ?[*]const u8, plen: usize, out_count: ?*u64) Status {
@@ -116,7 +122,7 @@ export fn sdm_delete_prefix(h: ?*anyopaque, p: ?[*]const u8, plen: usize, out_co
 export fn sdm_get(h: ?*anyopaque, k: ?[*]const u8, klen: usize, out_ptr: *?[*]u8, out_len: *usize) Status {
     out_ptr.* = null;
     out_len.* = 0;
-    const v = (handle(h).get(gpa, bytes(k, klen)) catch |err| return fail(err)) orelse return .not_found;
+    const v = (handle(h).get(gpa, bytes(k, klen)) catch |err| return fail(err)) orelse return notFound();
     out_ptr.* = v.ptr;
     out_len.* = v.len;
     return .ok;

@@ -26,7 +26,6 @@ pub fn main(init: std.process.Init) !void {
     var out_buf: [64 * 1024]u8 = undefined;
     var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &stdout.interface;
-    defer out.flush() catch {};
 
     if (args.len < 3) {
         try Io.File.stderr().writeStreamingAll(io, usage);
@@ -34,6 +33,15 @@ pub fn main(init: std.process.Init) !void {
     }
     const cmd = args[1];
     const dir = args[2];
+
+    if (std.mem.eql(u8, cmd, "check")) {
+        // Check the files before opening the database: opening repairs a
+        // torn tail, which would hide it from the check.
+        const ok = try checkFiles(init.gpa, io, dir, out);
+        try out.flush();
+        if (!ok) std.process.exit(1);
+        return;
+    }
 
     var db = Db.open(init.gpa, io, Io.Dir.cwd(), dir, .{ .auto_compact = false }) catch |err| {
         var buf: [256]u8 = undefined;
@@ -48,13 +56,6 @@ pub fn main(init: std.process.Init) !void {
         try out.print("keys        {d}\nlast seq    {d}\nsegments    {d}\ndisk bytes  {d}\nlive bytes  {d}\nindex keys  {d} bytes\n", .{
             db.count(), db.lastSeq(), st.segments, st.total_bytes, st.live_bytes, db.index.keyBytes(),
         });
-    } else if (std.mem.eql(u8, cmd, "check")) {
-        // Opening already verified every record while replaying. Reading
-        // each live value verifies the index points at intact records.
-        var it = db.iterator(.{});
-        var n: usize = 0;
-        while (try it.next()) |_| n += 1;
-        try out.print("ok: {d} live keys verified across {d} segments\n", .{ n, db.spaceStats().segments });
     } else if (std.mem.eql(u8, cmd, "get")) {
         if (args.len < 4) return usageExit(io);
         const v = (try db.getView(args[3])) orelse {
@@ -80,7 +81,8 @@ pub fn main(init: std.process.Init) !void {
             const a = args[i];
             if (std.mem.eql(u8, a, "-r")) {
                 reverse = true;
-            } else if (std.mem.eql(u8, a, "-n") and i + 1 < args.len) {
+            } else if (std.mem.eql(u8, a, "-n")) {
+                if (i + 1 >= args.len) return usageExit(io);
                 i += 1;
                 limit = try std.fmt.parseInt(usize, args[i], 10);
             } else prefix = a;
@@ -98,6 +100,50 @@ pub fn main(init: std.process.Init) !void {
         const after = db.spaceStats();
         try out.print("compacted {d} segments: {d} -> {d} bytes\n", .{ n, before.total_bytes, after.total_bytes });
     } else return usageExit(io);
+    // Report lost output as a failure instead of exiting 0.
+    try out.flush();
+}
+
+/// Scans every segment file read-only and reports damage without repairing
+/// anything. Returns whether every file is clean.
+fn checkFiles(gpa: std.mem.Allocator, io: Io, path: []const u8, out: *Io.Writer) !bool {
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
+        try out.print("cannot open {s}: {t}\n", .{ path, err });
+        return false;
+    };
+    defer dir.close(io);
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(gpa);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (sdm.segment.parseFileName(entry.name)) |id| try ids.append(gpa, id);
+    }
+    std.mem.sortUnstable(u64, ids.items, {}, std.sort.asc(u64));
+    var clean = true;
+    var records: u64 = 0;
+    for (ids.items) |id| {
+        var name_buf: [sdm.segment.name_len]u8 = undefined;
+        const name = sdm.segment.fileName(&name_buf, id);
+        const file = try dir.openFile(io, name, .{});
+        defer file.close(io);
+        var scanner = try sdm.segment.Scanner.init(gpa, io, file);
+        defer scanner.deinit();
+        while (try scanner.next()) |_| records += 1;
+        switch (scanner.stop) {
+            .end => {},
+            .torn => {
+                clean = false;
+                try out.print("{s}: damaged tail at byte {d} of {d} (opening the database will cut it off)\n", .{ name, scanner.pos, scanner.file_len });
+            },
+            .corrupt => {
+                clean = false;
+                try out.print("{s}: damaged record at byte {d} followed by valid records\n", .{ name, scanner.pos });
+            },
+        }
+    }
+    if (clean) try out.print("ok: {d} records verified across {d} segments\n", .{ records, ids.items.len });
+    return clean;
 }
 
 fn usageExit(io: Io) !void {

@@ -92,11 +92,31 @@ fn open(dir: &Path) -> SharedKiban {
     SharedKiban::open_with_options(dir, KibanOptions::agent_memory(PREFIX_LEN)).expect("open")
 }
 
+fn fatal(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(2);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        fatal("usage: kiban-bench <new-dir> [records]");
+    }
     let dir = Path::new(&args[1]).to_path_buf();
-    let n: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
-    let _ = std::fs::remove_dir_all(&dir);
+    let n: u64 = match args.get(2) {
+        Some(s) => s.parse().unwrap_or(0),
+        None => 1_000_000,
+    };
+    // latest10 needs at least 10 records per agent.
+    if n < 10 * AGENTS {
+        fatal("records must be a number of at least 640");
+    }
+    // Never delete anything: the benchmark needs a new or empty directory.
+    if let Ok(mut entries) = std::fs::read_dir(&dir) {
+        if entries.next().is_some() {
+            fatal("the benchmark directory must be new or empty");
+        }
+    }
     let mut db = open(&dir);
 
     // load: n buffered puts in random order, then one sync.

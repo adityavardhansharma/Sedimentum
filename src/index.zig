@@ -120,10 +120,8 @@ pub fn OrderedMap(comptime V: type) type {
 
         const Split = struct { sep: []const u8, right: *anyopaque };
 
-        const InsertOut = struct {
-            result: GetOrPutResult,
-            split: ?Split = null,
-        };
+        /// Deeper than any tree that fits in memory (fanout 64).
+        const max_height = 24;
 
         /// Finds `key` or inserts it with an undefined value the caller must set.
         pub fn getOrPut(self: *Self, key: []const u8) Allocator.Error!GetOrPutResult {
@@ -136,20 +134,7 @@ pub fn OrderedMap(comptime V: type) type {
             }
             const owned = try self.gpa.dupe(u8, key);
             errdefer self.gpa.free(owned);
-            const out = try self.insertRec(self.root, self.height, owned);
-            if (out.split) |s| {
-                errdefer self.gpa.free(s.sep);
-                const root = try self.gpa.create(Inner);
-                root.* = .{ .len = 1 };
-                root.keys[0] = s.sep;
-                root.children[0] = self.root;
-                root.children[1] = s.right;
-                self.root = root;
-                self.height += 1;
-            }
-            self.count += 1;
-            self.key_bytes += owned.len;
-            return out.result;
+            return self.insertNewOwned(owned);
         }
 
         pub fn put(self: *Self, key: []const u8, value: V) Allocator.Error!void {
@@ -158,45 +143,142 @@ pub fn OrderedMap(comptime V: type) type {
         }
 
         /// Inserts a key the caller knows is absent, taking ownership of
-        /// `owned` (allocated with this map's allocator). Skips the lookup
-        /// `getOrPut` does first.
+        /// `owned` (allocated with this map's allocator) on success. Skips
+        /// the lookup `getOrPut` does first.
+        ///
+        /// Every node a split needs is allocated before the tree changes,
+        /// so a failed allocation leaves the tree exactly as it was.
         pub fn insertNewOwned(self: *Self, owned: []const u8) Allocator.Error!GetOrPutResult {
-            const out = try self.insertRec(self.root, self.height, owned);
-            if (out.split) |sp| {
-                errdefer self.gpa.free(sp.sep);
-                const root = try self.gpa.create(Inner);
-                root.* = .{ .len = 1 };
-                root.keys[0] = sp.sep;
-                root.children[0] = self.root;
-                root.children[1] = sp.right;
-                self.root = root;
-                self.height += 1;
+            // Walk down, remembering the path.
+            var path: [max_height]*Inner = undefined;
+            var slots: [max_height]usize = undefined;
+            var node = self.root;
+            var depth: usize = 0;
+            while (depth < self.height) : (depth += 1) {
+                const inner: *Inner = @ptrCast(@alignCast(node));
+                const ci = upperBound(inner.keys[0..inner.len], owned);
+                path[depth] = inner;
+                slots[depth] = ci;
+                node = inner.children[ci];
             }
-            self.count += 1;
-            self.key_bytes += owned.len;
-            return out.result;
+            const leaf: *Leaf = @ptrCast(@alignCast(node));
+            const pos = lowerBound(leaf.keys[0..leaf.len], owned);
+            if (leaf.len < fanout) return self.inserted(insertAt(leaf, pos, owned));
+
+            // Count the full inner nodes above the leaf that will split too.
+            var full: usize = 0;
+            while (full < depth and path[depth - 1 - full].len == fanout) full += 1;
+            const new_root = full == depth;
+
+            // Allocate everything up front.
+            const mid = fanout / 2;
+            const sep = try self.gpa.dupe(u8, leaf.keys[mid]);
+            errdefer self.gpa.free(sep);
+            const right_leaf = try self.gpa.create(Leaf);
+            errdefer self.gpa.destroy(right_leaf);
+            var rights: [max_height]*Inner = undefined;
+            var made: usize = 0;
+            errdefer for (rights[0..made]) |r| self.gpa.destroy(r);
+            while (made < full) : (made += 1) rights[made] = try self.gpa.create(Inner);
+            const root: ?*Inner = if (new_root) try self.gpa.create(Inner) else null;
+
+            // From here on nothing can fail. Split the leaf; the first key of
+            // the new right leaf is the old key at `mid` whichever side the
+            // new key lands on.
+            right_leaf.* = .{ .len = fanout - mid, .next = leaf.next, .prev = leaf };
+            @memcpy(right_leaf.keys[0..right_leaf.len], leaf.keys[mid..fanout]);
+            @memcpy(right_leaf.vals[0..right_leaf.len], leaf.vals[mid..fanout]);
+            leaf.len = mid;
+            const result = if (pos <= mid) insertAt(leaf, pos, owned) else insertAt(right_leaf, pos - mid, owned);
+            if (leaf.next) |n| n.prev = right_leaf;
+            leaf.next = right_leaf;
+
+            // Carry the split up the path.
+            var split: ?Split = .{ .sep = sep, .right = right_leaf };
+            var d = depth;
+            var used: usize = 0;
+            while (d > 0 and split != null) {
+                d -= 1;
+                const inner = path[d];
+                const ci = slots[d];
+                const sp = split.?;
+                if (inner.len < fanout) {
+                    insertIntoInner(inner, ci, sp);
+                    split = null;
+                    break;
+                }
+                const right = rights[used];
+                used += 1;
+                const up = inner.keys[mid];
+                right.* = .{ .len = @intCast(fanout - mid - 1) };
+                @memcpy(right.keys[0..right.len], inner.keys[mid + 1 .. fanout]);
+                @memcpy(right.children[0 .. right.len + 1], inner.children[mid + 1 .. fanout + 1]);
+                inner.len = mid;
+                if (ci <= mid) insertIntoInner(inner, ci, sp) else insertIntoInner(right, ci - mid - 1, sp);
+                split = .{ .sep = up, .right = right };
+            }
+            std.debug.assert(used == full);
+            if (split) |sp| {
+                const r = root.?;
+                r.* = .{ .len = 1 };
+                r.keys[0] = sp.sep;
+                r.children[0] = self.root;
+                r.children[1] = sp.right;
+                self.root = r;
+                self.height += 1;
+            } else std.debug.assert(root == null);
+            return self.inserted(result);
         }
 
-        /// Replaces an empty map with `keys` (sorted, unique, owned by this
-        /// map from now on) and `vals`, filling leaves to `fill` slots.
-        /// Linear time: no searches.
+        fn inserted(self: *Self, r: GetOrPutResult) GetOrPutResult {
+            self.count += 1;
+            self.key_bytes += r.key.len;
+            return r;
+        }
+
+        /// Replaces an empty map with `keys` (sorted, unique) and `vals`,
+        /// filling leaves to 3/4. Linear time: no searches. The map takes
+        /// ownership of the keys only on success; on failure it is empty
+        /// again and the caller still owns them.
         pub fn buildSorted(self: *Self, keys: []const []const u8, vals: []const V) Allocator.Error!void {
             std.debug.assert(self.count == 0 and self.height == 0);
             std.debug.assert(keys.len == vals.len);
             if (keys.len == 0) return;
             const fill = fanout * 3 / 4;
+            const gpa = self.gpa;
+            const first_leaf: *Leaf = @ptrCast(@alignCast(self.root));
+            const leaf_count = (keys.len + fill - 1) / fill;
+
+            // Bookkeeping is sized up front so only node allocations can fail.
+            var level: std.ArrayList(*anyopaque) = try .initCapacity(gpa, leaf_count);
+            defer level.deinit(gpa);
+            var firsts: std.ArrayList([]const u8) = try .initCapacity(gpa, leaf_count);
+            defer firsts.deinit(gpa);
+            var next_level: std.ArrayList(*anyopaque) = try .initCapacity(gpa, leaf_count);
+            defer next_level.deinit(gpa);
+            var next_firsts: std.ArrayList([]const u8) = try .initCapacity(gpa, leaf_count);
+            defer next_firsts.deinit(gpa);
+            var inners: std.ArrayList(*Inner) = try .initCapacity(gpa, leaf_count + max_height);
+            defer inners.deinit(gpa);
+            errdefer {
+                for (inners.items) |inner| {
+                    for (inner.keys[0..inner.len]) |k| gpa.free(k);
+                    gpa.destroy(inner);
+                }
+                var l = first_leaf.next;
+                while (l) |n| {
+                    l = n.next;
+                    gpa.destroy(n);
+                }
+                first_leaf.* = .{};
+            }
 
             // Leaves.
-            var level: std.ArrayList(*anyopaque) = .empty;
-            defer level.deinit(self.gpa);
-            var firsts: std.ArrayList([]const u8) = .empty;
-            defer firsts.deinit(self.gpa);
-            const first_leaf: *Leaf = @ptrCast(@alignCast(self.root));
             var leaf = first_leaf;
             var i: usize = 0;
             while (i < keys.len) {
                 if (i > 0) {
-                    const next = try self.gpa.create(Leaf);
+                    const next = try gpa.create(Leaf);
                     next.* = .{ .prev = leaf };
                     leaf.next = next;
                     leaf = next;
@@ -205,10 +287,8 @@ pub fn OrderedMap(comptime V: type) type {
                 @memcpy(leaf.keys[0..n], keys[i..][0..n]);
                 @memcpy(leaf.vals[0..n], vals[i..][0..n]);
                 leaf.len = @intCast(n);
-                try level.append(self.gpa, leaf);
-                try firsts.append(self.gpa, keys[i]);
-                for (keys[i..][0..n]) |k| self.key_bytes += k.len;
-                self.count += n;
+                level.appendAssumeCapacity(leaf);
+                firsts.appendAssumeCapacity(keys[i]);
                 i += n;
             }
 
@@ -216,56 +296,31 @@ pub fn OrderedMap(comptime V: type) type {
             // copies of firsts[1..] within each node.
             var height: u32 = 0;
             while (level.items.len > 1) {
-                var next_level: std.ArrayList(*anyopaque) = .empty;
-                errdefer next_level.deinit(self.gpa);
-                var next_firsts: std.ArrayList([]const u8) = .empty;
-                errdefer next_firsts.deinit(self.gpa);
+                next_level.clearRetainingCapacity();
+                next_firsts.clearRetainingCapacity();
                 var j: usize = 0;
                 while (j < level.items.len) {
                     const n = @min(fill + 1, level.items.len - j);
-                    const inner = try self.gpa.create(Inner);
-                    inner.* = .{ .len = @intCast(n - 1) };
+                    const inner = try gpa.create(Inner);
+                    inner.* = .{ .len = 0 };
+                    inners.appendAssumeCapacity(inner);
                     @memcpy(inner.children[0..n], level.items[j..][0..n]);
-                    for (1..n) |c| inner.keys[c - 1] = try self.gpa.dupe(u8, firsts.items[j + c]);
-                    try next_level.append(self.gpa, inner);
-                    try next_firsts.append(self.gpa, firsts.items[j]);
+                    for (1..n) |c| {
+                        inner.keys[c - 1] = try gpa.dupe(u8, firsts.items[j + c]);
+                        inner.len += 1;
+                    }
+                    next_level.appendAssumeCapacity(inner);
+                    next_firsts.appendAssumeCapacity(firsts.items[j]);
                     j += n;
                 }
-                level.deinit(self.gpa);
-                firsts.deinit(self.gpa);
-                level = next_level;
-                firsts = next_firsts;
+                std.mem.swap(std.ArrayList(*anyopaque), &level, &next_level);
+                std.mem.swap(std.ArrayList([]const u8), &firsts, &next_firsts);
                 height += 1;
             }
             self.root = level.items[0];
             self.height = height;
-        }
-
-        /// `owned` is known to be absent from the map.
-        fn insertRec(self: *Self, node: *anyopaque, height: u32, owned: []const u8) Allocator.Error!InsertOut {
-            if (height == 0) return self.insertLeaf(@ptrCast(@alignCast(node)), owned);
-
-            const inner: *Inner = @ptrCast(@alignCast(node));
-            const ci = upperBound(inner.keys[0..inner.len], owned);
-            var out = try self.insertRec(inner.children[ci], height - 1, owned);
-            const s = out.split orelse return out;
-            out.split = null;
-
-            if (inner.len < fanout) {
-                insertIntoInner(inner, ci, s);
-                return out;
-            }
-            // Split this inner node, then place the child's split on the right side.
-            const right = try self.gpa.create(Inner);
-            const mid = fanout / 2;
-            const up = inner.keys[mid];
-            right.* = .{ .len = @intCast(fanout - mid - 1) };
-            @memcpy(right.keys[0..right.len], inner.keys[mid + 1 .. fanout]);
-            @memcpy(right.children[0 .. right.len + 1], inner.children[mid + 1 .. fanout + 1]);
-            inner.len = mid;
-            if (ci <= mid) insertIntoInner(inner, ci, s) else insertIntoInner(right, ci - mid - 1, s);
-            out.split = .{ .sep = up, .right = right };
-            return out;
+            self.count = keys.len;
+            for (keys) |k| self.key_bytes += k.len;
         }
 
         fn insertIntoInner(inner: *Inner, ci: usize, s: Split) void {
@@ -275,27 +330,6 @@ pub fn OrderedMap(comptime V: type) type {
             inner.keys[ci] = s.sep;
             inner.children[ci + 1] = s.right;
             inner.len = n + 1;
-        }
-
-        fn insertLeaf(self: *Self, leaf: *Leaf, owned: []const u8) Allocator.Error!InsertOut {
-            const pos = lowerBound(leaf.keys[0..leaf.len], owned);
-            if (leaf.len < fanout) {
-                return .{ .result = insertAt(leaf, pos, owned) };
-            }
-            // The first key of the new right leaf is the old key at `mid`
-            // whichever side the new key lands on.
-            const mid = fanout / 2;
-            const sep = try self.gpa.dupe(u8, leaf.keys[mid]);
-            errdefer self.gpa.free(sep);
-            const right = try self.gpa.create(Leaf);
-            right.* = .{ .len = fanout - mid, .next = leaf.next, .prev = leaf };
-            @memcpy(right.keys[0..right.len], leaf.keys[mid..fanout]);
-            @memcpy(right.vals[0..right.len], leaf.vals[mid..fanout]);
-            leaf.len = mid;
-            const result = if (pos <= mid) insertAt(leaf, pos, owned) else insertAt(right, pos - mid, owned);
-            if (leaf.next) |n| n.prev = right;
-            leaf.next = right;
-            return .{ .result = result, .split = .{ .sep = sep, .right = right } };
         }
 
         fn insertAt(leaf: *Leaf, pos: usize, owned: []const u8) GetOrPutResult {
@@ -819,4 +853,69 @@ test "bulk load builds the same ordered view" {
     try m.put("k000000x", 1);
     try testing.expectEqualStrings("k000000x", m.seek("k000000x").key());
     try testing.expectEqual(m.len(), m.hash.count());
+}
+
+fn checkTree(map: anytype, want: usize) !void {
+    try std.testing.expectEqual(want, map.count);
+    var c = map.first();
+    var n: usize = 0;
+    var prev: []const u8 = "";
+    while (c.valid()) : (c.next()) {
+        if (n > 0) try std.testing.expect(std.mem.order(u8, prev, c.key()) == .lt);
+        try std.testing.expect(map.getPtr(c.key()) != null);
+        prev = c.key();
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "a failed insert leaves the tree unchanged" {
+    const backing = std.testing.allocator;
+    var fa = std.testing.FailingAllocator.init(backing, .{});
+    var map = try OrderedMap(u32).init(fa.allocator());
+    defer map.deinit();
+    var buf: [16]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(3);
+    const total = 6000;
+    for (0..total) |i| {
+        const k = std.fmt.bufPrint(&buf, "{d:0>12}", .{prng.random().int(u32)}) catch unreachable;
+        if (map.getPtr(k) != null) continue;
+        const owned = try backing.dupe(u8, k);
+        var ok = false;
+        for (0..4) |extra| {
+            fa.fail_index = fa.alloc_index + extra;
+            if (map.insertNewOwned(owned)) |r| {
+                r.value_ptr.* = @intCast(i);
+                ok = true;
+                break;
+            } else |_| {}
+        }
+        fa.fail_index = std.math.maxInt(usize);
+        if (!ok) (try map.insertNewOwned(owned)).value_ptr.* = @intCast(i);
+        if (i % 500 == 0) try checkTree(&map, map.count);
+    }
+    try checkTree(&map, map.count);
+}
+
+test "a failed bulk build leaves the hashed index usable" {
+    const backing = std.testing.allocator;
+    var buf: [16]u8 = undefined;
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(backing, .{});
+        var idx = try HashedIndex(u32).init(fa.allocator());
+        defer idx.deinit();
+        idx.bulk = true;
+        for (0..3000) |i| try idx.put(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable, @intCast(i));
+        fa.fail_index = fa.alloc_index + fail_at;
+        if (idx.finishBulk()) |_| {
+            try checkTree(&idx.tree, 3000);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(idx.bulk);
+            try std.testing.expectEqual(@as(usize, 0), idx.tree.count);
+        }
+    }
+    try std.testing.expect(fail_at > 3);
 }
