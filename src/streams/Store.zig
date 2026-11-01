@@ -14,9 +14,89 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const shard = @import("Shard.zig");
+const Journal = @import("Journal.zig");
+const chunk = @import("chunk.zig");
+const segment = @import("../segment.zig");
 
 pub const Pair = shard.Pair;
 pub const Range = shard.Range;
+pub const Expect = shard.Expect;
+
+/// One operation of an atomic batch (`write`).
+pub const Op = union(enum) {
+    put: struct {
+        key: []const u8,
+        value: []const u8,
+        /// Seconds until the value expires; 0 for never.
+        ttl: u32 = 0,
+    },
+    delete: []const u8,
+};
+
+/// Which end of a prefix `trim` keeps.
+pub const Keep = enum { first, last };
+
+pub const StreamInfo = struct {
+    name: []u8,
+    shard: usize,
+    runs: usize,
+    chunks: usize,
+    /// Records in chunks and the tail, counting old versions and
+    /// deletions until merges drop them.
+    records: u64,
+    disk_bytes: u64,
+    tail_bytes: usize,
+};
+
+pub fn freeStreams(gpa: Allocator, list: []StreamInfo) void {
+    for (list) |i| gpa.free(i.name);
+    gpa.free(list);
+}
+
+pub const Problem = struct {
+    kind: enum {
+        /// A chunk's metadata or a block failed its hash.
+        damaged_chunk,
+        /// At open, a stream's page ended in a record with a bad checksum
+        /// and was cut there: a write torn by a crash, or damage.
+        torn_tail,
+    } = .damaged_chunk,
+    shard: usize,
+    stream: []u8,
+    chunk_offset: u64 = 0,
+};
+
+pub const VerifyReport = struct {
+    chunks: usize = 0,
+    blocks: usize = 0,
+    bytes: u64 = 0,
+    problems: std.ArrayList(Problem) = .empty,
+
+    pub fn ok(r: *const VerifyReport) bool {
+        return r.problems.items.len == 0;
+    }
+
+    pub fn deinit(r: *VerifyReport, gpa: Allocator) void {
+        for (r.problems.items) |p| gpa.free(p.stream);
+        r.problems.deinit(gpa);
+    }
+};
+
+pub const Stats = struct {
+    shards: usize = 0,
+    streams: usize = 0,
+    runs: usize = 0,
+    chunks: usize = 0,
+    tail_bytes: usize = 0,
+    meta_bytes: usize = 0,
+    data_bytes: u64 = 0,
+    syncs: u64 = 0,
+    seals: u64 = 0,
+    merges: u64 = 0,
+    linked_merges: u64 = 0,
+    bytes_written: u64 = 0,
+    poisoned: bool = false,
+};
 pub const streamName = shard.streamName;
 pub const prefixEnd = shard.prefixEnd;
 
@@ -72,6 +152,7 @@ pub fn Store(comptime flavor: Flavor) type {
         const Self = @This();
         pub const Shard = shard.Shard(cfg);
         pub const config = cfg;
+        pub const engine = flavor;
 
         /// One sequence number per shard.
         pub const Snapshot = struct { seqs: [max_shards]u64 = @splat(0) };
@@ -82,9 +163,11 @@ pub fn Store(comptime flavor: Flavor) type {
         lock_file: Io.File,
         /// Unique per open handle; keys this handle's touched-shard bits.
         id: u64,
+        /// v3: batches that span streams are journaled here first.
+        journal: if (flavor == .v3) *Journal else void,
 
         pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !*Self {
-            var dir = try parent.createDirPathOpen(io, sub_path, .{});
+            var dir = try parent.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
             defer dir.close(io);
             // One process at a time, taken before reading or creating any
             // store-level file.
@@ -107,7 +190,21 @@ pub fn Store(comptime flavor: Flavor) type {
                 sh.* = try Shard.open(gpa, io, dir, name, options.sync_writes);
                 opened += 1;
             }
-            self.* = .{ .gpa = gpa, .io = io, .shards = shards, .lock_file = lock_file, .id = next_handle_id.fetchAdd(1, .monotonic) };
+            const journal: if (flavor == .v3) *Journal else void = if (flavor == .v3) blk: {
+                const j = try gpa.create(Journal);
+                errdefer gpa.destroy(j);
+                j.* = try Journal.open(io, dir);
+                break :blk j;
+            } else {};
+            errdefer if (flavor == .v3) {
+                journal.close();
+                gpa.destroy(journal);
+            };
+            self.* = .{ .gpa = gpa, .io = io, .shards = shards, .lock_file = lock_file, .id = next_handle_id.fetchAdd(1, .monotonic), .journal = journal };
+            if (flavor == .v3) {
+                for (shards) |sh| sh.journal = journal;
+                try self.replayJournal();
+            }
             return self;
         }
 
@@ -121,6 +218,9 @@ pub fn Store(comptime flavor: Flavor) type {
         fn checkFormat(io: Io, dir: Io.Dir) !void {
             if (try detectIn(io, dir)) |f| {
                 if (f != flavor) return error.WrongEngine;
+            } else if (try holdsV1(io, dir)) {
+                // A v1 database: don't start a stream store beside it.
+                return error.WrongEngine;
             }
             var buf: [8]u8 = undefined;
             _ = dir.readFile(io, "FORMAT", &buf) catch |err| switch (err) {
@@ -152,8 +252,35 @@ pub fn Store(comptime flavor: Flavor) type {
             return n;
         }
 
+        /// Puts back every journaled batch operation a stream lost in a
+        /// crash, makes it durable, then empties the journal.
+        fn replayJournal(self: *Self) !void {
+            const j = self.journal;
+            if (j.len == 0) return;
+            const bytes = try j.readAll(self.gpa);
+            defer self.gpa.free(bytes);
+            var recs: Journal.RecordIterator = .{ .bytes = bytes };
+            while (recs.next()) |rec_| {
+                var rec = rec_;
+                while (try rec.next()) |op| {
+                    if (op.shard >= self.shards.len) return error.Corrupt;
+                    try self.shards[op.shard].replayJournalOp(op.key, op.value, op.seq, @fromBackingInt(op.kind));
+                }
+            }
+            // Write every recovered tail out, even where the shard's
+            // sequence didn't move, before the journal copy goes away.
+            for (self.shards) |sh| try sh.checkpointNow();
+            try j.reset();
+        }
+
         pub fn close(self: *Self) void {
             for (self.shards) |sh| sh.close();
+            if (flavor == .v3) {
+                // Records left here are replayed (and skipped where already
+                // held) on the next open.
+                self.journal.close();
+                self.gpa.destroy(self.journal);
+            }
             if (touchedSlot(self.id, false)) |t| t.* = .{};
             self.lock_file.close(self.io);
             self.gpa.free(self.shards);
@@ -184,6 +311,356 @@ pub fn Store(comptime flavor: Flavor) type {
             for (self.shards) |sh| {
                 if (try sh.deletePrefix(prefix)) self.touch(sh);
             }
+        }
+
+        fn now(self: *const Self) u64 {
+            return self.shards[0].now();
+        }
+
+        /// Fixed clock for TTL tests, in unix seconds.
+        pub fn setClockForTest(self: *Self, t: ?u64) void {
+            for (self.shards) |sh| sh.clock_override = t;
+        }
+
+        fn shardOp(self: *const Self, op: Op) shard.Op {
+            return switch (op) {
+                .put => |p| if (p.ttl == 0)
+                    .{ .key = p.key, .value = p.value }
+                else
+                    .{ .key = p.key, .value = p.value, .kind = .put_ttl, .expires = self.now() + p.ttl },
+                .delete => |k| .{ .key = k, .kind = .del },
+            };
+        }
+
+        /// Like `put`, but the value disappears after `ttl` seconds. Expired
+        /// values are dropped by merges and compaction.
+        pub fn putTtl(self: *Self, key: []const u8, value: []const u8, ttl: u32) !void {
+            const sh = self.shardOf(key);
+            self.touch(sh);
+            return sh.write(self.shardOp(.{ .put = .{ .key = key, .value = value, .ttl = ttl } }));
+        }
+
+        /// Writes only if the key's current state matches `expect`,
+        /// otherwise returns `error.Conflict`. Check and write are atomic.
+        pub fn putIf(self: *Self, key: []const u8, value: []const u8, expect: Expect) !void {
+            const sh = self.shardOf(key);
+            self.touch(sh);
+            return sh.putIf(.{ .key = key, .value = value }, expect);
+        }
+
+        /// The sequence number of the live version of `key`, for `putIf`.
+        pub fn seqOf(self: *Self, key: []const u8) !?u64 {
+            return self.shardOf(key).seqOf(key);
+        }
+
+        pub fn contains(self: *Self, key: []const u8) !bool {
+            return try self.seqOf(key) != null;
+        }
+
+        /// Adds `delta` to the decimal integer stored at `key` (a missing
+        /// key counts as 0) and returns the result, atomically.
+        pub fn incr(self: *Self, key: []const u8, delta: i64) !i64 {
+            const sh = self.shardOf(key);
+            self.touch(sh);
+            return sh.incr(key, delta);
+        }
+
+        /// Applies `ops` atomically: after a crash, either all of them are
+        /// in the store or none are. Later operations on a key win.
+        pub fn write(self: *Self, ops: []const Op) !void {
+            if (ops.len == 0) return;
+            const gpa = self.gpa;
+            const sops = try gpa.alloc(shard.Op, ops.len);
+            defer gpa.free(sops);
+            for (ops, sops) |op, *so| {
+                so.* = self.shardOp(op);
+                try Shard.validate(so.*);
+            }
+            if (flavor == .v2) {
+                self.touch(self.shards[0]);
+                return self.shards[0].writeBatchWal(sops);
+            }
+            if (ops.len == 1) {
+                const sh = self.shardOf(sops[0].key);
+                self.touch(sh);
+                return sh.write(sops[0]);
+            }
+            return self.writeJournaled(sops);
+        }
+
+        fn shardIndex(self: *const Self, key: []const u8) usize {
+            if (self.shards.len == 1) return 0;
+            return std.hash.Wyhash.hash(0x5a, streamName(key)) % self.shards.len;
+        }
+
+        /// v3: journal the batch, then apply it with every shard it touches
+        /// locked, so no other write lands between its parts.
+        fn writeJournaled(self: *Self, ops: []const shard.Op) !void {
+            const gpa = self.gpa;
+            const j = self.journal;
+            const idx = try gpa.alloc(u8, ops.len);
+            defer gpa.free(idx);
+            var mask: u32 = 0;
+            for (ops, idx) |op, *i| {
+                i.* = @intCast(self.shardIndex(op.key));
+                mask |= @as(u32, 1) << @intCast(i.*);
+            }
+            var enc: Journal.Encoder = .{};
+            defer enc.deinit(gpa);
+            var seqs: [max_shards]u64 = @splat(0);
+
+            j.batch_mutex.lockUncancelable(self.io);
+            defer j.batch_mutex.unlock(self.io);
+            {
+                for (self.shards, 0..) |sh, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) sh.lock.lockUncancelable(self.io);
+                defer for (self.shards, 0..) |sh, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) sh.lock.unlock(self.io);
+                for (self.shards, 0..) |sh, i| {
+                    if (mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
+                    if (sh.poisoned) return error.Poisoned;
+                    seqs[i] = sh.seq;
+                }
+                try enc.begin(gpa);
+                for (ops, idx) |op, i| {
+                    seqs[i] += 1;
+                    try enc.add(gpa, .{
+                        .shard = i,
+                        .kind = @backingInt(op.kind),
+                        .seq = seqs[i],
+                        .key = op.key,
+                        .value = if (op.kind == .del) "" else op.value,
+                    }, if (op.kind == .put_ttl) op.expires else null);
+                }
+                try j.append(enc.finish());
+                // The journal holds the batch now. If applying fails part
+                // way, memory no longer matches it: stop writes to these
+                // shards; the next open replays the whole batch.
+                errdefer for (self.shards, 0..) |sh, i| {
+                    if (mask & (@as(u32, 1) << @intCast(i)) != 0) sh.poisoned = true;
+                };
+                for (ops, idx) |op, i| try self.shards[i].writeLocked(op, true);
+            }
+            for (self.shards, 0..) |sh, i| {
+                if (mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
+                self.touch(sh);
+                try sh.afterWrite(seqs[i]);
+            }
+            if (j.len > Journal.reset_bytes) try self.emptyJournalLocked();
+        }
+
+        /// Syncs every shard, then empties the journal. Hold `batch_mutex`.
+        fn emptyJournalLocked(self: *Self) !void {
+            for (self.shards) |sh| try sh.sync();
+            try self.journal.reset();
+        }
+
+        /// The value of each key (null when missing). Free with `freeMany`.
+        pub fn getMany(self: *Self, gpa: Allocator, keys: []const []const u8) ![]?[]u8 {
+            const out = try gpa.alloc(?[]u8, keys.len);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |v| if (v) |x| gpa.free(x);
+                gpa.free(out);
+            }
+            for (keys, out) |k, *o| {
+                o.* = try self.get(gpa, k);
+                done += 1;
+            }
+            return out;
+        }
+
+        /// Counts live keys in `range` by walking them.
+        pub fn count(self: *Self, range: Range) !usize {
+            var it = try self.iterator(range, null);
+            defer it.deinit();
+            var n: usize = 0;
+            while (try it.next()) |_| n += 1;
+            return n;
+        }
+
+        /// Keeps only the first (or last) `keep` keys under `prefix`, in
+        /// key order, and deletes the rest in atomic batches. For example,
+        /// with newest-first message keys, `trim("chat/42/", 100, .first)`
+        /// keeps the newest 100 messages. Returns how many were deleted.
+        pub fn trim(self: *Self, prefix: []const u8, keep: usize, side: Keep) !usize {
+            const gpa = self.gpa;
+            const end_buf = try gpa.alloc(u8, prefix.len);
+            defer gpa.free(end_buf);
+            const range: Range = .{ .start = prefix, .end = prefixEnd(prefix, end_buf), .reverse = side == .last };
+            var keys: std.ArrayList([]u8) = .empty;
+            defer {
+                for (keys.items) |k| gpa.free(k);
+                keys.deinit(gpa);
+            }
+            {
+                var it = try self.iterator(range, null);
+                defer it.deinit();
+                var seen: usize = 0;
+                while (try it.next()) |p| {
+                    seen += 1;
+                    if (seen <= keep) continue;
+                    const k = try gpa.dupe(u8, p.key);
+                    errdefer gpa.free(k);
+                    try keys.append(gpa, k);
+                }
+            }
+            const ops = try gpa.alloc(Op, @min(keys.items.len, 1024));
+            defer gpa.free(ops);
+            var i: usize = 0;
+            while (i < keys.items.len) {
+                const n = @min(ops.len, keys.items.len - i);
+                for (ops[0..n], keys.items[i..][0..n]) |*o, k| o.* = .{ .delete = k };
+                try self.write(ops[0..n]);
+                i += n;
+            }
+            return keys.items.len;
+        }
+
+        /// Every stream with its size, sorted by name. Free with
+        /// `freeStreams`.
+        pub fn listStreams(self: *Self, gpa: Allocator) ![]StreamInfo {
+            var out: std.ArrayList(StreamInfo) = .empty;
+            errdefer {
+                for (out.items) |i| gpa.free(i.name);
+                out.deinit(gpa);
+            }
+            for (self.shards, 0..) |sh, si| {
+                sh.lock.lockSharedUncancelable(self.io);
+                defer sh.lock.unlockShared(self.io);
+                var it = sh.streams.valueIterator();
+                while (it.next()) |p| {
+                    const st = p.*;
+                    var info_: StreamInfo = .{ .name = undefined, .shard = si, .runs = st.runs.items.len, .chunks = 0, .records = st.idx.items.len, .disk_bytes = 0, .tail_bytes = st.buf.items.len };
+                    for (st.runs.items) |r| for (r.chunks.items) |c| {
+                        info_.chunks += 1;
+                        info_.records += c.count;
+                        info_.disk_bytes += c.len;
+                    };
+                    if (info_.records == 0 and info_.chunks == 0) continue;
+                    info_.name = try gpa.dupe(u8, st.name);
+                    errdefer gpa.free(info_.name);
+                    try out.append(gpa, info_);
+                }
+            }
+            std.mem.sortUnstable(StreamInfo, out.items, {}, struct {
+                fn lt(_: void, a: StreamInfo, b: StreamInfo) bool {
+                    return std.mem.order(u8, a.name, b.name) == .lt;
+                }
+            }.lt);
+            return out.toOwnedSlice(gpa);
+        }
+
+        /// Reads every chunk and checks its hashes. Damage is reported, not
+        /// repaired.
+        pub fn verify(self: *Self, gpa: Allocator) !VerifyReport {
+            var report: VerifyReport = .{};
+            errdefer report.deinit(gpa);
+            for (self.shards, 0..) |sh, si| {
+                sh.lock.lockSharedUncancelable(self.io);
+                defer sh.lock.unlockShared(self.io);
+                for (sh.torn_tails.items) |n| {
+                    const name = try gpa.dupe(u8, n);
+                    errdefer gpa.free(name);
+                    try report.problems.append(gpa, .{ .kind = .torn_tail, .shard = si, .stream = name });
+                }
+                var it = sh.streams.valueIterator();
+                while (it.next()) |p| {
+                    const st = p.*;
+                    for (st.runs.items) |r| for (r.chunks.items) |*c| {
+                        report.chunks += 1;
+                        report.bytes += c.len;
+                        const good = blk: {
+                            const v = sh.chunkView(c) catch break :blk false;
+                            report.blocks += v.nblocks;
+                            v.verify() catch break :blk false;
+                            break :blk true;
+                        };
+                        if (!good) {
+                            const name = try gpa.dupe(u8, st.name);
+                            errdefer gpa.free(name);
+                            try report.problems.append(gpa, .{ .shard = si, .stream = name, .chunk_offset = c.off });
+                        }
+                    };
+                }
+            }
+            return report;
+        }
+
+        /// Makes everything durable and folds recent writes into chunks
+        /// (v2: the WAL is emptied; v3: pages are written).
+        pub fn checkpoint(self: *Self) !void {
+            if (flavor == .v3) {
+                self.journal.batch_mutex.lockUncancelable(self.io);
+                defer self.journal.batch_mutex.unlock(self.io);
+                for (self.shards) |sh| try sh.checkpointNow();
+                try self.journal.reset();
+            } else {
+                for (self.shards) |sh| try sh.checkpointNow();
+            }
+        }
+
+        /// Writes a consistent copy of the store to `sub_path` (which must
+        /// not exist yet). Writes wait while the copy is made.
+        pub fn backup(self: *Self, parent: Io.Dir, sub_path: []const u8) !void {
+            const io = self.io;
+            try parent.createDir(io, sub_path, .default_dir);
+            var dest = try parent.openDir(io, sub_path, .{});
+            defer dest.close(io);
+            if (flavor == .v3) self.journal.batch_mutex.lockUncancelable(io);
+            defer if (flavor == .v3) self.journal.batch_mutex.unlock(io);
+            for (self.shards) |sh| {
+                sh.file_mutex.lockUncancelable(io);
+                sh.lock.lockUncancelable(io);
+            }
+            defer for (self.shards) |sh| {
+                sh.lock.unlock(io);
+                sh.file_mutex.unlock(io);
+            };
+            for (self.shards, 0..) |sh, i| {
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "shard-{d}", .{i}) catch unreachable;
+                try dest.createDir(io, name, .default_dir);
+                var sd = try dest.openDir(io, name, .{});
+                defer sd.close(io);
+                try sh.backupLocked(sd);
+            }
+            var buf: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}\n", .{self.shards.len}) catch unreachable;
+            try writeSmall(io, dest, "SHARDS", text);
+            try writeSmall(io, dest, "FORMAT", format_text);
+        }
+
+        fn writeSmall(io: Io, dir: Io.Dir, name: []const u8, text: []const u8) !void {
+            const f = try dir.createFile(io, name, .{});
+            defer f.close(io);
+            try f.writePositionalAll(io, text, 0);
+            try f.sync(io);
+        }
+
+        pub fn isPoisoned(self: *Self) bool {
+            for (self.shards) |sh| if (sh.poisoned) return true;
+            return false;
+        }
+
+        pub fn stats(self: *Self) Stats {
+            var out: Stats = .{ .shards = self.shards.len };
+            for (self.shards) |sh| {
+                const i = sh.info();
+                out.streams += i.streams;
+                out.runs += i.runs;
+                out.chunks += i.chunks;
+                out.tail_bytes += i.tail_bytes;
+                out.meta_bytes += i.meta_bytes;
+                out.data_bytes += i.data_bytes;
+                sh.lock.lockSharedUncancelable(self.io);
+                defer sh.lock.unlockShared(self.io);
+                out.syncs += sh.stats.syncs.load(.monotonic);
+                out.seals += sh.stats.seals;
+                out.merges += sh.stats.merges;
+                out.linked_merges += sh.stats.linked_merges;
+                out.bytes_written += sh.stats.bytes_written;
+                out.poisoned = out.poisoned or sh.poisoned;
+            }
+            return out;
         }
 
         pub fn get(self: *Self, gpa: Allocator, key: []const u8) !?[]u8 {
@@ -383,6 +860,11 @@ fn collect(gpa: Allocator, it: anytype, limit: usize) ![]Pair {
     return out.toOwnedSlice(gpa);
 }
 
+pub fn freeMany(gpa: Allocator, values: []const ?[]u8) void {
+    for (values) |v| if (v) |x| gpa.free(x);
+    gpa.free(values);
+}
+
 pub fn freePairs(gpa: Allocator, pairs: []const Pair) void {
     for (pairs) |p| {
         gpa.free(p.key);
@@ -420,6 +902,15 @@ pub fn detect(io: Io, parent: Io.Dir, sub_path: []const u8) !?Flavor {
     };
     defer dir.close(io);
     return detectIn(io, dir);
+}
+
+/// Whether `dir` holds v1 segment files.
+fn holdsV1(io: Io, dir: Io.Dir) !bool {
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind == .file and segment.parseFileName(e.name) != null) return true;
+    }
+    return false;
 }
 
 fn detectIn(io: Io, dir: Io.Dir) !?Flavor {
@@ -676,6 +1167,17 @@ test "durable writes from several threads survive reopen" {
     try durableThreads(V3);
 }
 
+/// Tests only: after shards were dropped like a crash, releases the rest.
+fn crashRest(comptime S: type, db: *S) void {
+    if (@TypeOf(db.journal) != void) {
+        db.journal.close();
+        db.gpa.destroy(db.journal);
+    }
+    db.lock_file.close(db.io);
+    db.gpa.free(db.shards);
+    db.gpa.destroy(db);
+}
+
 fn crashTest(comptime S: type) !void {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -690,9 +1192,7 @@ fn crashTest(comptime S: type) !void {
         for (0..500) |i| try db.put(try std.fmt.bufPrint(&kb, "c/1/{d:0>5}", .{i}), &vb);
         const sh = db.shards[0];
         sh.freeMemoryForTest();
-        db.lock_file.close(io);
-        gpa.free(db.shards);
-        gpa.destroy(db);
+        crashRest(S, db);
     }
     var db = try S.open(gpa, io, tmp.dir, "db", .{});
     defer db.close();
@@ -769,4 +1269,269 @@ test "deleting a whole stream then compacting keeps merges working" {
     const got = try db.scan(gpa, .{ .start = "s/1/", .end = "s/10" }, null, 10);
     defer freePairs(gpa, got);
     try testing.expectEqual(@as(usize, 10), got.len);
+}
+
+fn featureTest(comptime S: type) !void {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try S.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = if (S == V3) 3 else null });
+    defer db.close();
+
+    // TTL: visible until it expires, in gets and scans.
+    db.setClockForTest(1000);
+    try db.putTtl("t/1/a", "short", 10);
+    try db.putTtl("t/1/b", "long", 100);
+    try db.put("t/1/c", "forever");
+    try expectValue(db, "t/1/a", "short");
+    db.setClockForTest(1011);
+    try expectValue(db, "t/1/a", null);
+    try expectValue(db, "t/1/b", "long");
+    try testing.expectEqual(@as(usize, 2), try db.count(.{ .start = "t/1/", .end = "t/10" }));
+    try testing.expect(!try db.contains("t/1/a"));
+    // Expired values are dropped for good by compaction.
+    try db.compact();
+    db.setClockForTest(1000);
+    try expectValue(db, "t/1/a", null);
+    try expectValue(db, "t/1/b", "long");
+    db.setClockForTest(null);
+
+    // Compare-and-swap.
+    try db.putIf("cas/1/k", "v1", .absent);
+    try testing.expectError(error.Conflict, db.putIf("cas/1/k", "v2", .absent));
+    const seq = (try db.seqOf("cas/1/k")).?;
+    try testing.expectError(error.Conflict, db.putIf("cas/1/k", "v2", .{ .seq = seq + 100 }));
+    try db.putIf("cas/1/k", "v2", .{ .seq = seq });
+    try expectValue(db, "cas/1/k", "v2");
+    try db.delete("cas/1/k");
+    try db.putIf("cas/1/k", "v3", .absent);
+
+    // Counters.
+    try testing.expectEqual(@as(i64, 5), try db.incr("ctr/1/n", 5));
+    try testing.expectEqual(@as(i64, 2), try db.incr("ctr/1/n", -3));
+    try expectValue(db, "ctr/1/n", "2");
+    try db.put("ctr/1/text", "hello");
+    try testing.expectError(error.NotACounter, db.incr("ctr/1/text", 1));
+
+    // Atomic batches across streams (and shards on v3).
+    try db.write(&.{
+        .{ .put = .{ .key = "b/1/x", .value = "1" } },
+        .{ .put = .{ .key = "b/2/y", .value = "2" } },
+        .{ .put = .{ .key = "b/3/z", .value = "3", .ttl = 1000 } },
+        .{ .delete = "t/1/c" },
+        .{ .put = .{ .key = "b/1/x", .value = "1b" } },
+    });
+    try expectValue(db, "b/1/x", "1b");
+    try expectValue(db, "b/2/y", "2");
+    try expectValue(db, "b/3/z", "3");
+    try expectValue(db, "t/1/c", null);
+    try testing.expectError(error.EmptyKey, db.write(&.{ .{ .put = .{ .key = "b/9/ok", .value = "1" } }, .{ .delete = "" } }));
+    try expectValue(db, "b/9/ok", null);
+
+    // Multi-get.
+    const many = try db.getMany(gpa, &.{ "b/1/x", "nope", "b/2/y" });
+    defer freeMany(gpa, many);
+    try testing.expectEqualStrings("1b", many[0].?);
+    try testing.expect(many[1] == null);
+    try testing.expectEqualStrings("2", many[2].?);
+
+    // Trim keeps one end of a prefix.
+    var kb: [32]u8 = undefined;
+    for (0..50) |i| try db.put(try std.fmt.bufPrint(&kb, "chat/7/{d:0>3}", .{i}), "m");
+    try testing.expectEqual(@as(usize, 40), try db.trim("chat/7/", 10, .first));
+    try testing.expectEqual(@as(usize, 10), try db.count(.{ .start = "chat/7/", .end = "chat/70" }));
+    try expectValue(db, "chat/7/009", "m");
+    try expectValue(db, "chat/7/010", null);
+    try testing.expectEqual(@as(usize, 7), try db.trim("chat/7/", 3, .last));
+    try expectValue(db, "chat/7/007", "m");
+    try expectValue(db, "chat/7/006", null);
+
+    // Stream listing, stats, integrity.
+    const list = try db.listStreams(gpa);
+    defer freeStreams(gpa, list);
+    var found = false;
+    for (list) |st| {
+        if (std.mem.eql(u8, st.name, "chat/7/")) found = true;
+    }
+    try testing.expect(found);
+    try db.checkpoint();
+    const st = db.stats();
+    try testing.expect(st.streams > 0 and !st.poisoned);
+    var rep = try db.verify(gpa);
+    defer rep.deinit(gpa);
+    try testing.expect(rep.ok());
+    try testing.expect(!db.isPoisoned());
+
+    // Backup opens on its own with the same contents.
+    try db.backup(tmp.dir, "copy");
+    {
+        var copy = try S.open(gpa, io, tmp.dir, "copy", .{});
+        defer copy.close();
+        try expectValue(copy, "b/1/x", "1b");
+        try expectValue(copy, "ctr/1/n", "2");
+        try expectValue(copy, "chat/7/008", "m");
+        try expectValue(copy, "chat/7/006", null);
+    }
+}
+
+test "TTL, compare-and-swap, counters, batches, trim, backup and verify" {
+    try featureTest(V2);
+    try featureTest(V3);
+}
+
+test "verify reports a damaged chunk" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var off: u64 = 0;
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = 1 });
+        defer db.close();
+        var kb: [32]u8 = undefined;
+        var vb: [200]u8 = undefined;
+        for (0..400) |i| {
+            for (&vb, 0..) |*b, j| b.* = @truncate(i * 31 + j * 7);
+            try db.put(try std.fmt.bufPrint(&kb, "d/1/{d:0>5}", .{i}), &vb);
+        }
+        try db.compact();
+        off = db.shards[0].streams.get("d/1/").?.runs.items[0].chunks.items[0].off;
+    }
+    {
+        var dir = try tmp.dir.openDir(io, "db/shard-0", .{});
+        defer dir.close(io);
+        const f = try dir.openFile(io, "data.1", .{ .mode = .read_write });
+        defer f.close(io);
+        var b: [1]u8 = undefined;
+        _ = try f.readPositionalAll(io, &b, off + 100);
+        b[0] ^= 0xff;
+        try f.writePositionalAll(io, &b, off + 100);
+    }
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    var rep = try db.verify(gpa);
+    defer rep.deinit(gpa);
+    try testing.expect(!rep.ok());
+    try testing.expectEqualStrings("d/1/", rep.problems.items[0].stream);
+}
+
+test "a v3 batch survives a crash before its pages were written" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = 4 });
+        try db.put("old/1/k", "before");
+        try db.syncAll();
+        try db.write(&.{
+            .{ .put = .{ .key = "a/1/k", .value = "A" } },
+            .{ .put = .{ .key = "b/2/k", .value = "B" } },
+            .{ .put = .{ .key = "c/3/k", .value = "C", .ttl = 3600 } },
+            .{ .delete = "old/1/k" },
+        });
+        // A later write to one key of the batch, made durable: replay
+        // must not bring the batch's older value back over it.
+        try db.put("a/1/k", "A2");
+        try db.sync();
+        // The journal is durable; some shards wrote their pages, others
+        // didn't. Then: crash.
+        try db.journal.syncIfNeeded();
+        for (db.shards) |sh| sh.freeMemoryForTest();
+        crashRest(V3, db);
+    }
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    try expectValue(db, "a/1/k", "A2");
+    try expectValue(db, "b/2/k", "B");
+    try expectValue(db, "c/3/k", "C");
+    try expectValue(db, "old/1/k", null);
+    try testing.expectEqual(@as(u64, 0), db.journal.len);
+}
+
+test "a v2 batch is all or nothing after a crash" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try V2.open(gpa, io, tmp.dir, "db", .{ .sync_writes = true });
+        try db.write(&.{
+            .{ .put = .{ .key = "a/1/k", .value = "A" } },
+            .{ .put = .{ .key = "b/2/k", .value = "B", .ttl = 3600 } },
+        });
+        db.shards[0].freeMemoryForTest();
+        crashRest(V2, db);
+    }
+    var db = try V2.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    try expectValue(db, "a/1/k", "A");
+    try expectValue(db, "b/2/k", "B");
+}
+
+test "an expired replacement never uncovers the value it replaced" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = false, .shards = 1 });
+    defer db.close();
+    db.setClockForTest(1000);
+    try db.put("e/1/k", "old");
+    const snap = try db.snapshot();
+    try db.putTtl("e/1/k", "new", 10);
+    db.setClockForTest(2000);
+    db.release(snap);
+    try db.checkpoint();
+    try db.compact();
+    try expectValue(db, "e/1/k", null);
+}
+
+test "check reports a v3 page cut off at open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var page_off: u64 = 0;
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = true, .shards = 1 });
+        defer db.close();
+        try db.put("p/1/a", "first");
+        try db.put("p/1/b", "second");
+        page_off = db.shards[0].streams.get("p/1/").?.page_off;
+    }
+    {
+        // Damage the second record's value byte.
+        var dir = try tmp.dir.openDir(io, "db/shard-0", .{});
+        defer dir.close(io);
+        const f = try dir.openFile(io, "data.0", .{ .mode = .read_write });
+        defer f.close(io);
+        const pos = page_off + 19 + 5 + 5 + 19 + 5 + 2;
+        var b: [1]u8 = undefined;
+        _ = try f.readPositionalAll(io, &b, pos);
+        b[0] ^= 0xff;
+        try f.writePositionalAll(io, &b, pos);
+    }
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    try expectValue(db, "p/1/a", "first");
+    var rep = try db.verify(gpa);
+    defer rep.deinit(gpa);
+    try testing.expect(!rep.ok());
+    try testing.expectEqual(.torn_tail, rep.problems.items[0].kind);
+}
+
+test "a stream store refuses a v1 directory" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try @import("../Db.zig").open(gpa, io, tmp.dir, "db", .{});
+        defer db.close();
+        try db.put("k", "v");
+    }
+    try testing.expectError(error.WrongEngine, V3.open(gpa, io, tmp.dir, "db", .{}));
+    try testing.expectError(error.WrongEngine, V2.open(gpa, io, tmp.dir, "db", .{}));
 }

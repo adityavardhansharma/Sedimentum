@@ -12,7 +12,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lz4 = @import("lz4.zig");
 
-pub const Kind = enum(u8) { put = 1, del = 2, _ };
+/// `put_ttl` values start with the expiry time (u64 unix seconds, little
+/// endian), then the user value.
+pub const Kind = enum(u8) { put = 1, del = 2, put_ttl = 3, _ };
 
 pub const Entry = struct {
     key: []const u8,

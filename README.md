@@ -60,11 +60,41 @@ bloom filters stay in RAM, so memory stays flat as data grows.
   checksum. Keys are front-coded, blocks are LZ4 compressed, and streams
   are spread over one shard per core, each with its own lock and fsync.
 
-Both support get, delete, ordered and reverse scans, snapshots, durable
-writes with group commit, and `deletePrefix`, which drops a whole stream
-without reading it. `compact` copies live data into a fresh file and
-deletes the old one. They don't support TTLs, batches or compare-and-swap
-yet.
+A directory remembers which engine made it (`FORMAT`), so opening it with
+the other one fails with `error.WrongEngine` instead of damaging it;
+`streams.detect` tells them apart.
+
+### What each engine can do
+
+| | v1 | v2 | v3 | kiban |
+|---|---|---|---|---|
+| get, put, delete, durable or buffered | yes | yes | yes | yes |
+| Ordered and reverse scans, `latest(prefix, n)` | yes | yes | yes | forward only |
+| Point-in-time snapshots | yes | yes | yes (across shards) | yes |
+| Atomic batches (`write`) | yes | yes (WAL batch) | yes (batch journal) | yes |
+| Expiring values (`putTtl`) | yes | yes | yes | no |
+| Compare-and-swap (`putIf`, `seqOf`) | yes | yes | yes | no |
+| `deletePrefix` | yes | yes, whole streams without reading | same as v2 | no |
+| Thread-safe handle with group commit | `Shared` | built in | built in, one lock per shard | `SharedKiban` |
+| Integrity check (`verify`, CLI `check`) | CLI | yes | yes | yes |
+| Online `backup` to a new directory | no | yes | yes | yes |
+| `checkpoint` / flush | sync | yes | yes | yes |
+| Stats | yes | yes | yes | yes |
+| Atomic counters (`incr`) | no | yes | yes | no |
+| Retention: keep the newest N of a prefix (`trim`) | no | yes | yes | no |
+| Per-stream listing with sizes (`listStreams`) | no | yes | yes | no |
+| Multi-get (`getMany`), `count(range)`, `contains` | count, contains | yes | yes | no |
+| RAM stays flat as data grows | with the memory cap | yes | yes | yes |
+| C ABI and CLI | yes | yes | yes | Rust only |
+
+v3 makes a batch that touches several streams atomic with a small journal
+(`BATCHES`): the batch is written there first, and every shard syncs the
+journal before it writes a page or a manifest, so no part of a batch can be
+durable before all of it is. On open, any batch operation a stream does not
+already hold (by sequence number) is put back, then the journal is emptied.
+
+`compact` copies live data into a fresh file and deletes the old one;
+expired values are dropped there and in merges.
 
 ## Features
 
@@ -77,7 +107,10 @@ yet.
 - Point-in-time snapshots: `snapshot`, `getAt`, iterators at a snapshot
 - `Shared`: a thread-safe handle with readers in parallel and group commit
 - A C ABI (`libsedimentum`, `include/sedimentum.h`) for other languages
-- A `sedimentum` CLI: `stats`, `check`, `get`, `put`, `delete`, `scan`, `compact`
+- A `sedimentum` CLI: `stats`, `check`, `get`, `put`, `delete`, `scan`, `compact`,
+  and for stream stores `streams`, `incr`, `trim`, `backup`, `checkpoint`.
+  `--engine v2|v3` picks the engine for a new directory; an existing one is
+  detected. The C ABI opens any engine with `sdm_open_engine`.
 - An optional memory cap that moves older index entries to disk
 
 ## Recovery rules

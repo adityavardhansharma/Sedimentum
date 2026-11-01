@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const chunk = @import("chunk.zig");
 const Log = @import("../Log.zig");
 const record = @import("../record.zig");
+const Journal = @import("Journal.zig");
 
 pub const Config = struct {
     /// v2: a write-ahead log and tails in memory. v3: in-place pages.
@@ -53,6 +54,32 @@ pub const Range = struct {
     end: ?[]const u8 = null,
     reverse: bool = false,
 };
+
+/// One write. `put_ttl` carries the expiry in `expires` (unix seconds).
+pub const Op = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    kind: chunk.Kind = .put,
+    expires: u64 = 0,
+};
+
+/// What a conditional write expects the key's current state to be.
+pub const Expect = union(enum) {
+    /// The key must not exist (or be deleted, or expired).
+    absent,
+    /// The key must be live with exactly this sequence number.
+    seq: u64,
+};
+
+/// The value a reader sees for `e` at time `now` (unix seconds), or null
+/// when it is a deletion or has expired.
+pub fn liveValue(e: chunk.Entry, now: u64) ?[]const u8 {
+    return switch (e.kind) {
+        .put => e.value,
+        .put_ttl => if (e.value.len >= 8 and std.mem.readInt(u64, e.value[0..8], .little) > now) e.value[8..] else null,
+        else => null,
+    };
+}
 
 /// Keys that start with these two bytes are reserved for internal records.
 pub const reserved_prefix = "\xff\xff";
@@ -134,6 +161,8 @@ pub fn Shard(comptime cfg: Config) type {
             page_off: u64 = 0,
             written: usize = 0,
             dirty: bool = false,
+            /// v3: the newest seq read back from the page at open.
+            page_seq: u64 = 0,
 
             fn recKey(st: *const Stream, off: u32) []const u8 {
                 const h = st.buf.items[off..];
@@ -205,6 +234,15 @@ pub fn Shard(comptime cfg: Config) type {
         poisoned: bool = false,
         builder: chunk.Builder,
         stats: Stats = .{},
+        /// v3: batches that span streams are journaled here first.
+        journal: ?*Journal = null,
+        /// Fixed clock for tests, in unix seconds.
+        clock_override: ?u64 = null,
+        /// Holds a TTL value with its expiry prefix while it is written.
+        value_buf: std.ArrayList(u8) = .empty,
+        /// v3: streams whose page ended in a record with a bad checksum at
+        /// open (cut off by recovery).
+        torn_tails: std.ArrayList([]u8) = .empty,
 
         lock: Io.RwLock = .init,
         commit_mutex: Io.Mutex = .init,
@@ -268,7 +306,9 @@ pub fn Shard(comptime cfg: Config) type {
         pub fn close(s: *Self) void {
             s.file_mutex.lockUncancelable(s.io);
             s.lock.lockUncancelable(s.io);
-            if (cfg.wal) {
+            if (s.poisoned) {
+                // Leave the files as they are; recovery rebuilds from them.
+            } else if (cfg.wal) {
                 s.checkpoint() catch {};
             } else {
                 s.writePages(true) catch {};
@@ -317,6 +357,9 @@ pub fn Shard(comptime cfg: Config) type {
             s.pending_free.deinit(gpa);
             s.man_buf.deinit(gpa);
             s.snaps.deinit(gpa);
+            s.value_buf.deinit(gpa);
+            for (s.torn_tails.items) |n| gpa.free(n);
+            s.torn_tails.deinit(gpa);
             s.builder.deinit();
         }
 
@@ -500,7 +543,7 @@ pub fn Shard(comptime cfg: Config) type {
             s.stats.bytes_written += bytes.len;
         }
 
-        fn chunkView(s: *const Self, c: *const ChunkMeta) !chunk.View {
+        pub fn chunkView(s: *const Self, c: *const ChunkMeta) !chunk.View {
             return chunk.View.open(s.map[c.off..][0..c.len]);
         }
 
@@ -510,29 +553,148 @@ pub fn Shard(comptime cfg: Config) type {
             return s.snaps.items.len > 0;
         }
 
+        pub fn now(s: *const Self) u64 {
+            if (s.clock_override) |t| return t;
+            const ns = Io.Clock.real.now(s.io).nanoseconds;
+            return if (ns <= 0) 0 else @intCast(@divFloor(ns, std.time.ns_per_s));
+        }
+
         pub fn put(s: *Self, key: []const u8, value: []const u8) !void {
-            return s.write(key, value, .put);
+            return s.write(.{ .key = key, .value = value });
         }
 
         pub fn delete(s: *Self, key: []const u8) !void {
-            return s.write(key, "", .del);
+            return s.write(.{ .key = key, .kind = .del });
         }
 
-        fn write(s: *Self, key: []const u8, value: []const u8, kind: chunk.Kind) !void {
-            if (key.len == 0) return error.EmptyKey;
-            if (key.len > std.math.maxInt(u16) - 64) return error.KeyTooLarge;
-            if (value.len > record.max_value_len) return error.ValueTooLarge;
-            if (std.mem.startsWith(u8, key, reserved_prefix)) return error.ReservedKey;
+        pub fn validate(op: Op) !void {
+            if (op.key.len == 0) return error.EmptyKey;
+            if (op.key.len > std.math.maxInt(u16) - 64) return error.KeyTooLarge;
+            if (op.value.len + 8 > record.max_value_len) return error.ValueTooLarge;
+            if (std.mem.startsWith(u8, op.key, reserved_prefix)) return error.ReservedKey;
+            switch (op.kind) {
+                .put, .del => {},
+                .put_ttl => if (op.expires == 0) return error.MissingExpiry,
+                _ => return error.InvalidKind,
+            }
+        }
+
+        pub fn write(s: *Self, op: Op) !void {
+            try validate(op);
             const seq = blk: {
                 s.lock.lockUncancelable(s.io);
                 defer s.lock.unlock(s.io);
-                try s.writeLocked(key, value, kind);
+                try s.writeLocked(op, true);
                 break :blk s.seq;
             };
             try s.afterWrite(seq);
         }
 
-        fn afterWrite(s: *Self, seq: u64) !void {
+        /// Writes `op` only if the key's current state matches `expect`.
+        /// The check and the write happen under one lock.
+        pub fn putIf(s: *Self, op: Op, expect: Expect) !void {
+            try validate(op);
+            const seq = blk: {
+                s.lock.lockUncancelable(s.io);
+                defer s.lock.unlock(s.io);
+                const cur = try s.liveSeqLocked(op.key);
+                const ok = switch (expect) {
+                    .absent => cur == null,
+                    .seq => |want| cur != null and cur.? == want,
+                };
+                if (!ok) return error.Conflict;
+                try s.writeLocked(op, true);
+                break :blk s.seq;
+            };
+            try s.afterWrite(seq);
+        }
+
+        /// Adds `delta` to the decimal counter at `key` (missing counts as
+        /// 0) and returns the new value, atomically.
+        pub fn incr(s: *Self, key: []const u8, delta: i64) !i64 {
+            try validate(.{ .key = key });
+            var result: i64 = undefined;
+            const seq = blk: {
+                s.lock.lockUncancelable(s.io);
+                defer s.lock.unlock(s.io);
+                const hit = try s.lookupLocked(s.gpa, key, max_seq, true);
+                const cur: i64 = if (hit) |h| if (h.value) |v| cur: {
+                    defer s.gpa.free(v);
+                    break :cur std.fmt.parseInt(i64, v, 10) catch return error.NotACounter;
+                } else 0 else 0;
+                result = std.math.add(i64, cur, delta) catch return error.Overflow;
+                var buf: [24]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "{d}", .{result}) catch unreachable;
+                try s.writeLocked(.{ .key = key, .value = text }, true);
+                break :blk s.seq;
+            };
+            try s.afterWrite(seq);
+            return result;
+        }
+
+        /// The sequence number of the live version of `key`, or null.
+        pub fn seqOf(s: *Self, key: []const u8) !?u64 {
+            s.lock.lockSharedUncancelable(s.io);
+            defer s.lock.unlockShared(s.io);
+            return s.liveSeqLocked(key);
+        }
+
+        fn liveSeqLocked(s: *Self, key: []const u8) !?u64 {
+            const hit = (try s.lookupLocked(s.gpa, key, max_seq, false)) orelse return null;
+            return if (hit.live) hit.seq else null;
+        }
+
+        /// v2: applies `ops` as one WAL batch, so recovery sees all or none.
+        /// v3 batches go through the store's journal instead.
+        pub fn writeBatchWal(s: *Self, ops: []const Op) !void {
+            comptime std.debug.assert(cfg.wal);
+            for (ops) |op| try validate(op);
+            const gpa = s.gpa;
+            const recs = try gpa.alloc(record.Record, ops.len);
+            defer gpa.free(recs);
+            const locs = try gpa.alloc(Log.Location, ops.len);
+            defer gpa.free(locs);
+            const seq = blk: {
+                s.lock.lockUncancelable(s.io);
+                defer s.lock.unlock(s.io);
+                if (s.poisoned) return error.Poisoned;
+                for (ops, recs, 0..) |op, *r, i| r.* = walRecord(op, s.seq + 1 + i);
+                try s.wal.appendBatch(recs, locs);
+                // The WAL holds the whole batch now. If applying it fails
+                // part way, memory doesn't match: refuse further writes and
+                // checkpoints; reopening replays the batch from the WAL.
+                errdefer s.poisoned = true;
+                for (ops) |op| try s.writeLocked(op, false);
+                break :blk s.seq;
+            };
+            try s.afterWrite(seq);
+        }
+
+        fn walRecord(op: Op, seq: u64) record.Record {
+            return .{
+                .seq = seq,
+                .kind = switch (op.kind) {
+                    .put => .put,
+                    .put_ttl => .put_ttl,
+                    else => .delete,
+                },
+                .key = op.key,
+                .value = if (op.kind == .del) "" else op.value,
+                .expires = op.expires,
+            };
+        }
+
+        /// The bytes the tail stores for `op`'s value.
+        fn storedValue(s: *Self, op: Op) ![]const u8 {
+            if (op.kind == .del) return "";
+            if (op.kind != .put_ttl) return op.value;
+            s.value_buf.clearRetainingCapacity();
+            std.mem.writeInt(u64, try s.value_buf.addManyAsArray(s.gpa, 8), op.expires, .little);
+            try s.value_buf.appendSlice(s.gpa, op.value);
+            return s.value_buf.items;
+        }
+
+        pub fn afterWrite(s: *Self, seq: u64) !void {
             if (s.sync_writes) try s.commit(seq);
             if (s.needs_checkpoint) {
                 s.file_mutex.lockUncancelable(s.io);
@@ -543,15 +705,18 @@ pub fn Shard(comptime cfg: Config) type {
             }
         }
 
-        fn writeLocked(s: *Self, key: []const u8, value: []const u8, kind: chunk.Kind) !void {
+        /// Applies one write with the next sequence number. `log` says
+        /// whether v2 appends it to the WAL (batches already did).
+        pub fn writeLocked(s: *Self, op: Op, log: bool) !void {
             if (s.poisoned) return error.Poisoned;
-            const st = try s.streamFor(key);
+            const st = try s.streamFor(op.key);
             const seq = s.seq + 1;
-            if (cfg.wal) _ = try s.wal.append(.{ .seq = seq, .kind = if (kind == .put) .put else .delete, .key = key, .value = value });
+            if (cfg.wal and log) _ = try s.wal.append(walRecord(op, seq));
+            const value = try s.storedValue(op);
             // The seq moves only after the tail takes the record: a seal it
             // triggers must not count this record as already sealed.
             errdefer s.seq = seq;
-            try s.tailAdd(st, key, value, seq, kind);
+            try s.tailAdd(st, op.key, value, seq, op.kind);
             s.seq = seq;
             if (cfg.wal) {
                 if (s.wal.segments.items.len > 2) s.needs_checkpoint = true;
@@ -631,11 +796,20 @@ pub fn Shard(comptime cfg: Config) type {
                 return;
             }
             const drop_tombstones = st.runs.items.len == 0 and !s.snapshotsOpen();
+            const now_s = s.now();
             var w = s.runWriter();
             errdefer w.discard();
+            // With no snapshot open, only each key's newest version matters:
+            // older ones are dropped with it, so an expired or deleted
+            // newest version can never uncover an older value.
+            const newest_only = !s.snapshotsOpen();
+            var prev: ?[]const u8 = null;
             for (st.idx.items) |off| {
                 const e = st.entry(off);
-                if (drop_tombstones and e.kind == .del) continue;
+                const older = prev != null and std.mem.eql(u8, prev.?, e.key);
+                prev = e.key;
+                if (newest_only and older) continue;
+                if (drop_tombstones and liveValue(e, now_s) == null) continue;
                 try w.add(e);
             }
             const run = try w.finish();
@@ -889,6 +1063,7 @@ pub fn Shard(comptime cfg: Config) type {
                 while (it.next()) |p| : (i += 1) list[i] = p.*;
             }
             const drop = !s.snapshotsOpen();
+            const now_s = s.now();
             for (list, 0..) |st, i| {
                 if (!cfg.wal) pages[i] = s.allocPage();
                 if (st.runs.items.len == 0) continue;
@@ -897,7 +1072,7 @@ pub fn Shard(comptime cfg: Config) type {
                 var mc = try MergeCursor.init(s, st.runs.items);
                 defer mc.deinit();
                 while (try mc.nextKey()) |e| {
-                    if (drop and (mc.versions_seen > 1 or e.kind == .del)) continue;
+                    if (drop and (mc.versions_seen > 1 or liveValue(e, now_s) == null)) continue;
                     try w.add(e);
                 }
                 var r = try w.finish();
@@ -948,6 +1123,7 @@ pub fn Shard(comptime cfg: Config) type {
             const gpa = s.gpa;
             const runs = st.runs.items[first..][0..count];
             const drop = !s.snapshotsOpen();
+            const now_s = s.now();
             var w = s.runWriter();
             // Until the swap, a failure gives back the new chunks only.
             errdefer w.discard();
@@ -956,7 +1132,7 @@ pub fn Shard(comptime cfg: Config) type {
                 defer it.deinit();
                 while (try it.nextKey()) |e| {
                     if (it.versions_seen > 1 and drop) continue;
-                    if (drop and first == 0 and e.kind == .del) continue;
+                    if (drop and first == 0 and liveValue(e, now_s) == null) continue;
                     try w.add(e);
                 }
             }
@@ -1025,7 +1201,7 @@ pub fn Shard(comptime cfg: Config) type {
                     }
                 }
                 for (victims.items) |st| try s.dropStream(st);
-                for (keys.items) |k| try s.writeLocked(k, "", .del);
+                for (keys.items) |k| try s.writeLocked(.{ .key = k, .kind = .del }, true);
                 changed = victims.items.len + keys.items.len > 0;
                 break :blk s.seq;
             };
@@ -1066,13 +1242,28 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         fn getLocked(s: *Self, gpa: Allocator, key: []const u8, at: u64) !?[]u8 {
+            const hit = (try s.lookupLocked(gpa, key, at, true)) orelse return null;
+            return hit.value;
+        }
+
+        pub const Hit = struct {
+            seq: u64,
+            live: bool,
+            /// The live value, owned by the caller, when it was asked for.
+            value: ?[]u8 = null,
+        };
+
+        /// The newest version of `key` with seq <= `at`, or null if there
+        /// is none.
+        fn lookupLocked(s: *Self, gpa: Allocator, key: []const u8, at: u64, want_value: bool) !?Hit {
             const st = s.findStream(key) orelse return null;
+            const now_s = s.now();
             // Tail first: it holds the newest writes.
             var pos = st.lowerBound(key);
             while (pos < st.idx.items.len) : (pos += 1) {
                 const e = st.entry(st.idx.items[pos]);
                 if (!std.mem.eql(u8, e.key, key)) break;
-                if (e.seq <= at) return if (e.kind == .put) try gpa.dupe(u8, e.value) else null;
+                if (e.seq <= at) return try hitFor(gpa, e, now_s, want_value);
             }
             var stack: [cfg.fmt.block_bytes * 2 + 2048]u8 = undefined;
             var bfa = std.heap.BufferFirstAllocator.init(&stack, gpa);
@@ -1090,11 +1281,18 @@ pub fn Shard(comptime cfg: Config) type {
                 if (c.min_seq > at) continue;
                 if (!chunk.bloomHas(c.bloom, h)) continue;
                 const v = try s.chunkView(c);
-                if (try chunk.get(v, a, key, at, &scratch, &kb)) |e| {
-                    return if (e.kind == .put) try gpa.dupe(u8, e.value) else null;
-                }
+                if (try chunk.get(v, a, key, at, &scratch, &kb)) |e| return try hitFor(gpa, e, now_s, want_value);
             }
             return null;
+        }
+
+        fn hitFor(gpa: Allocator, e: chunk.Entry, now_s: u64, want_value: bool) !Hit {
+            const live = liveValue(e, now_s);
+            return .{
+                .seq = e.seq,
+                .live = live != null,
+                .value = if (want_value and live != null) try gpa.dupe(u8, live.?) else null,
+            };
         }
 
         fn findChunk(r: *const Run, key: []const u8) ?*const ChunkMeta {
@@ -1303,12 +1501,13 @@ pub fn Shard(comptime cfg: Config) type {
             sources: std.ArrayList(Source) = .empty,
             range: Range,
             at: u64,
+            now: u64,
             key: std.ArrayList(u8) = .empty,
             value: std.ArrayList(u8) = .empty,
 
             pub fn init(s: *const Self, st: *const Stream, range: Range, at: u64) !StreamIter {
                 const gpa = s.gpa;
-                var it: StreamIter = .{ .s = s, .range = range, .at = at };
+                var it: StreamIter = .{ .s = s, .range = range, .at = at, .now = s.now() };
                 errdefer it.deinit();
                 try it.sources.ensureTotalCapacity(gpa, st.runs.items.len + 1);
                 var tail: TailCursor = .{ .st = st };
@@ -1366,6 +1565,7 @@ pub fn Shard(comptime cfg: Config) type {
                     try it.key.appendSlice(gpa, k);
                     var best_seq: u64 = 0;
                     var best_kind: ?chunk.Kind = null;
+                    var best_live: ?usize = null;
                     for (it.sources.items) |*src| {
                         while (src.valid()) {
                             const e = src.cur();
@@ -1374,12 +1574,15 @@ pub fn Shard(comptime cfg: Config) type {
                                 best_seq = e.seq;
                                 best_kind = e.kind;
                                 it.value.clearRetainingCapacity();
-                                try it.value.appendSlice(gpa, e.value);
+                                if (liveValue(e, it.now)) |lv| {
+                                    try it.value.appendSlice(gpa, lv);
+                                    best_live = lv.len;
+                                } else best_live = null;
                             }
                             try src.step(fwd);
                         }
                     }
-                    if (best_kind == .put) return .{ .key = it.key.items, .value = it.value.items };
+                    if (best_kind != null and best_live != null) return .{ .key = it.key.items, .value = it.value.items };
                 }
             }
         };
@@ -1558,6 +1761,8 @@ pub fn Shard(comptime cfg: Config) type {
         /// were sealed restart at offset 0, so the manifest that moved
         /// their old records into chunks must be durable first.
         fn writePages(s: *Self, sync_data: bool) !void {
+            // A journaled batch must be durable before any part of it is.
+            if (s.journal) |j| try j.syncIfNeeded();
             if (s.man_buf.items.len > 0) try s.durablePoint(false);
             for (s.dirty.items) |st| {
                 if (st.written < st.buf.items.len) {
@@ -1574,6 +1779,9 @@ pub fn Shard(comptime cfg: Config) type {
         /// the manifest durable, then deletes the sealed WAL segments.
         fn checkpoint(s: *Self) !void {
             s.needs_checkpoint = false;
+            // A poisoned shard's memory may lack writes its log or journal
+            // holds; folding memory into chunks would lose them.
+            if (s.poisoned) return error.Poisoned;
             if (!cfg.wal) return s.durablePoint(false);
             var it = s.streams.valueIterator();
             while (it.next()) |p| try s.seal(p.*);
@@ -1594,6 +1802,7 @@ pub fn Shard(comptime cfg: Config) type {
         fn durablePoint(s: *Self, force_rewrite: bool) !void {
             s.needs_checkpoint = false;
             if (s.man_buf.items.len == 0 and !force_rewrite and s.pending_free.items.len == 0) return;
+            if (s.journal) |j| try j.syncIfNeeded();
             try s.data.sync(s.io);
             try s.manSeq();
             if (force_rewrite or s.man_len > 2 * s.man_base + 8 * 1024 * 1024) {
@@ -1611,9 +1820,9 @@ pub fn Shard(comptime cfg: Config) type {
 
         // ------------------------------------------------------ manifest
 
-        const Op = enum(u8) { stream = 1, add_run = 2, merge = 3, drop = 4, floor = 5, seq = 6, gen = 7, _ };
+        const ManOp = enum(u8) { stream = 1, add_run = 2, merge = 3, drop = 4, floor = 5, seq = 6, gen = 7, _ };
 
-        fn manBegin(s: *Self, op: Op) !usize {
+        fn manBegin(s: *Self, op: ManOp) !usize {
             const start = s.man_buf.items.len;
             try s.man_buf.appendNTimes(s.gpa, 0, 8);
             try s.man_buf.append(s.gpa, @backingInt(op));
@@ -1807,7 +2016,7 @@ pub fn Shard(comptime cfg: Config) type {
         fn applyManifest(s: *Self, body: []const u8) !void {
             const gpa = s.gpa;
             var r: Reader = .{ .b = body, .pos = 1 };
-            switch (@as(Op, @fromBackingInt(@intCast(body[0])))) {
+            switch (@as(ManOp, @fromBackingInt(@intCast(body[0])))) {
                 .stream => {
                     const name = try r.str();
                     const exists = s.streams.contains(name);
@@ -1893,12 +2102,13 @@ pub fn Shard(comptime cfg: Config) type {
                 }
                 const st = try s.streamFor(rec.key);
                 if (rec.seq <= st.floor) return;
-                const kind: chunk.Kind = switch (rec.kind) {
-                    .put => .put,
-                    .delete => .del,
+                const op: Op = switch (rec.kind) {
+                    .put => .{ .key = rec.key, .value = rec.value },
+                    .put_ttl => .{ .key = rec.key, .value = rec.value, .kind = .put_ttl, .expires = rec.expires },
+                    .delete => .{ .key = rec.key, .kind = .del },
                     else => return error.Corrupt,
                 };
-                try s.tailAdd(st, rec.key, rec.value, rec.seq, kind);
+                try s.tailAdd(st, rec.key, try s.storedValue(op), rec.seq, op.kind);
                 s.seq = @max(s.seq, rec.seq);
             }
         };
@@ -1922,8 +2132,14 @@ pub fn Shard(comptime cfg: Config) type {
                     const vl = std.mem.readInt(u32, h[15..19], .little);
                     const len = rec_header + @as(usize, kl) + vl;
                     if (len > h.len or kl == 0) break;
-                    if (record.Crc32c.hash(h[4..len]) != std.mem.readInt(u32, h[0..4], .little)) break;
                     const seq = std.mem.readInt(u64, h[4..12], .little);
+                    if (record.Crc32c.hash(h[4..len]) != std.mem.readInt(u32, h[0..4], .little)) {
+                        // A newer-looking record with a bad checksum: a torn
+                        // last write, or damage. Either way it is cut off;
+                        // remember it so `verify` can say so.
+                        if (seq > prev) try s.torn_tails.append(gpa, try gpa.dupe(u8, st.name));
+                        break;
+                    }
                     if (seq <= prev) break;
                     prev = seq;
                     const off: u32 = @intCast(st.buf.items.len);
@@ -1932,8 +2148,69 @@ pub fn Shard(comptime cfg: Config) type {
                     pos += len;
                 }
                 st.written = pos;
+                st.page_seq = prev;
                 s.seq = @max(s.seq, prev);
             }
+        }
+
+        /// v3 recovery: puts back one journaled batch operation unless its
+        /// stream already holds it (in a chunk or in its page).
+        pub fn replayJournalOp(s: *Self, key: []const u8, value: []const u8, seq: u64, kind: chunk.Kind) !void {
+            switch (kind) {
+                .put, .del, .put_ttl => {},
+                _ => return error.Corrupt,
+            }
+            const st = try s.streamFor(key);
+            if (seq <= st.floor or seq <= st.page_seq) return;
+            try s.tailAdd(st, key, value, seq, kind);
+            st.page_seq = seq;
+            s.seq = @max(s.seq, seq);
+        }
+
+        /// Makes every accepted write durable and folds it into chunks
+        /// (v2, emptying the WAL) or pages (v3).
+        pub fn checkpointNow(s: *Self) !void {
+            {
+                s.file_mutex.lockUncancelable(s.io);
+                defer s.file_mutex.unlock(s.io);
+                s.lock.lockUncancelable(s.io);
+                defer s.lock.unlock(s.io);
+                if (s.poisoned) return error.Poisoned;
+                if (cfg.wal) try s.checkpoint() else try s.writePages(true);
+                try s.durablePoint(false);
+            }
+            // Everything up to now is durable; let waiting commits know.
+            try s.sync();
+        }
+
+        /// Copies this shard's durable state into `dest`. Hold `file_mutex`
+        /// and `lock`.
+        pub fn backupLocked(s: *Self, dest: Io.Dir) !void {
+            if (s.poisoned) return error.Poisoned;
+            // Everything into chunks (v2) or pages (v3), then a compact,
+            // synced manifest.
+            if (cfg.wal) try s.checkpoint() else try s.writePages(true);
+            try s.durablePoint(true);
+            try s.copyOut(s.manifest, s.man_len, dest, "MANIFEST");
+            var name_buf: [32]u8 = undefined;
+            try s.copyOut(s.data, s.data_end, dest, dataName(&name_buf, s.gen));
+        }
+
+        fn copyOut(s: *Self, src: Io.File, len: u64, dest: Io.Dir, name: []const u8) !void {
+            const f = try dest.createFile(s.io, name, .{ .truncate = true });
+            defer f.close(s.io);
+            const buf = try s.gpa.alloc(u8, 1 << 20);
+            defer s.gpa.free(buf);
+            var off: u64 = 0;
+            while (off < len) {
+                const want: usize = @intCast(@min(buf.len, len - off));
+                const got = try src.readPositionalAll(s.io, buf[0..want], off);
+                if (got > 0) try f.writePositionalAll(s.io, buf[0..got], off);
+                if (got < want) break; // v3 pages past the file's end read as zeros.
+                off += got;
+            }
+            try f.setLength(s.io, len);
+            try f.sync(s.io);
         }
 
         // --------------------------------------------------------- info
