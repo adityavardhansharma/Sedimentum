@@ -1390,15 +1390,19 @@ pub fn Shard(comptime cfg: Config) type {
 
         /// Registers a snapshot whose seq is read later: from then on no
         /// writer replaces or drops versions in place.
-        pub fn pin(s: *Self) void {
+        pub fn pin(s: *Self) u64 {
             s.lock.lockSharedUncancelable(s.io);
             defer s.lock.unlockShared(s.io);
             _ = s.open_snaps.fetchAdd(1, .acq_rel);
+            return s.seq;
         }
 
-        /// The newest applied seq, read without the lock.
-        pub fn visibleSeq(s: *const Self) u64 {
-            return @atomicLoad(u64, &s.seq, .acquire);
+        /// The newest seq, read under the shared lock, so it never falls
+        /// inside a batch or a prefix delete that holds the lock.
+        pub fn visibleSeq(s: *Self) u64 {
+            s.lock.lockSharedUncancelable(s.io);
+            defer s.lock.unlockShared(s.io);
+            return s.seq;
         }
 
         pub fn release(s: *Self, at: u64) void {

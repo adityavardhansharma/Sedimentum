@@ -214,7 +214,8 @@ pub const Builder = struct {
         b.min_seq = std.math.maxInt(u64);
         b.max_seq = 0;
         b.block_entries = 0;
-        b.misses = 0;
+        // `misses` and `skipped` carry over: the next chunk is probably the
+        // same kind of data.
     }
 
     pub fn isEmpty(b: *const Builder) bool {
@@ -397,9 +398,10 @@ pub const View = struct {
     }
 
     /// Checks every block hash (`open` already checked the metadata).
+    /// Checks the metadata and every block hash, ignoring checks that
+    /// passed earlier: the bytes may have been damaged since.
     pub fn verify(v: View) error{Corrupt}!void {
-        var fresh = v;
-        fresh.checked = null;
+        const fresh = try View.open(v.bytes);
         for (0..v.nblocks) |i| _ = try fresh.stored(i);
     }
 
@@ -711,5 +713,46 @@ test "order and hint agree with byte order" {
         const ha = hint(a[0..la], skip);
         const hb = hint(b[0..lb], skip);
         if (ha != hb) try testing.expectEqual(want, std.math.order(ha, hb));
+    }
+}
+
+test "verify rechecks metadata that an earlier read already passed" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa, .{ .block_bytes = 256, .front_coding = true, .compress = false });
+    defer b.deinit();
+    var kbuf: [32]u8 = undefined;
+    for (0..200) |i| try b.add(.{ .key = try std.fmt.bufPrint(&kbuf, "v/1/k{d:0>5}", .{i}), .value = "value", .seq = i + 1 });
+    const bytes = try gpa.dupe(u8, try b.finish());
+    defer gpa.free(bytes);
+    var checked: u64 = 0;
+    const v = try View.openChecked(bytes, &checked);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(gpa);
+    _ = try get(v, gpa, "v/1/k00007", 999, &scratch, &kb);
+    try testing.expect(checked & View.meta_bit != 0);
+    // Damage the first-key table after the cached check passed.
+    bytes[bytes.len - footer_len - 1] ^= 0xff;
+    const again = try View.openChecked(bytes, &checked);
+    try testing.expectError(error.Corrupt, again.verify());
+}
+
+test "a builder keeps skipping compression across chunks" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa, .{ .block_bytes = 512, .front_coding = true, .compress = true });
+    defer b.deinit();
+    var prng = std.Random.DefaultPrng.init(9);
+    var vbuf: [200]u8 = undefined;
+    var kbuf: [32]u8 = undefined;
+    for (0..3) |c| {
+        for (0..40) |i| {
+            prng.random().bytes(&vbuf);
+            try b.add(.{ .key = try std.fmt.bufPrint(&kbuf, "r/1/{d}/{d:0>4}", .{ c, i }), .value = &vbuf, .seq = i + 1 });
+        }
+        _ = try b.finish();
+        try testing.expect(b.misses >= 2);
+        b.reset();
+        try testing.expect(b.misses >= 2);
     }
 }

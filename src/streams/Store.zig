@@ -689,24 +689,23 @@ pub fn Store(comptime flavor: Flavor) type {
         /// held while the sequence numbers are taken.
         /// A point-in-time view across every shard, without holding all
         /// shard locks at once: each shard is pinned, then every shard's
-        /// seq is read twice. Seqs only grow, so two equal reads mean all
+        /// seq is read twice, each under its shared lock. Seqs only grow, so two equal reads mean all
         /// held those values together at some instant (a consistent cut);
         /// `batch_ver` rules out a cut in the middle of a batch.
         pub fn snapshot(self: *Self) !Snapshot {
-            for (self.shards) |sh| sh.pin();
             var snap: Snapshot = .{};
+            var v1 = self.batch_ver.load(.acquire);
+            for (self.shards, 0..) |sh, i| snap.seqs[i] = sh.pin();
             while (true) {
-                const v1 = self.batch_ver.load(.acquire);
-                if (v1 & 1 != 0) {
-                    std.atomic.spinLoopHint();
-                    continue;
-                }
-                for (self.shards, 0..) |sh, i| snap.seqs[i] = sh.visibleSeq();
-                var same = true;
+                var same = v1 & 1 == 0;
                 for (self.shards, 0..) |sh, i| {
-                    if (sh.visibleSeq() != snap.seqs[i]) same = false;
+                    const seq = sh.visibleSeq();
+                    if (seq != snap.seqs[i]) same = false;
+                    snap.seqs[i] = seq;
                 }
-                if (same and self.batch_ver.load(.acquire) == v1) return snap;
+                const v2 = self.batch_ver.load(.acquire);
+                if (same and v2 == v1) return snap;
+                v1 = v2;
                 std.atomic.spinLoopHint();
             }
         }
