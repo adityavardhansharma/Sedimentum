@@ -377,34 +377,32 @@ pub fn sync(log: *Log) !void {
 /// mapped, or null when it must be read with `read`. The result stays
 /// valid until the next append or until the segment is removed.
 pub fn view(log: *const Log, loc: Location) !?record.Record {
-    const full: []const u8 = blk: {
-        if (loc.segment == log.active_id and loc.offset >= log.flushed_end) {
-            const start: usize = @intCast(loc.offset - log.flushed_end);
-            break :blk log.wbuf.items[start..][0..loc.len];
-        }
-        const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
-        const map = seg.map orelse return null;
-        if (loc.offset + loc.len > map.len) return null;
-        break :blk map[@intCast(loc.offset)..][0..loc.len];
-    };
+    const full = (try log.rawView(loc)) orelse return null;
     return try verify(full);
+}
+
+fn rawView(log: *const Log, loc: Location) !?[]const u8 {
+    if (loc.segment == log.active_id and loc.offset >= log.flushed_end) {
+        const start: usize = @intCast(loc.offset - log.flushed_end);
+        return log.wbuf.items[start..][0..loc.len];
+    }
+    const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
+    const map = seg.map orelse return null;
+    if (loc.offset + loc.len > map.len) return null;
+    return map[@intCast(loc.offset)..][0..loc.len];
 }
 
 /// Reads and verifies the record at `loc`. The result borrows `buf`,
 /// which must be at least `loc.len` bytes.
 pub fn read(log: *const Log, loc: Location, buf: []u8) !record.Record {
-    if (try log.view(loc)) |rec| {
-        // Copy so the result has the same lifetime as `buf`.
-        const full = buf[0..loc.len];
-        const key_off = record.header_len;
-        @memcpy(full[key_off..][0..rec.key.len], rec.key);
-        @memcpy(full[key_off + rec.key.len ..][0..rec.value.len], rec.value);
-        return .{ .seq = rec.seq, .kind = rec.kind, .key = full[key_off..][0..rec.key.len], .value = full[key_off + rec.key.len ..][0..rec.value.len] };
-    }
     const full = buf[0..loc.len];
-    const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
-    const got = try seg.file.readPositionalAll(log.io, full, loc.offset);
-    if (got != full.len) return error.Corrupt;
+    if (try log.rawView(loc)) |raw| {
+        @memcpy(full, raw);
+    } else {
+        const seg = log.segs.get(loc.segment) orelse return error.Corrupt;
+        const got = try seg.file.readPositionalAll(log.io, full, loc.offset);
+        if (got != full.len) return error.Corrupt;
+    }
     return try verify(full);
 }
 

@@ -67,6 +67,39 @@ pub fn put(s: *Shared, key: []const u8, value: []const u8) !void {
     if (rolled and s.auto_compact) _ = try s.compact();
 }
 
+/// Like `put`, but the value expires after `ttl` seconds.
+pub fn putTtl(s: *Shared, key: []const u8, value: []const u8, ttl: u32) !void {
+    var rolled = false;
+    const seq = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const before = s.db.log.segments.items.len;
+        try s.db.putTtlBuffered(key, value, ttl);
+        rolled = s.db.log.segments.items.len > before;
+        break :blk s.db.lastSeq();
+    };
+    if (s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
+}
+
+/// Deletes every key under `prefix`. See `Db.deletePrefix`.
+pub fn deletePrefix(s: *Shared, prefix: []const u8) !usize {
+    var rolled = false;
+    var seq: u64 = 0;
+    const n = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const before = s.db.log.segments.items.len;
+        const n = try s.db.deletePrefixBuffered(prefix);
+        rolled = s.db.log.segments.items.len > before;
+        seq = s.db.lastSeq();
+        break :blk n;
+    };
+    if (n > 0 and s.db.options.sync_writes) try s.commit(seq);
+    if (rolled and s.auto_compact) _ = try s.compact();
+    return n;
+}
+
 /// Rewrites mostly dead segments. Blocks writers and readers while it runs.
 pub fn compact(s: *Shared) !usize {
     s.commit_mutex.lockUncancelable(s.io);
