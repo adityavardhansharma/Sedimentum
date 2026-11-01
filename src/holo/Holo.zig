@@ -45,6 +45,8 @@ const map_reserve: usize = 1 << 38;
 const page_align = std.heap.page_size_min;
 /// Checkpoint after this many new rows.
 const checkpoint_every: u32 = 1 << 18;
+/// Width of each count-min row: 4 x 128k counters, 2 MB.
+const cms_bits = 17;
 
 /// One memory's searchable summary. Fixed size, stored by id.
 pub const Row = extern struct {
@@ -212,7 +214,7 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     errdefer pages_file.close(io);
     const rows_map = try std.posix.mmap(null, map_reserve, .{ .READ = true }, .{ .TYPE = .SHARED }, rows_file.handle, 0);
     errdefer std.posix.munmap(rows_map);
-    const cms = try gpa.alloc(u32, 4 << 16);
+    const cms = try gpa.alloc(u32, 4 << cms_bits);
     @memset(cms, 0);
     errdefer gpa.free(cms);
 
@@ -366,19 +368,31 @@ pub fn row(h: *const Holo, id: u32) *const Row {
     return @ptrCast(@alignCast(h.rows_map[off..][0..@sizeOf(Row)].ptr));
 }
 
+fn cmsSlots(x: u64) [4]usize {
+    const mask = (1 << cms_bits) - 1;
+    var out: [4]usize = undefined;
+    // Two hashes give four independent-enough rows (Kirsch-Mitzenmacher).
+    const h1: u64 = x;
+    const h2: u64 = (x >> 32) | (x << 32) | 1;
+    inline for (0..4) |r| out[r] = (r << cms_bits) | @as(usize, @intCast((h1 +% r *% h2) >> 20 & mask));
+    return out;
+}
+
 fn df(h: *const Holo, x: u64) u32 {
+    const sl = cmsSlots(x);
     var m: u32 = std.math.maxInt(u32);
-    inline for (0..4) |r| {
-        const idx = (r << 16) | @as(usize, @as(u16, @truncate(x >> (r * 16))));
-        m = @min(m, h.cms[idx]);
-    }
+    inline for (0..4) |r| m = @min(m, h.cms[sl[r]]);
     return m;
 }
 
+/// Conservative update: only the counters at the current minimum grow, so
+/// common words don't inflate the counts of rare ones.
 fn bumpDf(h: *Holo, x: u64) void {
+    const sl = cmsSlots(x);
+    var m: u32 = std.math.maxInt(u32);
+    inline for (0..4) |r| m = @min(m, h.cms[sl[r]]);
     inline for (0..4) |r| {
-        const idx = (r << 16) | @as(usize, @as(u16, @truncate(x >> (r * 16))));
-        h.cms[idx] +|= 1;
+        if (h.cms[sl[r]] == m) h.cms[sl[r]] = m +| 1;
     }
 }
 
@@ -741,6 +755,19 @@ const TopK = struct {
         for (t.items) |c| m = @min(m, c.score);
         return m;
     }
+    /// The k-th best score so far, or 0 with fewer than k.
+    fn kth(t: *const TopK, k: usize) f32 {
+        if (t.len < k) return 0;
+        var best: [16]f32 = @splat(-1);
+        const kk = @min(k, best.len);
+        for (t.items[0..t.len]) |c| {
+            if (c.score <= best[kk - 1]) continue;
+            var i = kk - 1;
+            while (i > 0 and best[i - 1] < c.score) : (i -= 1) best[i] = best[i - 1];
+            best[i] = c.score;
+        }
+        return best[kk - 1];
+    }
     fn push(t: *TopK, c: Cand) void {
         if (t.len < t.items.len) {
             t.items[t.len] = c;
@@ -808,18 +835,45 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         defer set.deinit(gpa);
         if (!set.all and set.n == 0) return gpa.alloc(Hit, 0);
 
-        // One small scope: walk its chain instead of scanning pages.
-        if (set.single != none and h.scope_counts.items[set.single] <= 4096) {
-            var p = h.heads.items[set.single];
-            while (p != none) : (p = h.row(p).prev) {
-                const r = h.row(p);
-                if (!h.passes(p, r, &set, q)) continue;
-                const base = if (nq == 0) 1.0 else rowScore(r, qt);
-                if (nq > 0 and base == 0) continue;
-                const pg = p / page_rows;
-                const sc = base * h.recency(now, r.time) * heatBoost(h.heat.items[pg]) * subjBoost(r);
-                top.push(.{ .id = p, .score = if (nq == 0) @floatFromInt(p) else sc });
-                if (nq == 0 and top.len == top.items.len) break;
+        // A few small scopes (one chat, one project): walk their chains
+        // instead of scanning pages.
+        var chain_ids: [256]u32 = undefined;
+        var nchains: usize = 0;
+        if (!set.all and set.n <= chain_ids.len) {
+            var total: u64 = 0;
+            if (set.single != none) {
+                chain_ids[0] = set.single;
+                nchains = 1;
+            } else {
+                for (set.bits.words.items, 0..) |w0, wi| {
+                    var w = w0;
+                    while (w != 0) : (w &= w - 1) {
+                        chain_ids[nchains] = @intCast(wi * 64 + @ctz(w));
+                        nchains += 1;
+                    }
+                }
+            }
+            for (chain_ids[0..nchains]) |sid| total += h.scope_counts.items[sid];
+            if (total > 65536) nchains = 0;
+        }
+        if (nchains > 0) {
+            for (chain_ids[0..nchains]) |sid| {
+                var p = h.heads.items[sid];
+                var taken: usize = 0;
+                while (p != none) : (p = h.row(p).prev) {
+                    const r = h.row(p);
+                    if (!h.passes(p, r, &set, q)) continue;
+                    if (nq == 0) {
+                        top.push(.{ .id = p, .score = @floatFromInt(p) });
+                        taken += 1;
+                        if (taken == top.items.len) break;
+                        continue;
+                    }
+                    const base = rowScore(r, qt);
+                    if (base == 0) continue;
+                    const pg = p / page_rows;
+                    top.push(.{ .id = p, .score = base * h.recency(now, r.time) * heatBoost(h.heat.items[pg]) * subjBoost(r) });
+                }
             }
         } else {
             var qsum: f32 = 0;
@@ -831,7 +885,9 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                 if (pg.smask & set.mask == 0) continue;
                 if (pg.tmax < q.since) continue;
                 const best_rec = h.recency(now, pg.tmax) * 1.3 * 1.3;
-                const fl = top.floor();
+                // Prune against the limit-th best (with slack for the rerank),
+                // not the whole pool.
+                const fl = @max(top.floor(), top.kth(limit) * 0.75);
                 if (nq == 0) {
                     if (top.len == top.items.len) break;
                 } else {
@@ -865,12 +921,19 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
 
     // Rerank the pool on full text (BM25 with recency), then keep `limit`.
     const cands = top.items[0..top.len];
+    std.mem.sortUnstable(Cand, cands, {}, struct {
+        fn gt(_: void, a: Cand, b: Cand) bool {
+            return a.score > b.score;
+        }
+    }.gt);
     var hits: std.ArrayList(Hit) = .empty;
     errdefer {
         for (hits.items) |x| x.memory.deinit(gpa);
         hits.deinit(gpa);
     }
     for (cands) |c| {
+        // Newest-first answers need no rerank: stop at the limit.
+        if (nq == 0 and hits.items.len == limit) break;
         const m = (try h.get(gpa, c.id)) orelse continue;
         var score = c.score;
         if (nq > 0) {
