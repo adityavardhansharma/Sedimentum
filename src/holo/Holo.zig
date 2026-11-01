@@ -31,6 +31,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
 const streams = @import("../streams/Store.zig");
+const record = @import("../record.zig");
 const text = @import("text.zig");
 pub const Meaning = @import("Meaning.zig");
 
@@ -42,7 +43,6 @@ pub const page_rows = 128;
 pub const max_terms = 32;
 const bloom_words = 64; // 4096 bits
 /// Terms per memory that go into its page fingerprint.
-const bloom_terms = 12;
 const none: u32 = std.math.maxInt(u32);
 const map_reserve: usize = 1 << 38;
 const page_align = std.heap.page_size_min;
@@ -217,6 +217,9 @@ forgotten: Bits = .{},
 ops_seq: u64 = 0,
 ckpt_count: u32 = 0,
 batch_unsynced: std.atomic.Value(bool) = .init(false),
+/// Rows added whose text is not in the store yet. A checkpoint waits for
+/// zero, so it never saves a row without its text.
+inflight: std.atomic.Value(u32) = .init(0),
 
 // ------------------------------------------------------------------ open
 
@@ -515,10 +518,9 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     }
     h.cur[slot] = r;
     const pg = &h.pages.items[h.pages.items.len - 1];
-    // Only each memory's rarest terms go into the page fingerprint: they
-    // are the ones a question can be pruned on, and fewer bits keep the
-    // fingerprint sharp.
-    for (0..@min(nt, bloom_terms)) |i| {
+    // Every searchable term goes into the page fingerprint: recall skips a
+    // page when a term's bit is missing.
+    for (0..nt) |i| {
         const bit = text.bloomBit(terms.hashes[order[i]]);
         pg.bloom[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
     }
@@ -544,8 +546,10 @@ fn sealPage(h: *Holo) !void {
 const lanes = 8;
 const block_shift = 16;
 
-fn laneOf(scope: u32) u32 {
-    return scope % lanes;
+/// A scope's lane comes from its name, so a rebuilt index (where scope ids
+/// can come out in another order) finds the same keys.
+fn laneOf(h: *const Holo, scope: u32) u32 {
+    return @intCast(scopeHash(h.scopeName(scope)) % lanes);
 }
 
 fn memKey(buf: *[24]u8, id: u32, lane: u32) []const u8 {
@@ -554,7 +558,7 @@ fn memKey(buf: *[24]u8, id: u32, lane: u32) []const u8 {
 
 /// Store key of a memory, from its row.
 fn keyOf(h: *const Holo, buf: *[24]u8, id: u32) []const u8 {
-    return memKey(buf, id, laneOf(h.row(id).scope));
+    return memKey(buf, id, h.laneOf(h.row(id).scope));
 }
 
 fn opKey(buf: *[32]u8, seq: u64) []const u8 {
@@ -612,10 +616,13 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     const subject = opts.subject orelse "";
     if (subject.len > 1024) return error.InvalidSubject;
     const time = opts.time orelse h.nowMs();
+    const vlen = valueLen(scope, subject, body);
+    // Checked before the index changes: a failed write must not bury
+    // the memory it would have replaced.
+    if (vlen + 8 > record.max_value_len) return error.TooLarge;
     var ts: text.TermSet = .{};
     ts.fill(body);
     var stack: [4096]u8 = undefined;
-    const vlen = valueLen(scope, subject, body);
     const value = if (vlen <= stack.len) stack[0..vlen] else try h.gpa.alloc(u8, vlen);
     defer if (vlen > stack.len) h.gpa.free(value);
     encodeInto(value, scope, subject, time, body);
@@ -628,13 +635,30 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     const want_ckpt = h.count - h.ckpt_count >= checkpoint_every;
     var kb: [24]u8 = undefined;
     const key = h.keyOf(&kb, id);
+    _ = h.inflight.fetchAdd(1, .acq_rel);
     h.lock.unlock(h.io);
     // Text goes to the store outside the lock, so writers run in parallel.
     // A reader that finds a row before its text simply skips it.
-    try h.kv.put(key, value);
+    const put_result = h.kv.put(key, value);
+    _ = h.inflight.fetchSub(1, .acq_rel);
+    try put_result;
+    try h.dropIfForgotten(id);
     if (h.options.sync_writes) try h.kv.sync();
     if (want_ckpt) try h.checkpoint();
     return id;
+}
+
+/// A forget that ran between adding a row and storing its text deleted a
+/// key that was not there yet: delete the text now.
+fn dropIfForgotten(h: *Holo, id: u32) !void {
+    var kb: [24]u8 = undefined;
+    const key = blk: {
+        h.lock.lockSharedUncancelable(h.io);
+        defer h.lock.unlockShared(h.io);
+        if (!h.forgotten.get(id)) return;
+        break :blk h.keyOf(&kb, id);
+    };
+    try h.kv.delete(key);
 }
 
 pub const Item = struct {
@@ -652,6 +676,7 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
     for (items) |it| {
         if (it.scope.len == 0 or it.scope.len > 1024) return error.InvalidScope;
         if (it.subject) |sj| if (sj.len > 1024) return error.InvalidSubject;
+        if (valueLen(it.scope, it.subject orelse "", it.text) + 8 > record.max_value_len) return error.TooLarge;
     }
     const gpa = h.gpa;
     const now = h.nowMs();
@@ -703,8 +728,9 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
             const w = i / per;
             const terms: text.Terms = .{ .hashes = pools[w].items[sp.start..][0..sp.len], .total = sp.total };
             const id = try h.applyRow(it.scope, it.subject orelse "", it.time orelse now, it.text.len, terms);
-            lanes_of[i] = @intCast(laneOf(h.row(id).scope));
+            lanes_of[i] = @intCast(h.laneOf(h.row(id).scope));
         }
+        _ = h.inflight.fetchAdd(1, .acq_rel);
     }
 
     // 3. Store the text in parallel, each worker owning some lanes so
@@ -737,7 +763,9 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
         if (threads[w] == null) Put.run(h, items, lanes_of, first, now, w, nw, &errs[w]);
     }
     for (threads[0..nw]) |t| if (t) |x| x.join();
+    _ = h.inflight.fetchSub(1, .acq_rel);
     for (errs) |e| if (e) |x| return x;
+    for (0..items.len) |i| try h.dropIfForgotten(first + @as(u32, @intCast(i)));
     if (h.options.sync_writes) try h.kv.syncAll() else h.batch_unsynced.store(true, .release);
     if (h.count - h.ckpt_count >= checkpoint_every) try h.checkpoint();
     return first;
@@ -785,16 +813,19 @@ pub fn forgetScope(h: *Holo, scope: []const u8) !usize {
     if (scope.len == 0) return error.InvalidScope;
     h.lock.lockUncancelable(h.io);
     defer h.lock.unlock(h.io);
-    const n = try h.forgetScopeLocked(scope);
-    const op = try h.gpa.alloc(u8, 1 + scope.len);
+    const n = try h.forgetScopeLocked(scope, h.count);
+    // The op records where it stopped, so replay leaves later memories alone.
+    const op = try h.gpa.alloc(u8, 5 + scope.len);
     defer h.gpa.free(op);
     op[0] = 2;
-    @memcpy(op[1..], scope);
+    std.mem.writeInt(u32, op[1..5], h.count, .little);
+    @memcpy(op[5..], scope);
     try h.logOp(op);
     return n;
 }
 
-fn forgetScopeLocked(h: *Holo, scope: []const u8) !usize {
+/// Forgets the memories in `scope` and below with ids before `before`.
+fn forgetScopeLocked(h: *Holo, scope: []const u8, before: u32) !usize {
     var set = try h.scopeSet(h.gpa, scope);
     defer set.deinit(h.gpa);
     var n: usize = 0;
@@ -803,7 +834,7 @@ fn forgetScopeLocked(h: *Holo, scope: []const u8) !usize {
         if (!set.has(sid)) continue;
         var p = h.heads.items[sid];
         while (p != none) : (p = h.row(p).prev) {
-            if (h.forgotten.get(p)) continue;
+            if (p >= before or h.forgotten.get(p)) continue;
             try h.forgetLocked(p);
             n += 1;
         }
@@ -817,19 +848,25 @@ pub fn settle(h: *Holo, scope: []const u8, summary: []const u8) !u32 {
     const id = try h.remember(scope, summary, .{ .subject = "summary" });
     h.lock.lockUncancelable(h.io);
     defer h.lock.unlock(h.io);
-    h.sinkLocked(id);
-    const op = try h.gpa.alloc(u8, 5);
+    h.sinkLocked(scope, id);
+    // Scope and boundary, not just the summary: the summary itself may be
+    // forgotten later, and replay must still sink the same memories.
+    const op = try h.gpa.alloc(u8, 5 + scope.len);
     defer h.gpa.free(op);
-    op[0] = 3;
+    op[0] = 4;
     std.mem.writeInt(u32, op[1..5], id, .little);
+    @memcpy(op[5..], scope);
     try h.logOp(op);
     return id;
 }
 
-fn sinkLocked(h: *Holo, summary_id: u32) void {
-    if (summary_id >= h.count) return;
-    var p = h.row(summary_id).prev;
-    while (p != none) : (p = h.row(p).prev) h.buried.set(p);
+/// Buries the memories of exactly `scope` with ids before `before`.
+fn sinkLocked(h: *Holo, scope: []const u8, before: u32) void {
+    const sid = h.findScope(scope) orelse return;
+    var p = h.heads.items[sid];
+    while (p != none) : (p = h.row(p).prev) {
+        if (p < before) h.buried.set(p);
+    }
 }
 
 // ----------------------------------------------------------------- reads
@@ -840,7 +877,7 @@ pub fn get(h: *Holo, gpa: Allocator, id: u32) !?Memory {
     const key = blk: {
         h.lock.lockSharedUncancelable(h.io);
         defer h.lock.unlockShared(h.io);
-        if (id >= h.count) return null;
+        if (id >= h.count or h.forgotten.get(id)) return null;
         break :blk h.keyOf(&kb, id);
     };
     const raw = (try h.kv.get(gpa, key)) orelse return null;
@@ -859,18 +896,21 @@ fn fetch(h: *Holo, gpa: Allocator, ids: []const u32, out: *std.ArrayList(Memory)
 
 /// The newest `n` memories in one scope, newest first.
 pub fn recent(h: *Holo, gpa: Allocator, scope: []const u8, n: usize) ![]Memory {
-    var ids_buf: [256]u32 = undefined;
-    const want = @min(n, ids_buf.len);
-    var k: usize = 0;
+    return h.recentFiltered(gpa, scope, n, false);
+}
+
+fn recentFiltered(h: *Holo, gpa: Allocator, scope: []const u8, n: usize, skip_buried: bool) ![]Memory {
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
     {
         h.lock.lockSharedUncancelable(h.io);
         defer h.lock.unlockShared(h.io);
         if (h.findScope(scope)) |sid| {
+            try ids.ensureTotalCapacity(gpa, @min(n, h.scope_counts.items[sid]));
             var p = h.heads.items[sid];
-            while (p != none and k < want) : (p = h.row(p).prev) {
-                if (h.forgotten.get(p)) continue;
-                ids_buf[k] = p;
-                k += 1;
+            while (p != none and ids.items.len < n) : (p = h.row(p).prev) {
+                if (h.forgotten.get(p) or (skip_buried and h.buried.get(p))) continue;
+                ids.appendAssumeCapacity(p);
             }
         }
     }
@@ -879,7 +919,7 @@ pub fn recent(h: *Holo, gpa: Allocator, scope: []const u8, n: usize) ![]Memory {
         for (out.items) |m| m.deinit(gpa);
         out.deinit(gpa);
     }
-    try h.fetch(gpa, ids_buf[0..k], &out);
+    try h.fetch(gpa, ids.items, &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -1099,7 +1139,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                     const base = coverage(rowScore(r, qt), qsum);
                     if (base == 0) continue;
                     const pg = p / page_rows;
-                    top.push(.{ .id = p, .score = base * h.recency(now, r.time) * heatBoost(h.heat.items[pg]) * subjBoost(r) });
+                    top.push(.{ .id = p, .score = base * h.recency(now, r.time) * heatBoost(@atomicLoad(u32, &h.heat.items[pg], .monotonic)) * subjBoost(r) });
                 }
             }
         } else {
@@ -1119,7 +1159,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                     // Nothing older can beat the current top: stop.
                     if (top.len == top.items.len and qsum * best_rec <= fl) break;
                     const bound = pageBound(pg, qt);
-                    if (bound == 0 or coverage(bound, qsum) * best_rec * heatBoost(h.heat.items[pi]) <= fl) continue;
+                    if (bound == 0 or coverage(bound, qsum) * best_rec * heatBoost(@atomicLoad(u32, &h.heat.items[pi], .monotonic)) <= fl) continue;
                 }
                 const first: u32 = @intCast(pi * page_rows);
                 const last: u32 = @min(h.count, first + page_rows);
@@ -1135,7 +1175,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                     }
                     const base = coverage(rowScore(r, qt), qsum);
                     if (base == 0) continue;
-                    top.push(.{ .id = id, .score = base * h.recency(now, r.time) * heatBoost(h.heat.items[pi]) * subjBoost(r) });
+                    top.push(.{ .id = id, .score = base * h.recency(now, r.time) * heatBoost(@atomicLoad(u32, &h.heat.items[pi], .monotonic)) * subjBoost(r) });
                 }
             }
         }
@@ -1198,7 +1238,12 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
             score = bm * cov * cov * (1.0 + semantic_weight * near) * h.recency(now, m.time) * subjBoost(&r);
             matched = mask;
         }
-        try hits.append(gpa, .{ .memory = m, .score = score, .buried = h.buried.get(c.id), .matched = matched, .topics = topics });
+        const buried = blk: {
+            h.lock.lockSharedUncancelable(h.io);
+            defer h.lock.unlockShared(h.io);
+            break :blk h.buried.get(c.id);
+        };
+        try hits.append(gpa, .{ .memory = m, .score = score, .buried = buried, .matched = matched, .topics = topics });
     }
     const Ctx = struct {
         fn gt(_: void, a: Hit, b: Hit) bool {
@@ -1354,7 +1399,7 @@ pub fn brief(h: *Holo, gpa: Allocator, situation: []const u8, scope: []const u8,
     errdefer out.deinit(gpa);
     const hits = try h.recall(gpa, .{ .about = situation, .scope = scope, .limit = 16 });
     defer freeHits(gpa, hits);
-    const rec = if (h.isExactScope(scope)) try h.recent(gpa, scope, 6) else try gpa.alloc(Memory, 0);
+    const rec = if (h.isExactScope(scope)) try h.recentFiltered(gpa, scope, 6, true) else try gpa.alloc(Memory, 0);
     defer freeMemories(gpa, rec);
 
     var used: usize = 0;
@@ -1369,6 +1414,11 @@ pub fn brief(h: *Holo, gpa: Allocator, situation: []const u8, scope: []const u8,
     for (hits) |x| {
         if (x.buried) {
             skipped += 1;
+            // An older version: keep it out of the recent section too.
+            if (nseen < seen.len) {
+                seen[nseen] = x.memory.id;
+                nseen += 1;
+            }
             continue;
         }
         rel[nrel] = x.memory;
@@ -1459,7 +1509,14 @@ fn putSlice(gpa: Allocator, buf: *std.ArrayList(u8), bytes: []const u8) !void {
 
 /// Writes everything derived to disk so the next open needs no rebuild.
 pub fn checkpoint(h: *Holo) !void {
-    h.lock.lockUncancelable(h.io);
+    // Wait until every added row has its text in the store; new rows
+    // cannot start while the write lock is held.
+    while (true) {
+        h.lock.lockUncancelable(h.io);
+        if (h.inflight.load(.acquire) == 0) break;
+        h.lock.unlock(h.io);
+        std.Thread.yield() catch {};
+    }
     defer h.lock.unlock(h.io);
     const gpa = h.gpa;
     // Text first: a checkpoint must never claim rows the store could lose.
@@ -1613,7 +1670,8 @@ fn replay(h: *Holo) !bool {
     var sk: [16]u8 = undefined;
     const start = std.fmt.bufPrint(&sk, "~m/{x:0>4}", .{h.count >> block_shift}) catch unreachable;
     var it = try h.kv.iterator(.{ .start = start, .end = "~m0" }, null);
-    defer it.deinit();
+    var it_open = true;
+    defer if (it_open) it.deinit();
     const Pending = struct { id: u32, value: []u8 };
     var block: std.ArrayList(Pending) = .empty;
     defer {
@@ -1655,21 +1713,42 @@ fn replay(h: *Holo) !bool {
         errdefer gpa.free(copy);
         try block.append(gpa, .{ .id = id, .value = copy });
     }
-    var ok: [32]u8 = undefined;
-    const ostart = opKey(&ok, h.ops_seq + 1);
-    var oit = try h.kv.iterator(.{ .start = ostart, .end = "~o0" }, null);
-    defer oit.deinit();
-    while (try oit.next()) |p| {
-        const v = p.value;
+    it.deinit();
+    it_open = false;
+
+    // Operations: copied out first, because applying them deletes keys,
+    // which needs the store's write locks the iterator holds.
+    var ops: std.ArrayList([]u8) = .empty;
+    defer {
+        for (ops.items) |o| gpa.free(o);
+        ops.deinit(gpa);
+    }
+    {
+        var ok: [32]u8 = undefined;
+        const ostart = opKey(&ok, h.ops_seq + 1);
+        var oit = try h.kv.iterator(.{ .start = ostart, .end = "~o0" }, null);
+        defer oit.deinit();
+        while (try oit.next()) |p| {
+            const copy = try gpa.dupe(u8, p.value);
+            errdefer gpa.free(copy);
+            try ops.append(gpa, copy);
+        }
+    }
+    for (ops.items) |v| {
         if (v.len == 0) return error.Corrupt;
         switch (v[0]) {
-            1, 3 => {
+            1 => {
                 if (v.len != 5) return error.Corrupt;
                 const id = std.mem.readInt(u32, v[1..5], .little);
                 while (h.count <= id) try h.placeholder();
-                if (v[0] == 1) try h.forgetLocked(id) else h.sinkLocked(id);
+                try h.forgetLocked(id);
             },
-            2 => _ = try h.forgetScopeLocked(v[1..]),
+            2, 4 => {
+                if (v.len < 5) return error.Corrupt;
+                const before = std.mem.readInt(u32, v[1..5], .little);
+                while (h.count < before) try h.placeholder();
+                if (v[0] == 2) _ = try h.forgetScopeLocked(v[5..], before) else h.sinkLocked(v[5..], before);
+            },
             else => return error.Corrupt,
         }
         h.ops_seq += 1;
@@ -1885,4 +1964,142 @@ test "meaning finds a memory that uses other words" {
     const sem = try h.recall(testing.allocator, .{ .about = "outage", .limit = 2 });
     defer freeHits(testing.allocator, sem);
     try testing.expectEqual(@as(usize, 1), sem.len);
+}
+
+/// Opens, runs `body`, closes; then puts back the checkpoint from before
+/// `body`, as if the process died before writing a new one.
+fn crashAfter(tmp: *testing.TmpDir, body: *const fn (*Holo) anyerror!void) !void {
+    const old = try tmp.dir.readFileAlloc(testing.io, "h/CKPT", testing.allocator, .unlimited);
+    defer testing.allocator.free(old);
+    {
+        const h = try tmpHolo(tmp);
+        defer h.close();
+        try body(h);
+    }
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "h/CKPT", .data = old });
+}
+
+test "replaying a forget after the checkpoint does not hang" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const h = try tmpHolo(&tmp);
+        defer h.close();
+        for (0..20) |i| {
+            var b: [32]u8 = undefined;
+            _ = try h.remember("a", try std.fmt.bufPrint(&b, "note {d}", .{i}), .{});
+        }
+    }
+    try crashAfter(&tmp, struct {
+        fn f(h: *Holo) !void {
+            try h.forget(3);
+        }
+    }.f);
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    try testing.expect(h.forgotten.get(3));
+    try testing.expect((try h.get(testing.allocator, 3)) == null);
+}
+
+test "replayed forgetScope leaves later memories, settle survives a forgotten summary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const h = try tmpHolo(&tmp);
+        defer h.close();
+        _ = try h.remember("keep", "anchor", .{});
+    }
+    try crashAfter(&tmp, struct {
+        fn f(h: *Holo) !void {
+            _ = try h.remember("gone", "first life", .{});
+            _ = try h.forgetScope("gone");
+            _ = try h.remember("gone", "second life", .{});
+            _ = try h.remember("s", "old detail one", .{});
+            _ = try h.remember("s", "old detail two", .{});
+            const sum = try h.settle("s", "summary of s");
+            try h.forget(sum);
+            _ = try h.remember("s", "after the summary", .{});
+        }
+    }.f);
+    try tmp.dir.deleteFile(testing.io, "h/CKPT");
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    const g = try h.recent(testing.allocator, "gone", 10);
+    defer freeMemories(testing.allocator, g);
+    try testing.expectEqual(@as(usize, 1), g.len);
+    try testing.expectEqualStrings("second life", g[0].text);
+    const hits = try h.recall(testing.allocator, .{ .about = "old detail", .scope = "s" });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 0), hits.len);
+    const after = try h.recall(testing.allocator, .{ .about = "after summary", .scope = "s" });
+    defer freeHits(testing.allocator, after);
+    try testing.expectEqual(@as(usize, 1), after.len);
+}
+
+test "rebuilt index finds text when forgotten gaps shift scope ids" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const h = try tmpHolo(&tmp);
+        defer h.close();
+        _ = try h.remember("a", "one", .{});
+        const two = try h.remember("a", "two", .{});
+        try h.forget(two);
+        _ = try h.remember("b", "three", .{});
+    }
+    try tmp.dir.deleteFile(testing.io, "h/CKPT");
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    const m = (try h.get(testing.allocator, 2)).?;
+    defer m.deinit(testing.allocator);
+    try testing.expectEqualStrings("three", m.text);
+}
+
+test "global recall finds any kept term, recent returns more than 256" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    for (0..400) |i| {
+        var b: [32]u8 = undefined;
+        _ = try h.remember("r", try std.fmt.bufPrint(&b, "row {d}", .{i}), .{});
+    }
+    // 20 distinct words: all kept, all searchable from a global query.
+    _ = try h.remember("w", "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango", .{});
+    for ([_][]const u8{ "alpha", "november", "tango" }) |w| {
+        const hits = try h.recall(testing.allocator, .{ .about = w });
+        defer freeHits(testing.allocator, hits);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+    }
+    const all = try h.recent(testing.allocator, "r", 500);
+    defer freeMemories(testing.allocator, all);
+    try testing.expectEqual(@as(usize, 400), all.len);
+}
+
+test "a write that is too large changes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    _ = try h.remember("p", "plan A", .{ .subject = "plan" });
+    const big = try testing.allocator.alloc(u8, record.max_value_len);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    try testing.expectError(error.TooLarge, h.remember("p", big, .{ .subject = "plan" }));
+    const cur = (try h.current(testing.allocator, "p", "plan")).?;
+    defer cur.deinit(testing.allocator);
+    try testing.expectEqualStrings("plan A", cur.text);
+}
+
+test "brief leaves replaced memories out of the recent section" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    _ = try h.remember("p", "deploy target is staging", .{ .subject = "target" });
+    _ = try h.remember("p", "deploy target is production", .{ .subject = "target" });
+    const b = try h.brief(testing.allocator, "unrelated question", "p", 2000);
+    defer b.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, b.text, "production") != null);
+    try testing.expect(std.mem.indexOf(u8, b.text, "staging") == null);
 }
