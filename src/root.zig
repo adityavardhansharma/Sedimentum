@@ -15,6 +15,7 @@ pub const streams = @import("streams/Store.zig");
 /// Holo: agent memory with recall, sedimentation and token-budgeted briefs.
 pub const Holo = @import("holo/Holo.zig");
 pub const holo_text = @import("holo/text.zig");
+pub const holo_meaning = @import("holo/Meaning.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
     io_g = io;
     prog_start = nowNs(io);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const usage = "usage: sedimentum-holo-bench <agent|recall> <new-dir> [memories]\n";
+    const usage = "usage: sedimentum-holo-bench <agent|recall|hard> <new-dir> [memories] [meaning-model]\n";
     if (args.len < 3) return fatal(io, usage);
     const mode = args[1];
     const dir = args[2];
@@ -195,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
     } else |_| {}
     if (std.mem.eql(u8, mode, "agent")) return runAgent(io, dir);
     if (std.mem.eql(u8, mode, "recall")) return runRecall(io, dir, n);
+    if (std.mem.eql(u8, mode, "hard")) return runHard(io, dir, n, if (args.len > 4) args[4] else "models/holo-words.bin");
     return fatal(io, usage);
 }
 
@@ -522,6 +523,8 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
     var scb: [48]u8 = undefined;
     var sjb: [64]u8 = undefined;
 
+    var batch: Batch = .{};
+    defer batch.deinit();
     phaseStart("recall_load", n + evs.items.len);
     var t = nowNs(io);
     var ei: usize = 0;
@@ -534,8 +537,7 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
             const f = facts[e.fact];
             try factText(&buf, e.fact, f, e.ver);
             raw += buf.items.len;
-            _ = try h.remember(scopeOf(&scb, f), buf.items, .{ .time = tm, .subject = if (f.tagged) subjectOf(&sjb, e.fact, f) else null });
-            tick();
+            try batch.add(h, scopeOf(&scb, f), buf.items, if (f.tagged) subjectOf(&sjb, e.fact, f) else null, tm);
         }
         buf.clearRetainingCapacity();
         var ss = i *% 0x2545F4914F6CDD1D +% 5;
@@ -544,9 +546,9 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
         const p = splitmix(&ss) % projects;
         const c = splitmix(&ss) % chats_per_project;
         const sc = std.fmt.bufPrint(&scb, "proj/{d:0>3}/chat/{d:0>2}", .{ p, c }) catch unreachable;
-        _ = try h.remember(sc, buf.items, .{ .time = tm });
-        tick();
+        try batch.add(h, sc, buf.items, null, tm);
     }
+    try batch.flush(h);
     try h.sync();
     const load_secs = secondsSince(io, t);
     const now_ms = t0_ms + n * 1000;
@@ -693,7 +695,298 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
 }
 
 var sample_printed = false;
+var debug_queries: u32 = 0;
 
 fn ratio(a: u64, b: u64) f64 {
     return @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(@max(b, 1)));
+}
+
+// ------------------------------------------------------------ batch writer
+
+/// Collects memories and saves them with `rememberMany`, 4096 at a time.
+const Batch = struct {
+    const Ent = struct { scope: [2]u32, text: [2]u32, subject: ?[2]u32, time: u64 };
+    bytes: std.ArrayList(u8) = .empty,
+    ents: std.ArrayList(Ent) = .empty,
+    items: std.ArrayList(Holo.Item) = .empty,
+
+    fn deinit(b: *Batch) void {
+        b.bytes.deinit(driver);
+        b.ents.deinit(driver);
+        b.items.deinit(driver);
+    }
+    fn put(b: *Batch, s: []const u8) ![2]u32 {
+        const off: u32 = @intCast(b.bytes.items.len);
+        try b.bytes.appendSlice(driver, s);
+        return .{ off, @intCast(s.len) };
+    }
+    fn add(b: *Batch, h: *Holo, scope: []const u8, body: []const u8, subject: ?[]const u8, time: u64) !void {
+        const sc = try b.put(scope);
+        const tx = try b.put(body);
+        const sj: ?[2]u32 = if (subject) |s| try b.put(s) else null;
+        try b.ents.append(driver, .{ .scope = sc, .text = tx, .subject = sj, .time = time });
+        if (b.ents.items.len == 4096) try b.flush(h);
+    }
+    fn flush(b: *Batch, h: *Holo) !void {
+        if (b.ents.items.len == 0) return;
+        b.items.clearRetainingCapacity();
+        const by = b.bytes.items;
+        for (b.ents.items) |e| try b.items.append(driver, .{
+            .scope = by[e.scope[0]..][0..e.scope[1]],
+            .text = by[e.text[0]..][0..e.text[1]],
+            .subject = if (e.subject) |s| by[s[0]..][0..s[1]] else null,
+            .time = e.time,
+        });
+        _ = try h.rememberMany(b.items.items);
+        for (0..b.ents.items.len) |_| tick();
+        b.ents.clearRetainingCapacity();
+        b.bytes.clearRetainingCapacity();
+    }
+};
+
+// -------------------------------------------------------------- hard test
+//
+// Real chat filler (common English words), every entity has all 20 facts,
+// and questions come in two wordings: one that shares words with the fact
+// and a paraphrase that shares none (only the entity's name). The name
+// alone matches 20+ memories, so the right one must be picked by meaning.
+
+const HardAttr = struct {
+    /// '@' is the entity, '#' the value.
+    fact: []const u8,
+    update: []const u8,
+    same: []const u8,
+    para: []const u8,
+};
+
+const hard_attrs = [_]HardAttr{
+    .{ .fact = "@ is deployed in the # region", .update = "@ moved over to the # region", .same = "which region is @ deployed in?", .para = "which datacenter hosts @?" },
+    .{ .fact = "@ keeps its records in #", .update = "@ migrated its records into #", .same = "where does @ keep its records?", .para = "what database does @ use?" },
+    .{ .fact = "# is on call for @", .update = "# now carries the pager for @", .same = "who is on call for @?", .para = "who handles outages of @?" },
+    .{ .fact = "@ ships on #", .update = "@ launch slipped to #", .same = "when does @ ship?", .para = "when does @ go live?" },
+    .{ .fact = "@ throttles traffic at # requests", .update = "@ throttling raised to # requests", .same = "at what traffic does @ throttle requests?", .para = "how many calls per second can @ take?" },
+    .{ .fact = "@ caches results for #", .update = "@ cache expiry bumped to #", .same = "how long does @ cache results?", .para = "how long are @ responses stored?" },
+    .{ .fact = "@ invoices customers in #", .update = "@ invoicing switched to #", .same = "what do @ invoices use?", .para = "what money does @ bill in?" },
+    .{ .fact = "@ signs users in through #", .update = "@ login now goes through #", .same = "how does @ sign users in?", .para = "who handles authentication for @?" },
+    .{ .fact = "@ is written in #", .update = "@ got rewritten in #", .same = "what is @ written in?", .para = "what programming language is @ coded in?" },
+    .{ .fact = "@ keeps logs for #", .update = "@ log retention cut to #", .same = "how long does @ keep logs?", .para = "how long are @ records kept?" },
+    .{ .fact = "@ passes messages through #", .update = "@ messaging moved to #", .same = "what does @ pass messages through?", .para = "which broker does @ rely on?" },
+    .{ .fact = "@ serves static files from #", .update = "@ assets now served from #", .same = "where does @ serve static files from?", .para = "who delivers @ content to browsers?" },
+    .{ .fact = "@ may fail # of requests", .update = "@ failure allowance tightened to #", .same = "how many requests may @ fail?", .para = "how much downtime is @ allowed?" },
+    .{ .fact = "@ is backed up every #", .update = "@ backups now run every #", .same = "how often is @ backed up?", .para = "how often is @ snapshotted?" },
+    .{ .fact = "@ new checkout is behind the # toggle", .update = "@ toggle renamed to #", .same = "which toggle is the @ checkout behind?", .para = "what switch turns on the new @ checkout?" },
+    .{ .fact = "@ tests run with #", .update = "@ tests ported to #", .same = "what do @ tests run with?", .para = "which framework checks @ code?" },
+    .{ .fact = "@ is billed to the # account", .update = "@ charges moved to the # account", .same = "which account is @ billed to?", .para = "whose subscription pays for @?" },
+    .{ .fact = "@ builds on #", .update = "@ builds migrated to #", .same = "where does @ build?", .para = "what compiles @ on every commit?" },
+    .{ .fact = "@ documentation lives on #", .update = "@ docs moved to #", .same = "where does @ documentation live?", .para = "where is the @ manual?" },
+    .{ .fact = "@ mockups are drawn in #", .update = "@ mockups now made in #", .same = "what are @ mockups drawn in?", .para = "what tool sketches @ screens?" },
+};
+
+fn fillTemplate(buf: *std.ArrayList(u8), tmpl: []const u8, ent: []const u8, val: []const u8) !void {
+    for (tmpl) |c| switch (c) {
+        '@' => try buf.appendSlice(gpa, ent),
+        '#' => try buf.appendSlice(gpa, val),
+        else => try buf.append(gpa, c),
+    };
+}
+
+/// The most common words of the meaning table, most common first.
+fn loadChatWords(io: Io, model: []const u8, want: usize) !std.ArrayList([]const u8) {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, model, driver, .unlimited);
+    var list: std.ArrayList([]const u8) = .empty;
+    var p: usize = 16;
+    while (list.items.len < want and p < bytes.len) {
+        const l = bytes[p];
+        try list.append(driver, bytes[p + 1 ..][0..l]);
+        p += 1 + l;
+    }
+    return list;
+}
+
+fn chatFiller(buf: *std.ArrayList(u8), cw: []const []const u8, seed: u64, nwords: u64) !void {
+    var s = seed;
+    for (0..nwords) |_| {
+        const u: f64 = @as(f64, @floatFromInt(splitmix(&s) >> 11)) / @as(f64, 1 << 53);
+        const idx: usize = @intFromFloat(@as(f64, @floatFromInt(cw.len)) * u * u * u);
+        try buf.appendSlice(gpa, cw[@min(idx, cw.len - 1)]);
+        try buf.append(gpa, ' ');
+    }
+}
+
+fn runHard(io: Io, dir: []const u8, n: u64, model_path: []const u8) !void {
+    prog_phases = 10;
+    if (std.c.getenv("HOLO_DEBUG") != null) debug_queries = 8;
+    const model_bytes = try Io.Dir.cwd().readFileAlloc(io, model_path, driver, .unlimited);
+    const meaning = try Holo.Meaning.load(driver, model_bytes);
+    defer meaning.deinit(driver);
+    driver.free(model_bytes);
+    var cw = try loadChatWords(io, model_path, 4000);
+    defer cw.deinit(driver);
+
+    const nents = @max(n / 10_000, 10);
+    const nfacts = nents * hard_attrs.len;
+    const facts = try driver.alloc(Fact, nfacts);
+    defer driver.free(facts);
+    var s: u64 = 777;
+    for (facts, 0..) |*f, i| {
+        const t0 = splitmix(&s) % (n * 8 / 10);
+        const updated = splitmix(&s) % 100 < 30;
+        const ent = i / hard_attrs.len;
+        f.* = .{
+            .project = ent % projects,
+            .chat = splitmix(&s) % chats_per_project,
+            .attr = @intCast(i % hard_attrs.len),
+            .tagged = splitmix(&s) % 2 == 0,
+            .at = .{ t0, if (updated) t0 + 1 + splitmix(&s) % (n - t0 - 1) else 0 },
+            .versions = if (updated) 2 else 1,
+        };
+    }
+    const Ev = struct { pos: u64, fact: u32, ver: u8 };
+    var evs: std.ArrayList(Ev) = .empty;
+    defer evs.deinit(driver);
+    for (facts, 0..) |f, i| for (0..f.versions) |v| try evs.append(driver, .{ .pos = f.at[v], .fact = @intCast(i), .ver = @intCast(v) });
+    std.mem.sortUnstable(Ev, evs.items, {}, struct {
+        fn lt(_: void, a: Ev, b: Ev) bool {
+            return a.pos < b.pos;
+        }
+    }.lt);
+
+    const opts: Holo.Options = .{ .sync_writes = false, .half_life_ms = 3 * 24 * 3600 * 1000, .meaning = meaning };
+    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, opts);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var batch: Batch = .{};
+    defer batch.deinit();
+    var scb: [48]u8 = undefined;
+    var sjb: [64]u8 = undefined;
+
+    phaseStart("hard_load", n + evs.items.len);
+    var t = nowNs(io);
+    var ei: usize = 0;
+    var raw: u64 = 0;
+    for (0..n) |i| {
+        const tm = t0_ms + i * 1000;
+        while (ei < evs.items.len and evs.items[ei].pos == i) : (ei += 1) {
+            const e = evs.items[ei];
+            const f = facts[e.fact];
+            const ent_i = e.fact / hard_attrs.len;
+            var eb: [24]u8 = undefined;
+            var vb: [24]u8 = undefined;
+            buf.clearRetainingCapacity();
+            try chatFiller(&buf, cw.items, e.fact *% 77 +% e.ver, 4);
+            const a = hard_attrs[f.attr];
+            try fillTemplate(&buf, if (e.ver == 0) a.fact else a.update, entity(&eb, ent_i), valueWord(&vb, e.fact, e.ver));
+            try buf.appendSlice(gpa, ". ");
+            try chatFiller(&buf, cw.items, e.fact *% 91 +% e.ver, 4);
+            raw += buf.items.len;
+            const subj: ?[]const u8 = if (f.tagged) (std.fmt.bufPrint(&sjb, "{s}/{d}", .{ entity(&eb, ent_i), f.attr }) catch unreachable) else null;
+            try batch.add(h, scopeOf(&scb, f), buf.items, subj, tm);
+        }
+        buf.clearRetainingCapacity();
+        var ss = i *% 0x2545F4914F6CDD1D +% 5;
+        try chatFiller(&buf, cw.items, splitmix(&ss), 8 + splitmix(&ss) % 30);
+        raw += buf.items.len;
+        const p = splitmix(&ss) % projects;
+        const c = splitmix(&ss) % chats_per_project;
+        const sc = std.fmt.bufPrint(&scb, "proj/{d:0>3}/chat/{d:0>2}", .{ p, c }) catch unreachable;
+        try batch.add(h, sc, buf.items, null, tm);
+    }
+    try batch.flush(h);
+    try h.sync();
+    const load_secs = secondsSince(io, t);
+    const now_ms = t0_ms + n * 1000;
+    h.setClockForTest(now_ms);
+    try report("hard_load", n + evs.items.len, load_secs, null, ",\"raw_bytes\":{d},\"entities\":{d},\"facts\":{d},\"updated\":{d},\"rss_kb\":{d},\"index_bytes\":{d}", .{
+        raw, nents, nfacts, evs.items.len - nfacts, maxRssKb(io), h.info().index_bytes,
+    });
+
+    phaseStart("hard_reopen", 1);
+    t = nowNs(io);
+    h.close();
+    h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, opts);
+    h.setClockForTest(now_ms);
+    try report("hard_reopen", 1, secondsSince(io, t), null, ",\"disk_bytes\":{d}", .{dirBytes(io, dir)});
+
+    const queries = @min(nfacts, 2000);
+    const Case = struct { name: []const u8, para: bool, expand: bool, project: bool = false, brief: bool = false };
+    const cases = [_]Case{
+        .{ .name = "same_words_lexical", .para = false, .expand = false },
+        .{ .name = "same_words_meaning", .para = false, .expand = true },
+        .{ .name = "paraphrase_lexical", .para = true, .expand = false },
+        .{ .name = "paraphrase_meaning", .para = true, .expand = true },
+        .{ .name = "paraphrase_meaning_project", .para = true, .expand = true, .project = true },
+        .{ .name = "paraphrase_brief_2000tok", .para = true, .expand = true, .project = true, .brief = true },
+        .{ .name = "paraphrase_lexical_brief_2000tok", .para = true, .expand = false, .project = true, .brief = true },
+    };
+    for (cases) |cs| {
+        phaseStart(cs.name, queries);
+        var lat: Lat = .{};
+        defer lat.ns.deinit(driver);
+        var hit1: u64 = 0;
+        var hit5: u64 = 0;
+        var stale1: u64 = 0;
+        var tokens: u64 = 0;
+        var qs: u64 = 5;
+        t = nowNs(io);
+        for (0..queries) |_| {
+            const fi = splitmix(&qs) % nfacts;
+            const f = facts[fi];
+            var eb: [24]u8 = undefined;
+            var vb: [24]u8 = undefined;
+            var ob: [24]u8 = undefined;
+            const ent = entity(&eb, fi / hard_attrs.len);
+            const want = valueWord(&vb, fi, f.versions - 1);
+            const old: ?[]const u8 = if (f.versions > 1) valueWord(&ob, fi, 0) else null;
+            buf.clearRetainingCapacity();
+            const a = hard_attrs[f.attr];
+            try fillTemplate(&buf, if (cs.para) a.para else a.same, ent, "");
+            var pb: [16]u8 = undefined;
+            const proj = std.fmt.bufPrint(&pb, "proj/{d:0>3}", .{f.project}) catch unreachable;
+            const st = nowNs(io);
+            if (cs.brief) {
+                const b = if (cs.expand) try h.brief(gpa, buf.items, proj, 2000) else blk: {
+                    // Lexical brief: same store, meaning switched off.
+                    const saved = h.options.meaning;
+                    h.options.meaning = null;
+                    defer h.options.meaning = saved;
+                    break :blk try h.brief(gpa, buf.items, proj, 2000);
+                };
+                lat.ns.append(driver, @intCast(nowNs(io) - st)) catch {};
+                defer b.deinit(gpa);
+                if (!sample_printed and cs.expand) {
+                    sample_printed = true;
+                    std.debug.print("BRIEF-SAMPLE brief(\"{s}\", \"{s}\", 2000)\n{s}BRIEF-END\n", .{ buf.items, proj, b.text });
+                }
+                tokens += b.tokens;
+                if (std.mem.indexOf(u8, b.text, want) != null) hit5 += 1;
+                if (old) |o| if (std.mem.indexOf(u8, b.text, o) != null) {
+                    stale1 += 1;
+                };
+            } else {
+                const hits = try h.recall(gpa, .{ .about = buf.items, .scope = if (cs.project) proj else "", .limit = 5, .expand = cs.expand });
+                lat.ns.append(driver, @intCast(nowNs(io) - st)) catch {};
+                defer Holo.freeHits(gpa, hits);
+                if (debug_queries > 0 and cs.para and cs.expand and !cs.project) {
+                    debug_queries -= 1;
+                    std.debug.print("Q[{s}] {s}  want={s}\n", .{ cs.name, buf.items, want });
+                    for (hits) |x| std.debug.print("   {d:.3} {s}\n", .{ x.score, x.memory.text });
+                }
+                for (hits, 0..) |x, rank| {
+                    const has = std.mem.indexOf(u8, x.memory.text, want) != null;
+                    const has_old = if (old) |o| std.mem.indexOf(u8, x.memory.text, o) != null and !has else false;
+                    if (rank == 0 and has) hit1 += 1;
+                    if (rank == 0 and has_old) stale1 += 1;
+                    if (has) {
+                        hit5 += 1;
+                        break;
+                    }
+                }
+            }
+            tick();
+        }
+        try report(cs.name, queries, secondsSince(io, t), &lat, ",\"hit_at_1\":{d:.4},\"hit_at_k\":{d:.4},\"stale\":{d:.4},\"avg_tokens\":{d:.1}", .{
+            ratio(hit1, queries), ratio(hit5, queries), ratio(stale1, queries), ratio(tokens, queries),
+        });
+    }
+    h.close();
 }

@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
 const streams = @import("../streams/Store.zig");
 const text = @import("text.zig");
+pub const Meaning = @import("Meaning.zig");
 
 const Holo = @This();
 
@@ -47,8 +48,10 @@ const map_reserve: usize = 1 << 38;
 const page_align = std.heap.page_size_min;
 /// Checkpoint after this many new rows.
 const checkpoint_every: u32 = 1 << 18;
-/// Width of each count-min row: 4 x 128k counters, 2 MB.
-const cms_bits = 17;
+/// Count-min sketch: 2 rows of 256k counters, 2 MB. Two rows halve the
+/// cache misses per word; conservative update keeps them accurate.
+const cms_bits = 18;
+const cms_rows = 2;
 
 /// One memory's searchable summary. Fixed size, stored by id.
 pub const Row = extern struct {
@@ -81,6 +84,9 @@ pub const Options = struct {
     /// good matches (newest version wins); old memories keep 85% of their score.
     half_life_ms: u64 = 7 * 24 * 3600 * 1000,
     shards: ?usize = null,
+    /// Word meanings (see `Meaning`). With it, recall also finds memories
+    /// that say the same thing in other words. Owned by the caller.
+    meaning: ?*const Meaning = null,
 };
 
 pub const RememberOptions = struct {
@@ -112,7 +118,12 @@ pub const Hit = struct {
     buried: bool,
     /// Which query terms it matched (bit per term, rarest first).
     matched: u8 = 0,
+    /// With meaning: the memory's words that best answer the question
+    /// (meaning-table index + 1; 0 for none).
+    topics: Topics = @splat(0),
 };
+
+pub const Topics = [4]u32;
 
 pub fn freeMemories(gpa: Allocator, ms: []const Memory) void {
     for (ms) |m| m.deinit(gpa);
@@ -134,6 +145,9 @@ pub const Query = struct {
     limit: usize = 10,
     /// Include buried (replaced or settled) memories.
     deep: bool = false,
+    /// Use word meanings, when the store has them: related words count
+    /// as partial matches and the closest in meaning ranks first.
+    expand: bool = true,
 };
 
 pub const Brief = struct {
@@ -202,6 +216,7 @@ forgotten: Bits = .{},
 
 ops_seq: u64 = 0,
 ckpt_count: u32 = 0,
+batch_unsynced: std.atomic.Value(bool) = .init(false),
 
 // ------------------------------------------------------------------ open
 
@@ -221,7 +236,7 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     errdefer pages_file.close(io);
     const rows_map = try std.posix.mmap(null, map_reserve, .{ .READ = true }, .{ .TYPE = .SHARED }, rows_file.handle, 0);
     errdefer std.posix.munmap(rows_map);
-    const cms = try gpa.alloc(u32, 4 << cms_bits);
+    const cms = try gpa.alloc(u32, cms_rows << cms_bits);
     @memset(cms, 0);
     errdefer gpa.free(cms);
 
@@ -375,20 +390,17 @@ pub fn row(h: *const Holo, id: u32) *const Row {
     return @ptrCast(@alignCast(h.rows_map[off..][0..@sizeOf(Row)].ptr));
 }
 
-fn cmsSlots(x: u64) [4]usize {
+fn cmsSlots(x: u64) [cms_rows]usize {
     const mask = (1 << cms_bits) - 1;
-    var out: [4]usize = undefined;
-    // Two hashes give four independent-enough rows (Kirsch-Mitzenmacher).
-    const h1: u64 = x;
-    const h2: u64 = (x >> 32) | (x << 32) | 1;
-    inline for (0..4) |r| out[r] = (r << cms_bits) | @as(usize, @intCast((h1 +% r *% h2) >> 20 & mask));
+    var out: [cms_rows]usize = undefined;
+    inline for (0..cms_rows) |r| out[r] = (r << cms_bits) | @as(usize, @intCast((x >> (r * 24 + 8)) & mask));
     return out;
 }
 
 fn df(h: *const Holo, x: u64) u32 {
     const sl = cmsSlots(x);
     var m: u32 = std.math.maxInt(u32);
-    inline for (0..4) |r| m = @min(m, h.cms[sl[r]]);
+    inline for (0..cms_rows) |r| m = @min(m, h.cms[sl[r]]);
     return m;
 }
 
@@ -397,8 +409,8 @@ fn df(h: *const Holo, x: u64) u32 {
 fn bumpDf(h: *Holo, x: u64) void {
     const sl = cmsSlots(x);
     var m: u32 = std.math.maxInt(u32);
-    inline for (0..4) |r| m = @min(m, h.cms[sl[r]]);
-    inline for (0..4) |r| {
+    inline for (0..cms_rows) |r| m = @min(m, h.cms[sl[r]]);
+    inline for (0..cms_rows) |r| {
         if (h.cms[sl[r]] == m) h.cms[sl[r]] = m +| 1;
     }
 }
@@ -430,7 +442,7 @@ fn simhash(hashes: []const u64, order: []const u16) u32 {
 
 /// Adds one memory's row. Caller holds the write lock. Same code for new
 /// writes and for replay, so a rebuilt index matches the original.
-fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, body: []const u8, ts: *const text.TermSet) !u32 {
+fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, body_len: usize, terms: text.Terms) !u32 {
     const gpa = h.gpa;
     const id = h.count;
     if (id == none) return error.Full;
@@ -439,11 +451,11 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     // Keep the rarest terms: they are what tells memories apart.
     var dfs: [text.TermSet.cap]u32 = undefined;
     var order: [text.TermSet.cap]u16 = undefined;
-    for (ts.hashes[0..ts.len], 0..) |x, i| {
+    for (terms.hashes, 0..) |x, i| {
         order[i] = @intCast(i);
         dfs[i] = h.df(x);
     }
-    const nt = @min(ts.len, max_terms);
+    const nt = @min(terms.hashes.len, max_terms);
     {
         const Ctx = struct {
             d: []const u32,
@@ -451,7 +463,7 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
                 return c.d[a] < c.d[b];
             }
         };
-        std.mem.sortUnstable(u16, order[0..ts.len], Ctx{ .d = dfs[0..ts.len] }, Ctx.lt);
+        std.mem.sortUnstable(u16, order[0..terms.hashes.len], Ctx{ .d = dfs[0..terms.hashes.len] }, Ctx.lt);
     }
 
     var r: Row = .{
@@ -460,14 +472,14 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
         .subj = if (subject.len > 0) @truncate(std.hash.Wyhash.hash(1, subject)) else 0,
         .scope = scope,
         .prev = h.heads.items[scope],
-        .len = @intCast(body.len),
-        .sim = simhash(&ts.hashes, order[0..nt]),
+        .len = @intCast(body_len),
+        .sim = simhash(terms.hashes, order[0..nt]),
         .nterms = @intCast(nt),
         .kind = 0,
     };
-    for (0..nt) |i| r.terms[i] = text.tag(ts.hashes[order[i]]);
-    for (ts.hashes[0..ts.len]) |x| h.bumpDf(x);
-    h.total_terms += ts.total;
+    for (0..nt) |i| r.terms[i] = text.tag(terms.hashes[order[i]]);
+    for (terms.hashes) |x| h.bumpDf(x);
+    h.total_terms += terms.total;
 
     try h.buried.ensure(gpa, id + 1);
     try h.forgotten.ensure(gpa, id + 1);
@@ -507,7 +519,7 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     // are the ones a question can be pruned on, and fewer bits keep the
     // fingerprint sharp.
     for (0..@min(nt, bloom_terms)) |i| {
-        const bit = text.bloomBit(ts.hashes[order[i]]);
+        const bit = text.bloomBit(terms.hashes[order[i]]);
         pg.bloom[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
     }
     pg.tmax = @max(pg.tmax, time);
@@ -549,8 +561,17 @@ fn opKey(buf: *[32]u8, seq: u64) []const u8 {
     return std.fmt.bufPrint(buf, "~o/{x:0>10}/{x:0>16}", .{ seq >> 12, seq }) catch unreachable;
 }
 
+fn valueLen(scope: []const u8, subject: []const u8, body: []const u8) usize {
+    return 2 + scope.len + 2 + subject.len + 8 + body.len;
+}
+
 fn encodeValue(gpa: Allocator, scope: []const u8, subject: []const u8, time: u64, body: []const u8) ![]u8 {
-    const v = try gpa.alloc(u8, 2 + scope.len + 2 + subject.len + 8 + body.len);
+    const v = try gpa.alloc(u8, valueLen(scope, subject, body));
+    encodeInto(v, scope, subject, time, body);
+    return v;
+}
+
+fn encodeInto(v: []u8, scope: []const u8, subject: []const u8, time: u64, body: []const u8) void {
     var p: usize = 0;
     std.mem.writeInt(u16, v[p..][0..2], @intCast(scope.len), .little);
     p += 2;
@@ -563,7 +584,6 @@ fn encodeValue(gpa: Allocator, scope: []const u8, subject: []const u8, time: u64
     std.mem.writeInt(u64, v[p..][0..8], time, .little);
     p += 8;
     @memcpy(v[p..], body);
-    return v;
 }
 
 fn decodeValue(id: u32, raw: []u8) !Memory {
@@ -594,11 +614,14 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     const time = opts.time orelse h.nowMs();
     var ts: text.TermSet = .{};
     ts.fill(body);
-    const value = try encodeValue(h.gpa, scope, subject, time, body);
-    defer h.gpa.free(value);
+    var stack: [4096]u8 = undefined;
+    const vlen = valueLen(scope, subject, body);
+    const value = if (vlen <= stack.len) stack[0..vlen] else try h.gpa.alloc(u8, vlen);
+    defer if (vlen > stack.len) h.gpa.free(value);
+    encodeInto(value, scope, subject, time, body);
 
     h.lock.lockUncancelable(h.io);
-    const id = h.applyRow(scope, subject, time, body, &ts) catch |e| {
+    const id = h.applyRow(scope, subject, time, body.len, ts.terms()) catch |e| {
         h.lock.unlock(h.io);
         return e;
     };
@@ -614,8 +637,119 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     return id;
 }
 
+pub const Item = struct {
+    scope: []const u8,
+    text: []const u8,
+    subject: ?[]const u8 = null,
+    time: ?u64 = null,
+};
+
+/// Saves many memories at once and returns the first id; the rest follow
+/// in order. Tokenizing and storing run on every core; only adding the
+/// rows to the index is serial. Use it for imports and bulk loads.
+pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
+    if (items.len == 0) return h.count;
+    for (items) |it| {
+        if (it.scope.len == 0 or it.scope.len > 1024) return error.InvalidScope;
+        if (it.subject) |sj| if (sj.len > 1024) return error.InvalidSubject;
+    }
+    const gpa = h.gpa;
+    const now = h.nowMs();
+    const nw: usize = @min(max_workers, @max(1, std.Thread.getCpuCount() catch 1), (items.len + 63) / 64);
+
+    // 1. Tokenize in parallel: each worker fills its own slice of spans.
+    const Span = struct { start: u32, len: u32, total: u32 };
+    const spans = try gpa.alloc(Span, items.len);
+    defer gpa.free(spans);
+    var pools: [max_workers]std.ArrayList(u64) = @splat(.empty);
+    defer for (&pools) |*p| p.deinit(gpa);
+    const Tok = struct {
+        fn run(its: []const Item, sp: []Span, pool: *std.ArrayList(u64), a: Allocator, err: *?anyerror) void {
+            var ts: text.TermSet = .{};
+            for (its, sp) |it, *o| {
+                ts.fill(it.text);
+                o.* = .{ .start = @intCast(pool.items.len), .len = @intCast(ts.len), .total = @intCast(ts.total) };
+                pool.appendSlice(a, ts.hashes[0..ts.len]) catch |e| {
+                    err.* = e;
+                    return;
+                };
+            }
+        }
+    };
+    var errs: [max_workers]?anyerror = @splat(null);
+    const per = (items.len + nw - 1) / nw;
+    {
+        var threads: [max_workers]?std.Thread = @splat(null);
+        for (0..nw) |w| {
+            const lo = @min(items.len, w * per);
+            const hi = @min(items.len, lo + per);
+            const args = .{ items[lo..hi], spans[lo..hi], &pools[w], gpa, &errs[w] };
+            threads[w] = std.Thread.spawn(.{}, Tok.run, args) catch null;
+            if (threads[w] == null) @call(.auto, Tok.run, args);
+        }
+        for (threads[0..nw]) |t| if (t) |x| x.join();
+    }
+    for (errs) |e| if (e) |x| return x;
+
+    // 2. Add rows, in order, under the lock.
+    const lanes_of = try gpa.alloc(u8, items.len);
+    defer gpa.free(lanes_of);
+    var first: u32 = 0;
+    {
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        first = h.count;
+        for (items, spans, 0..) |it, sp, i| {
+            const w = i / per;
+            const terms: text.Terms = .{ .hashes = pools[w].items[sp.start..][0..sp.len], .total = sp.total };
+            const id = try h.applyRow(it.scope, it.subject orelse "", it.time orelse now, it.text.len, terms);
+            lanes_of[i] = @intCast(laneOf(h.row(id).scope));
+        }
+    }
+
+    // 3. Store the text in parallel, each worker owning some lanes so
+    // workers rarely share a shard.
+    const Put = struct {
+        fn run(hh: *Holo, its: []const Item, lanes_: []const u8, first_id: u32, now_: u64, w: usize, n: usize, err: *?anyerror) void {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(hh.gpa);
+            for (its, 0..) |it, i| {
+                if (lanes_[i] % n != w) continue;
+                const subject = it.subject orelse "";
+                buf.resize(hh.gpa, valueLen(it.scope, subject, it.text)) catch |e| {
+                    err.* = e;
+                    return;
+                };
+                encodeInto(buf.items, it.scope, subject, it.time orelse now_, it.text);
+                var kb: [24]u8 = undefined;
+                const id = first_id + @as(u32, @intCast(i));
+                hh.kv.put(memKey(&kb, id, lanes_[i]), buf.items) catch |e| {
+                    err.* = e;
+                    return;
+                };
+            }
+        }
+    };
+    errs = @splat(null);
+    var threads: [max_workers]?std.Thread = @splat(null);
+    for (0..nw) |w| {
+        threads[w] = std.Thread.spawn(.{}, Put.run, .{ h, items, lanes_of, first, now, w, nw, &errs[w] }) catch null;
+        if (threads[w] == null) Put.run(h, items, lanes_of, first, now, w, nw, &errs[w]);
+    }
+    for (threads[0..nw]) |t| if (t) |x| x.join();
+    for (errs) |e| if (e) |x| return x;
+    if (h.options.sync_writes) try h.kv.syncAll() else h.batch_unsynced.store(true, .release);
+    if (h.count - h.ckpt_count >= checkpoint_every) try h.checkpoint();
+    return first;
+}
+
+const max_workers = 8;
+
 /// Makes every write so far durable.
 pub fn sync(h: *Holo) !void {
+    // Batch writes store text from worker threads, which this thread's
+    // own sync would not cover.
+    if (h.batch_unsynced.swap(false, .acq_rel)) return h.kv.syncAll();
     try h.kv.sync();
 }
 
@@ -762,7 +896,13 @@ pub fn current(h: *Holo, gpa: Allocator, scope: []const u8, subject: []const u8)
     return h.get(gpa, id);
 }
 
-const QTerm = struct { tag: u16, bit: u12, idf: f32, hash: u64 };
+/// A query word or a word related in meaning to one. `idf` is what a match
+/// is worth; words of one `group` count once, by their best match.
+const QTerm = struct { tag: u16, bit: u12, idf: f32, hash: u64, group: u8 = 0 };
+const max_groups = 8;
+const max_related = 4;
+const min_related_sim = 0.45;
+const anchor_weight = 2.0;
 
 const Cand = struct { id: u32, score: f32 };
 
@@ -824,11 +964,24 @@ fn coverage(s: f32, qsum: f32) f32 {
 fn rowScore(r: *const Row, q: []const QTerm) f32 {
     const V = @Vector(max_terms, u16);
     const tags: V = r.terms;
-    var s: f32 = 0;
+    var best: [max_groups]f32 = @splat(0);
     for (q) |t| {
         const hit = tags == @as(V, @splat(t.tag));
-        if (@reduce(.Or, hit)) s += t.idf;
+        if (@reduce(.Or, hit)) best[t.group] = @max(best[t.group], t.idf);
     }
+    var s: f32 = 0;
+    for (best) |b| s += b;
+    return s;
+}
+
+/// Best possible score of any row on a page, from its bloom filter.
+fn pageBound(pg: *const Page, q: []const QTerm) f32 {
+    var best: [max_groups]f32 = @splat(0);
+    for (q) |t| {
+        if (pg.bloom[t.bit / 64] & (@as(u64, 1) << @intCast(t.bit % 64)) != 0) best[t.group] = @max(best[t.group], t.idf);
+    }
+    var s: f32 = 0;
+    for (best) |b| s += b;
     return s;
 }
 
@@ -846,9 +999,10 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
     // Query terms, rarest first, at most 8.
     var ts: text.TermSet = .{};
     ts.fill(q.about);
-    var qt_buf: [8]QTerm = undefined;
+    var qt_buf: [max_groups * (1 + max_related)]QTerm = undefined;
     var cands_buf: [256]Cand = undefined;
-    const pool = @min(cands_buf.len, @max(limit * 4, 16));
+    const meaning: ?*const Meaning = if (q.expand) h.options.meaning else null;
+    const pool = @min(cands_buf.len, if (meaning != null) @max(limit * 8, 64) else @max(limit * 4, 16));
     var top: TopK = .{ .items = cands_buf[0..pool] };
     var nq: usize = 0;
     var avg_len: f32 = 1;
@@ -867,10 +1021,42 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
             }
         };
         std.mem.sortUnstable(QTerm, all[0..ts.len], {}, Ctx.lt);
-        nq = @min(ts.len, qt_buf.len);
+        // Names and ids (words the meaning table does not know) are what a
+        // question is about: with meaning on, they weigh double.
+        if (meaning) |mn| {
+            for (all[0..ts.len]) |*t| if (mn.index(t.hash) == null) {
+                t.idf *= anchor_weight;
+            };
+            std.mem.sortUnstable(QTerm, all[0..ts.len], {}, Ctx.lt);
+        }
+        nq = @min(ts.len, max_groups);
         @memcpy(qt_buf[0..nq], all[0..nq]);
+        for (qt_buf[0..nq], 0..) |*t, g| {
+            t.group = @intCast(g);
+            qsum += t.idf;
+        }
+        // Words related in meaning join their word's group, worth their
+        // squared similarity times the lower of the two rarities.
+        if (meaning) |mn| {
+            const ng = nq;
+            for (0..ng) |g| {
+                var rel: [max_related]Meaning.Related = undefined;
+                const n = mn.related(qt_buf[g].hash, min_related_sim, &rel);
+                outer: for (rel[0..n]) |rw| {
+                    for (qt_buf[0..nq]) |t| if (t.hash == rw.hash) continue :outer;
+                    const vi = h.idf(rw.hash);
+                    qt_buf[nq] = .{
+                        .tag = text.tag(rw.hash),
+                        .bit = text.bloomBit(rw.hash),
+                        .idf = rw.sim * rw.sim * @min(qt_buf[g].idf, vi),
+                        .hash = rw.hash,
+                        .group = @intCast(g),
+                    };
+                    nq += 1;
+                }
+            }
+        }
         const qt = qt_buf[0..nq];
-        for (qt) |t| qsum += t.idf;
 
         var set = try h.scopeSet(gpa, q.scope);
         defer set.deinit(gpa);
@@ -932,10 +1118,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                 } else {
                     // Nothing older can beat the current top: stop.
                     if (top.len == top.items.len and qsum * best_rec <= fl) break;
-                    var bound: f32 = 0;
-                    for (qt) |t| {
-                        if (pg.bloom[t.bit / 64] & (@as(u64, 1) << @intCast(t.bit % 64)) != 0) bound += t.idf;
-                    }
+                    const bound = pageBound(pg, qt);
                     if (bound == 0 or coverage(bound, qsum) * best_rec * heatBoost(h.heat.items[pi]) <= fl) continue;
                 }
                 const first: u32 = @intCast(pi * page_rows);
@@ -976,36 +1159,46 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         const m = (try h.get(gpa, c.id)) orelse continue;
         var score = c.score;
         var matched: u8 = 0;
+        var topics: Topics = @splat(0);
         if (nq > 0) {
             var mt: text.TermSet = .{};
             mt.fill(m.text);
-            var bm: f32 = 0;
-            var covered: f32 = 0;
+            var gbm: [max_groups]f32 = @splat(0);
+            var gcov: [max_groups]f32 = @splat(0);
             var mask: u8 = 0;
             const dl: f32 = @floatFromInt(mt.total);
-            for (qt_buf[0..nq], 0..) |t, qi| {
+            for (qt_buf[0..nq]) |t| {
                 for (mt.hashes[0..mt.len], 0..) |x, i| if (x == t.hash) {
+                    if (t.idf <= gcov[t.group]) break;
                     const tf: f32 = @floatFromInt(mt.tf[i]);
-                    bm += t.idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / @max(avg_len, 1)));
-                    covered += t.idf;
-                    mask |= @as(u8, 1) << @intCast(qi);
+                    gbm[t.group] = t.idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / @max(avg_len, 1)));
+                    gcov[t.group] = t.idf;
+                    mask |= @as(u8, 1) << @intCast(t.group);
                     break;
                 };
+            }
+            var bm: f32 = 0;
+            var covered: f32 = 0;
+            for (gbm, gcov) |b, cv| {
+                bm += b;
+                covered += cv;
             }
             if (bm == 0) {
                 m.deinit(gpa);
                 continue;
             }
+            var near: f32 = 0;
+            if (meaning) |mn| near, topics = closeness(mn, qt_buf[0..nq], m.text);
             const r = blk: {
                 h.lock.lockSharedUncancelable(h.io);
                 defer h.lock.unlockShared(h.io);
                 break :blk h.row(c.id).*;
             };
             const cov = covered / @max(qsum, 1e-6);
-            score = bm * cov * cov * h.recency(now, m.time) * subjBoost(&r);
+            score = bm * cov * cov * (1.0 + semantic_weight * near) * h.recency(now, m.time) * subjBoost(&r);
             matched = mask;
         }
-        try hits.append(gpa, .{ .memory = m, .score = score, .buried = h.buried.get(c.id), .matched = matched });
+        try hits.append(gpa, .{ .memory = m, .score = score, .buried = h.buried.get(c.id), .matched = matched, .topics = topics });
     }
     const Ctx = struct {
         fn gt(_: void, a: Hit, b: Hit) bool {
@@ -1026,8 +1219,10 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
 }
 
 /// Read-time sedimentation: among hits that matched the same query terms
-/// about equally well (within 10%), the newest comes first and the older
-/// ones are marked buried. "We changed X to B" then outranks "X is A".
+/// (at least two of them) about equally well (within 10%), the newest comes
+/// first and the older ones are marked buried. "We changed X to B" then
+/// outranks "X is A". Hits that share only one word, such as a name, are
+/// different facts about it and are left alone.
 fn sedimentHits(hits: []Hit) void {
     var changed = true;
     var rounds: usize = 0;
@@ -1036,7 +1231,7 @@ fn sedimentHits(hits: []Hit) void {
         for (0..hits.len) |i| for (i + 1..hits.len) |j| {
             const a = &hits[i];
             const b = &hits[j];
-            if (a.matched != b.matched or b.score < a.score * 0.9) continue;
+            if (!sameFact(a, b)) continue;
             if (b.memory.time > a.memory.time) {
                 std.mem.swap(Hit, a, b);
                 changed = true;
@@ -1046,12 +1241,106 @@ fn sedimentHits(hits: []Hit) void {
     for (0..hits.len) |j| for (0..j) |i| {
         const a = &hits[i];
         const b = &hits[j];
-        if (a.matched == b.matched and b.score >= a.score * 0.9 and a.memory.time > b.memory.time) {
+        if (sameFact(a, b) and a.memory.time > b.memory.time) {
             b.buried = true;
             break;
         }
     };
 }
+
+/// `b` (ranked below `a`) looks like another version of the same fact:
+/// it matched the same question words (two or more) about as well, or,
+/// with meaning, it shares the question's name and answers it with a
+/// same word ("moved to the X region" after "deployed in the Y region").
+fn sameFact(a: *const Hit, b: *const Hit) bool {
+    if (a.matched == b.matched and @popCount(a.matched) >= 2 and b.score >= a.score * 0.9) return true;
+    if (a.matched & b.matched & 1 == 0 or b.score < a.score * 0.5) return false;
+    for (a.topics) |x| {
+        if (x == 0) break;
+        for (b.topics) |y| if (x == y) return true;
+    }
+    return false;
+}
+/// How much the closest-in-meaning candidate gains over an unrelated one.
+const semantic_weight = 8.0;
+
+/// How close a memory is in meaning to the question: for each question
+/// word, its best match among the memory's words (1 for the word itself,
+/// less for related words, nothing below `sim_floor`), weighted by rarity.
+/// Words near a name the question asks about count fully; farther ones
+/// fade, so chatter around the answer does not drown it.
+fn closeness(mn: *const Meaning, qt: []const QTerm, body: []const u8) struct { f32, Topics } {
+    const Seq = struct {
+        hashes: [256]u64 = undefined,
+        len: usize = 0,
+        pub fn term(q: *@This(), x: u64) void {
+            if (q.len < q.hashes.len) {
+                q.hashes[q.len] = x;
+                q.len += 1;
+            }
+        }
+    };
+    var seq: Seq = .{};
+    text.forEachTerm(body, &seq);
+    // Positions of the question's names (words with no meaning entry).
+    var anchors: [32]u16 = undefined;
+    var na: usize = 0;
+    for (seq.hashes[0..seq.len], 0..) |x, i| {
+        for (qt) |t| if (t.hash == x and t.hash == qt[t.group].hash and mn.index(x) == null) {
+            if (na < anchors.len) {
+                anchors[na] = @intCast(i);
+                na += 1;
+            }
+            break;
+        };
+    }
+    var di: [256]u32 = undefined;
+    var dw: [256]f32 = undefined;
+    var nd: usize = 0;
+    for (seq.hashes[0..seq.len], 0..) |x, i| {
+        const wi = mn.index(x) orelse continue;
+        var w: f32 = 1;
+        if (na > 0) {
+            var dist: usize = std.math.maxInt(usize);
+            for (anchors[0..na]) |ap| dist = @min(dist, if (ap > i) ap - i else i - ap);
+            if (dist > near_words) w = @exp2(-@as(f32, @floatFromInt(dist - near_words)) / near_words);
+        }
+        di[nd] = wi;
+        dw[nd] = w;
+        nd += 1;
+    }
+    var sum: f32 = 0;
+    var wsum: f32 = 0;
+    var topics: Topics = @splat(0);
+    var nt: usize = 0;
+    for (qt) |t| {
+        if (t.hash != qt[t.group].hash) continue;
+        const qi = mn.index(t.hash) orelse continue;
+        wsum += t.idf;
+        var best: f32 = 0;
+        var best_d: u32 = 0;
+        for (di[0..nd], dw[0..nd]) |d, w| {
+            const sm = w * mn.similarity(qi, d);
+            if (sm > best) {
+                best = sm;
+                best_d = d;
+            }
+        }
+        if (best < sim_floor) continue;
+        sum += t.idf * (best - sim_floor) / (1 - sim_floor);
+        if (best >= topic_sim and nt < topics.len) {
+            topics[nt] = best_d + 1;
+            nt += 1;
+        }
+    }
+    return .{ if (wsum > 0) sum / wsum else 0, topics };
+}
+
+/// A memory's answer word must be at least this close to count as a topic.
+const topic_sim = 0.5;
+/// Words this close to a name count fully in `closeness`.
+const near_words = 4;
+const sim_floor = 0.15;
 
 fn subjBoost(r: *const Row) f32 {
     return if (r.subj != 0) 1.1 else 1.0;
@@ -1351,7 +1640,7 @@ fn replay(h: *Holo) !bool {
                 const m = try decodeValue(x.id, x.value);
                 var ts: text.TermSet = .{};
                 ts.fill(m.text);
-                _ = try h.applyRow(m.scope, m.subject, m.time, m.text, &ts);
+                _ = try h.applyRow(m.scope, m.subject, m.time, m.text.len, ts.terms());
                 changed = true;
             }
             for (block.items) |x| gpa.free(x.value);
@@ -1392,7 +1681,7 @@ fn replay(h: *Holo) !bool {
 /// A row for an id whose memory was forgotten before a checkpoint saw it.
 fn placeholder(h: *Holo) !void {
     var ts: text.TermSet = .{};
-    const id = try h.applyRow("~", "", 0, "", &ts);
+    const id = try h.applyRow("~", "", 0, 0, ts.terms());
     h.forgotten.set(id);
 }
 
@@ -1450,6 +1739,31 @@ test "recall ranks by meaning words and buries replaced subjects" {
     const cur = (try h.current(testing.allocator, "proj/decisions", "auth-refresh")).?;
     defer cur.deinit(testing.allocator);
     try testing.expectEqualStrings("auth tokens refresh every 60 minutes now", cur.text);
+}
+
+test "rememberMany matches one-by-one writes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    var items: [1000]Item = undefined;
+    var bufs: [1000][48]u8 = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .scope = if (i % 2 == 0) "a/x" else "b/y", .text = try std.fmt.bufPrint(&bufs[i], "note {d} about walrus{d}", .{ i, i % 10 }), .time = 1000 + i };
+    }
+    const first = try h.rememberMany(&items);
+    try testing.expectEqual(@as(u32, 0), first);
+    try testing.expectEqual(@as(u32, 1000), h.count);
+    const m = (try h.get(testing.allocator, 777)).?;
+    defer m.deinit(testing.allocator);
+    try testing.expectEqualStrings("note 777 about walrus7", m.text);
+    try testing.expectEqualStrings("b/y", m.scope);
+    const r = try h.recent(testing.allocator, "a/x", 3);
+    defer freeMemories(testing.allocator, r);
+    try testing.expectEqual(@as(u32, 998), r[0].id);
+    const hits = try h.recall(testing.allocator, .{ .about = "walrus3", .limit = 200 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 100), hits.len);
 }
 
 test "scope filters and forgetting" {
@@ -1546,4 +1860,29 @@ test "reopen after clean close and after losing the checkpoint" {
         defer cur.deinit(testing.allocator);
         try testing.expectEqual(@as(u32, 250), cur.id);
     }
+}
+
+test "meaning finds a memory that uses other words" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mn = try Meaning.testModel(testing.allocator);
+    defer mn.deinit(testing.allocator);
+    const h = try Holo.open(testing.allocator, testing.io, tmp.dir, "h", .{ .sync_writes = false, .shards = 2, .meaning = mn });
+    defer h.close();
+    for (0..200) |i| {
+        var b: [64]u8 = undefined;
+        _ = try h.remember("p", try std.fmt.bufPrint(&b, "filler note {d} about a banana", .{i}), .{});
+    }
+    _ = try h.remember("p", "the billing service had downtime on friday", .{});
+    const hits = try h.recall(testing.allocator, .{ .about = "billing outage", .limit = 2 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(hits.len >= 1);
+    try testing.expectEqualStrings("the billing service had downtime on friday", hits[0].memory.text);
+
+    const lex = try h.recall(testing.allocator, .{ .about = "outage", .limit = 2, .expand = false });
+    defer freeHits(testing.allocator, lex);
+    try testing.expectEqual(@as(usize, 0), lex.len);
+    const sem = try h.recall(testing.allocator, .{ .about = "outage", .limit = 2 });
+    defer freeHits(testing.allocator, sem);
+    try testing.expectEqual(@as(usize, 1), sem.len);
 }

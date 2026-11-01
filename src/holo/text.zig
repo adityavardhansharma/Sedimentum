@@ -55,9 +55,39 @@ pub fn stem(buf: []u8) []u8 {
     return w;
 }
 
+/// Fast hash for short words: words up to 16 bytes are read as two
+/// integers and mixed with one 128-bit multiply.
 pub fn hashTerm(w: []const u8) u64 {
-    return std.hash.Wyhash.hash(0x7e57_a11c, w);
+    if (w.len > 16) return std.hash.Wyhash.hash(0x7e57_a11c, w);
+    var a: u64 = 0;
+    var b: u64 = 0;
+    if (w.len >= 8) {
+        a = std.mem.readInt(u64, w[0..8], .little);
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. w.len - 8], w[8..]);
+        b = std.mem.readInt(u64, &tail, .little);
+    } else {
+        var head: [8]u8 = @splat(0);
+        @memcpy(head[0..w.len], w);
+        a = std.mem.readInt(u64, &head, .little);
+    }
+    const m1 = mum(a ^ 0xa0761d6478bd642f, b ^ 0xe7037ed1a0b428db ^ @as(u64, w.len));
+    return mum(m1, 0x8ebc6af09c88c6e3 ^ 0x7e57_a11c);
 }
+
+inline fn mum(a: u64, b: u64) u64 {
+    const r = @as(u128, a) *% @as(u128, b);
+    return @as(u64, @truncate(r)) ^ @as(u64, @truncate(r >> 64));
+}
+
+/// Lowercase letter or digit for word bytes, 0 for separators.
+const fold = blk: {
+    var t: [256]u8 = @splat(0);
+    for ('a'..'z' + 1) |c| t[c] = c;
+    for ('A'..'Z' + 1) |c| t[c] = c + 32;
+    for ('0'..'9' + 1) |c| t[c] = c;
+    break :blk t;
+};
 
 /// Walks the terms of a text, calling `sink.term(hash)` for each one.
 pub fn forEachTerm(text: []const u8, sink: anytype) void {
@@ -65,8 +95,8 @@ pub fn forEachTerm(text: []const u8, sink: anytype) void {
     var n: usize = 0;
     var too_long = false;
     for (text) |c0| {
-        const c = std.ascii.toLower(c0);
-        if (std.ascii.isAlphanumeric(c)) {
+        const c = fold[c0];
+        if (c != 0) {
             if (n < max_word) {
                 buf[n] = c;
                 n += 1;
@@ -87,6 +117,12 @@ fn emit(w: []u8, too_long: bool, sink: anytype) void {
     const st = stem(w);
     sink.term(if (st.len == w.len) raw else hashTerm(st));
 }
+
+/// A text's unique term hashes and its total term count.
+pub const Terms = struct {
+    hashes: []const u64,
+    total: usize,
+};
 
 /// Unique term hashes of one text, up to `cap`. Repeats are counted.
 pub const TermSet = struct {
@@ -115,6 +151,10 @@ pub const TermSet = struct {
         s.tf[s.len] = 1;
         s.len += 1;
         s.table[i] = @intCast(s.len);
+    }
+
+    pub fn terms(s: *const TermSet) Terms {
+        return .{ .hashes = s.hashes[0..s.len], .total = s.total };
     }
 
     pub fn fill(s: *TermSet, t: []const u8) void {
