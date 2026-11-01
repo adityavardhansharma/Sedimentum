@@ -29,7 +29,13 @@ pub const Format = struct {
     compress: bool,
 };
 
-const magic: u32 = 0x5344_4d43; // "SDMC"
+const magic_v1: u32 = 0x5344_4d43; // "SDMC": blocks without restart points
+const magic: u32 = 0x5344_4d52; // "SDMR": blocks end in restart points
+
+/// Every `restart_every`th entry of a block stores its whole key and its
+/// offset goes in the block's trailer, so a lookup binary-searches the
+/// restarts and decodes at most this many entries.
+const restart_every = 16;
 const index_entry = 20;
 const footer_len = 24;
 const compressed_bit: u32 = 1 << 31;
@@ -108,6 +114,7 @@ pub const Builder = struct {
     first: std.ArrayList(u8) = .empty,
     scratch: std.ArrayList(u8) = .empty,
     hashes: std.ArrayList(u64) = .empty,
+    restarts: std.ArrayList(u32) = .empty,
     nblocks: u32 = 0,
     count: u32 = 0,
     min_seq: u64 = std.math.maxInt(u64),
@@ -122,11 +129,13 @@ pub const Builder = struct {
     pub fn deinit(b: *Builder) void {
         inline for (.{ &b.out, &b.block, &b.index, &b.keys, &b.prev, &b.first, &b.scratch }) |l| l.deinit(b.gpa);
         b.hashes.deinit(b.gpa);
+        b.restarts.deinit(b.gpa);
     }
 
     pub fn reset(b: *Builder) void {
         inline for (.{ &b.out, &b.block, &b.index, &b.keys, &b.prev, &b.first }) |l| l.clearRetainingCapacity();
         b.hashes.clearRetainingCapacity();
+        b.restarts.clearRetainingCapacity();
         b.nblocks = 0;
         b.count = 0;
         b.min_seq = std.math.maxInt(u64);
@@ -169,7 +178,9 @@ pub const Builder = struct {
             try b.keys.appendSlice(gpa, &kl);
             try b.keys.appendSlice(gpa, e.key);
         }
-        const shared: usize = if (b.fmt.front_coding and b.block_entries > 0)
+        const restart = b.block_entries % restart_every == 0;
+        if (restart) try b.restarts.append(gpa, @intCast(b.block.items.len));
+        const shared: usize = if (b.fmt.front_coding and !restart)
             std.mem.indexOfDiff(u8, b.prev.items, e.key) orelse @min(b.prev.items.len, e.key.len)
         else
             0;
@@ -192,6 +203,9 @@ pub const Builder = struct {
 
     fn flushBlock(b: *Builder) !void {
         const gpa = b.gpa;
+        for (b.restarts.items) |r| std.mem.writeInt(u32, try b.block.addManyAsArray(gpa, 4), r, .little);
+        std.mem.writeInt(u32, try b.block.addManyAsArray(gpa, 4), @intCast(b.restarts.items.len), .little);
+        b.restarts.clearRetainingCapacity();
         const raw = b.block.items;
         var stored = raw;
         var flag: u32 = 0;
@@ -260,11 +274,27 @@ pub const View = struct {
     count: u32,
     index: []const u8,
     keys: []const u8,
+    /// Which checks already passed for these bytes: bit i for block i
+    /// (i < 63), bit 63 for the metadata. Owned by the chunk's metadata in
+    /// RAM, so each block is hashed once per process instead of on every
+    /// read. Null means check every time.
+    checked: ?*u64 = null,
+    /// Blocks end in restart points (every chunk written since they were
+    /// added; older chunks are read the old way).
+    restarts: bool = true,
+
+    const meta_bit: u64 = 1 << 63;
 
     pub fn open(bytes: []const u8) error{Corrupt}!View {
+        return openChecked(bytes, null);
+    }
+
+    /// Like `open`, but remembers passed checks in `checked`.
+    pub fn openChecked(bytes: []const u8, checked: ?*u64) error{Corrupt}!View {
         if (bytes.len < footer_len) return error.Corrupt;
         const f = bytes[bytes.len - footer_len ..];
-        if (std.mem.readInt(u32, f[20..24], .little) != magic) return error.Corrupt;
+        const m = std.mem.readInt(u32, f[20..24], .little);
+        if (m != magic and m != magic_v1) return error.Corrupt;
         const index_off = std.mem.readInt(u32, f[0..4], .little);
         const nblocks = std.mem.readInt(u32, f[4..8], .little);
         const keys_off = std.mem.readInt(u32, f[12..16], .little);
@@ -274,8 +304,14 @@ pub const View = struct {
         // The block index and first-key table steer every lookup, so they
         // are checked on every open (they are small); blocks are checked
         // when they are read.
-        if (blockHash(bytes[index_off..meta_end]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
+        const known = if (checked) |c| @atomicLoad(u64, c, .monotonic) & meta_bit != 0 else false;
+        if (!known) {
+            if (blockHash(bytes[index_off..meta_end]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
+            if (checked) |c| _ = @atomicRmw(u64, c, .Or, meta_bit, .monotonic);
+        }
         return .{
+            .checked = checked,
+            .restarts = m == magic,
             .bytes = bytes,
             .nblocks = nblocks,
             .count = std.mem.readInt(u32, f[8..12], .little),
@@ -286,7 +322,9 @@ pub const View = struct {
 
     /// Checks every block hash (`open` already checked the metadata).
     pub fn verify(v: View) error{Corrupt}!void {
-        for (0..v.nblocks) |i| _ = try v.stored(i);
+        var fresh = v;
+        fresh.checked = null;
+        for (0..v.nblocks) |i| _ = try fresh.stored(i);
     }
 
     pub fn firstKey(v: View, i: usize) error{Corrupt}![]const u8 {
@@ -329,18 +367,70 @@ pub const View = struct {
         const index_start = v.bytes.len - footer_len - v.keys.len - v.index.len;
         if (@as(u64, off) + len > index_start) return error.Corrupt;
         const bytes = v.bytes[off..][0..len];
-        if (blockHash(bytes) != std.mem.readInt(u32, e[12..16], .little)) return error.Corrupt;
+        const bit: u64 = if (i < 63) @as(u64, 1) << @intCast(i) else 0;
+        const known = if (v.checked) |c| @atomicLoad(u64, c, .monotonic) & bit != 0 else false;
+        if (!known) {
+            if (blockHash(bytes) != std.mem.readInt(u32, e[12..16], .little)) return error.Corrupt;
+            if (v.checked) |c| if (bit != 0) {
+                _ = @atomicRmw(u64, c, .Or, bit, .monotonic);
+            };
+        }
         return .{ .bytes = bytes, .raw_len = std.mem.readInt(u32, e[8..12], .little), .compressed = len_flag & compressed_bit != 0 };
     }
 
-    /// The raw bytes of block `i`: the stored bytes, or decompressed into
-    /// `scratch`.
-    pub fn block(v: View, i: usize, gpa: Allocator, scratch: *std.ArrayList(u8)) ![]const u8 {
+    /// The entries of block `i` (decompressed into `scratch` if needed)
+    /// and its restart table.
+    pub fn block(v: View, i: usize, gpa: Allocator, scratch: *std.ArrayList(u8)) !Block {
         const s = try v.stored(i);
-        if (!s.compressed) return s.bytes;
-        try scratch.resize(gpa, s.raw_len);
-        try lz4.decompress(s.bytes, scratch.items);
-        return scratch.items;
+        const raw = if (!s.compressed) s.bytes else blk: {
+            try scratch.resize(gpa, s.raw_len);
+            try lz4.decompress(s.bytes, scratch.items);
+            break :blk scratch.items;
+        };
+        if (!v.restarts) return .{ .entries = raw };
+        if (raw.len < 4) return error.Corrupt;
+        const n = std.mem.readInt(u32, raw[raw.len - 4 ..][0..4], .little);
+        if (n == 0 or @as(u64, n) * 4 + 4 > raw.len) return error.Corrupt;
+        const table = raw[raw.len - 4 - n * 4 .. raw.len - 4];
+        return .{ .entries = raw[0 .. raw.len - 4 - n * 4], .restarts = table };
+    }
+};
+
+pub const Block = struct {
+    entries: []const u8,
+    /// u32 offsets of entries that store their whole key; empty for blocks
+    /// written before restart points.
+    restarts: []const u8 = &.{},
+
+    fn restart(b: Block, i: usize) u32 {
+        return std.mem.readInt(u32, b.restarts[i * 4 ..][0..4], .little);
+    }
+
+    fn restartCount(b: Block) usize {
+        return b.restarts.len / 4;
+    }
+
+    /// The whole key stored at restart `i`.
+    fn restartKey(b: Block, i: usize) error{Corrupt}![]const u8 {
+        var pos: usize = b.restart(i);
+        if (pos >= b.entries.len) return error.Corrupt;
+        const shared = try getVar(b.entries, &pos);
+        const suffix = try getVar(b.entries, &pos);
+        _ = try getVar(b.entries, &pos);
+        if (shared != 0 or pos + 9 > b.entries.len or suffix > b.entries.len - pos - 9) return error.Corrupt;
+        return b.entries[pos + 9 ..][0..@intCast(suffix)];
+    }
+
+    /// Where to start scanning for the first entry with key >= `key`: the
+    /// last restart whose key is < `key`, or 0.
+    fn seek(b: Block, key: []const u8) error{Corrupt}!usize {
+        var lo: usize = 0;
+        var hi: usize = b.restartCount();
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (std.mem.order(u8, try b.restartKey(mid), key) == .lt) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) 0 else b.restart(lo - 1);
     }
 };
 
@@ -391,8 +481,8 @@ pub const Parsed = struct {
         p.keys.clearRetainingCapacity();
         p.offs.clearRetainingCapacity();
         p.kb.clearRetainingCapacity();
-        const raw = try v.block(bi, gpa, &p.scratch);
-        var it: BlockIter = .{ .raw = raw };
+        const blk = try v.block(bi, gpa, &p.scratch);
+        var it: BlockIter = .{ .raw = blk.entries };
         while (try it.next(gpa, &p.kb)) |e| {
             try p.offs.append(gpa, @intCast(p.keys.items.len));
             try p.keys.appendSlice(gpa, e.key);
@@ -409,7 +499,8 @@ pub const Parsed = struct {
 /// borrows the chunk bytes or `scratch`.
 pub fn get(v: View, gpa: Allocator, key: []const u8, at: u64, scratch: *std.ArrayList(u8), kb: *std.ArrayList(u8)) !?Entry {
     const bi = (try v.findBlock(key)) orelse return null;
-    var it: BlockIter = .{ .raw = try v.block(bi, gpa, scratch) };
+    const blk = try v.block(bi, gpa, scratch);
+    var it: BlockIter = .{ .raw = blk.entries, .pos = try blk.seek(key) };
     kb.clearRetainingCapacity();
     while (try it.next(gpa, kb)) |e| {
         switch (std.mem.order(u8, e.key, key)) {
@@ -494,4 +585,28 @@ fn buildAndCheck(fmt: Format) !void {
 test "chunks round trip with and without compression" {
     try buildAndCheck(.{ .block_bytes = 4096, .front_coding = false, .compress = false });
     try buildAndCheck(.{ .block_bytes = 8192, .front_coding = true, .compress = true });
+}
+
+test "a key's versions that cross restart points are all found" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |fc| {
+        var b = Builder.init(gpa, .{ .block_bytes = 8192, .front_coding = fc, .compress = fc });
+        defer b.deinit();
+        try b.add(.{ .key = "a/1/k0", .value = "x", .seq = 1 });
+        var seq: u64 = 100;
+        while (seq > 60) : (seq -= 1) try b.add(.{ .key = "a/1/k1", .value = "v", .seq = seq });
+        try b.add(.{ .key = "a/1/k2", .value = "y", .seq = 2 });
+        const view = try View.open(try b.finish());
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        var kb: std.ArrayList(u8) = .empty;
+        defer kb.deinit(gpa);
+        for (61..101) |at| {
+            const e = (try get(view, gpa, "a/1/k1", at, &scratch, &kb)).?;
+            try testing.expectEqual(@as(u64, at), e.seq);
+        }
+        try testing.expect((try get(view, gpa, "a/1/k1", 60, &scratch, &kb)) == null);
+        try testing.expectEqual(@as(u64, 2), (try get(view, gpa, "a/1/k2", 9, &scratch, &kb)).?.seq);
+        try testing.expect((try get(view, gpa, "a/1/k15", 999, &scratch, &kb)) == null);
+    }
 }

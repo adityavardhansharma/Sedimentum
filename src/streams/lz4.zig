@@ -103,7 +103,12 @@ pub fn decompress(src: []const u8, dst: []u8) error{Corrupt}!void {
         var lit: usize = tok >> 4;
         if (lit == 15) lit += try readLen(src, &ip);
         if (ip + lit > src.len or op + lit > dst.len) return error.Corrupt;
-        @memcpy(dst[op..][0..lit], src[ip..][0..lit]);
+        if (lit <= 16 and src.len - ip >= 16 and dst.len - op >= 16) {
+            // Short literals: one fixed 16-byte copy beats a sized memcpy.
+            dst[op..][0..16].* = src[ip..][0..16].*;
+        } else {
+            @memcpy(dst[op..][0..lit], src[ip..][0..lit]);
+        }
         ip += lit;
         op += lit;
         if (ip == src.len) break;
@@ -115,20 +120,35 @@ pub fn decompress(src: []const u8, dst: []u8) error{Corrupt}!void {
         if (ml == 15) ml += try readLen(src, &ip);
         ml += min_match;
         if (op + ml > dst.len) return error.Corrupt;
-        var from = op - offset;
-        if (offset >= ml) {
-            @memcpy(dst[op..][0..ml], dst[from..][0..ml]);
-            op += ml;
-        } else {
-            var i: usize = 0;
-            while (i < ml) : (i += 1) {
-                dst[op] = dst[from];
-                op += 1;
-                from += 1;
-            }
-        }
+        copyMatch(dst, op, offset, ml);
+        op += ml;
     }
     if (op != dst.len) return error.Corrupt;
+}
+
+/// Copies `ml` bytes from `offset` back. When the source is at least 16
+/// bytes back and there is room past the end, it copies 16 bytes at a time
+/// and may write up to 15 bytes past `op + ml`, which later output
+/// overwrites. Overlapping short offsets repeat their pattern byte by byte.
+fn copyMatch(dst: []u8, op: usize, offset: usize, ml: usize) void {
+    var from = op - offset;
+    var to = op;
+    const end = op + ml;
+    if (offset >= 16 and dst.len - op >= ml + 16) {
+        while (to < end) : ({
+            to += 16;
+            from += 16;
+        }) dst[to..][0..16].* = dst[from..][0..16].*;
+        return;
+    }
+    if (offset >= ml) {
+        @memcpy(dst[to..end], dst[from..][0..ml]);
+        return;
+    }
+    while (to < end) : ({
+        to += 1;
+        from += 1;
+    }) dst[to] = dst[from];
 }
 
 fn readLen(src: []const u8, ip: *usize) error{Corrupt}!usize {
@@ -162,6 +182,17 @@ test "round trips text, runs, random bytes and edge sizes" {
     var text: std.ArrayList(u8) = .empty;
     for (0..500) |i| try text.print(gpa, "user said item {d} is due on day {d}; ", .{ i, i % 30 });
     try inputs.append(gpa, try text.toOwnedSlice(gpa));
+    // Matches at every offset from 1 to 300, short and long.
+    var mixed: std.ArrayList(u8) = .empty;
+    const r = prng.random();
+    while (mixed.items.len < 60000) {
+        const off = r.intRangeAtMost(usize, 1, 300);
+        const len = r.intRangeAtMost(usize, 1, 80);
+        if (off <= mixed.items.len and r.boolean()) {
+            for (0..len) |_| try mixed.append(gpa, mixed.items[mixed.items.len - off]);
+        } else for (0..len) |_| try mixed.append(gpa, r.int(u8) % 7);
+    }
+    try inputs.append(gpa, try mixed.toOwnedSlice(gpa));
     for (1..40) |n| {
         const b = try gpa.alloc(u8, n);
         for (b, 0..) |*c, i| c.* = @intCast(i % 3);

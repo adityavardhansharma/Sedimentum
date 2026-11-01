@@ -667,6 +667,13 @@ pub fn Store(comptime flavor: Flavor) type {
             return self.shardOf(key).get(gpa, key, std.math.maxInt(u64));
         }
 
+        /// Like `get`, but copies the value into `out` (replacing its
+        /// contents) instead of allocating. Returns false if there is none.
+        /// Reusing one buffer makes repeated reads allocation-free.
+        pub fn getInto(self: *Self, gpa: Allocator, key: []const u8, out: *std.ArrayList(u8)) !bool {
+            return self.shardOf(key).getInto(gpa, key, std.math.maxInt(u64), out);
+        }
+
         pub fn getAt(self: *Self, gpa: Allocator, snap: Snapshot, key: []const u8) !?[]u8 {
             const sh = self.shardOf(key);
             const i = std.mem.indexOfScalar(*Shard, self.shards, sh).?;
@@ -1296,6 +1303,17 @@ fn featureTest(comptime S: type) !void {
     try expectValue(db, "t/1/a", null);
     try expectValue(db, "t/1/b", "long");
     db.setClockForTest(null);
+
+    // getInto reuses one buffer and skips expired values.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try testing.expect(try db.getInto(gpa, "t/1/c", &buf));
+    try testing.expectEqualStrings("forever", buf.items);
+    try db.put("t/1/d", "a longer value than before");
+    try testing.expect(try db.getInto(gpa, "t/1/d", &buf));
+    try testing.expectEqualStrings("a longer value than before", buf.items);
+    try testing.expect(!try db.getInto(gpa, "t/1/a", &buf)); // expired
+    try testing.expect(!try db.getInto(gpa, "t/1/none", &buf));
 
     // Compare-and-swap.
     try db.putIf("cas/1/k", "v1", .absent);

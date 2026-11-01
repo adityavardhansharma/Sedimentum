@@ -124,6 +124,8 @@ pub fn Shard(comptime cfg: Config) type {
             first: []u8,
             last: []u8,
             bloom: []u64,
+            /// Checks that already passed (see `chunk.View.checked`).
+            checked: u64 = 0,
 
             fn deinit(c: *ChunkMeta, gpa: Allocator) void {
                 gpa.free(c.first);
@@ -544,7 +546,7 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         pub fn chunkView(s: *const Self, c: *const ChunkMeta) !chunk.View {
-            return chunk.View.open(s.map[c.off..][0..c.len]);
+            return chunk.View.openChecked(s.map[c.off..][0..c.len], @constCast(&c.checked));
         }
 
         // ------------------------------------------------------- writing
@@ -617,7 +619,7 @@ pub fn Shard(comptime cfg: Config) type {
             const seq = blk: {
                 s.lock.lockUncancelable(s.io);
                 defer s.lock.unlock(s.io);
-                const hit = try s.lookupLocked(s.gpa, key, max_seq, true);
+                const hit = try s.lookupLocked(s.gpa, key, max_seq, .dupe);
                 const cur: i64 = if (hit) |h| if (h.value) |v| cur: {
                     defer s.gpa.free(v);
                     break :cur std.fmt.parseInt(i64, v, 10) catch return error.NotACounter;
@@ -640,7 +642,7 @@ pub fn Shard(comptime cfg: Config) type {
         }
 
         fn liveSeqLocked(s: *Self, key: []const u8) !?u64 {
-            const hit = (try s.lookupLocked(s.gpa, key, max_seq, false)) orelse return null;
+            const hit = (try s.lookupLocked(s.gpa, key, max_seq, .none)) orelse return null;
             return if (hit.live) hit.seq else null;
         }
 
@@ -1241,8 +1243,18 @@ pub fn Shard(comptime cfg: Config) type {
             return s.getLocked(gpa, key, at);
         }
 
+        /// Copies the newest visible value at `at` into `out` (replacing its
+        /// contents) and returns whether there was one. A reused `out` makes
+        /// repeated reads allocation-free.
+        pub fn getInto(s: *Self, gpa: Allocator, key: []const u8, at: u64, out: *std.ArrayList(u8)) !bool {
+            s.lock.lockSharedUncancelable(s.io);
+            defer s.lock.unlockShared(s.io);
+            const hit = (try s.lookupLocked(gpa, key, at, .{ .into = out })) orelse return false;
+            return hit.live;
+        }
+
         fn getLocked(s: *Self, gpa: Allocator, key: []const u8, at: u64) !?[]u8 {
-            const hit = (try s.lookupLocked(gpa, key, at, true)) orelse return null;
+            const hit = (try s.lookupLocked(gpa, key, at, .dupe)) orelse return null;
             return hit.value;
         }
 
@@ -1255,7 +1267,7 @@ pub fn Shard(comptime cfg: Config) type {
 
         /// The newest version of `key` with seq <= `at`, or null if there
         /// is none.
-        fn lookupLocked(s: *Self, gpa: Allocator, key: []const u8, at: u64, want_value: bool) !?Hit {
+        fn lookupLocked(s: *Self, gpa: Allocator, key: []const u8, at: u64, want: Want) !?Hit {
             const st = s.findStream(key) orelse return null;
             const now_s = s.now();
             // Tail first: it holds the newest writes.
@@ -1263,7 +1275,7 @@ pub fn Shard(comptime cfg: Config) type {
             while (pos < st.idx.items.len) : (pos += 1) {
                 const e = st.entry(st.idx.items[pos]);
                 if (!std.mem.eql(u8, e.key, key)) break;
-                if (e.seq <= at) return try hitFor(gpa, e, now_s, want_value);
+                if (e.seq <= at) return try hitFor(gpa, e, now_s, want);
             }
             var stack: [cfg.fmt.block_bytes * 2 + 2048]u8 = undefined;
             var bfa = std.heap.BufferFirstAllocator.init(&stack, gpa);
@@ -1281,18 +1293,32 @@ pub fn Shard(comptime cfg: Config) type {
                 if (c.min_seq > at) continue;
                 if (!chunk.bloomHas(c.bloom, h)) continue;
                 const v = try s.chunkView(c);
-                if (try chunk.get(v, a, key, at, &scratch, &kb)) |e| return try hitFor(gpa, e, now_s, want_value);
+                if (try chunk.get(v, a, key, at, &scratch, &kb)) |e| return try hitFor(gpa, e, now_s, want);
             }
             return null;
         }
 
-        fn hitFor(gpa: Allocator, e: chunk.Entry, now_s: u64, want_value: bool) !Hit {
+        /// What a lookup does with the value it finds.
+        pub const Want = union(enum) {
+            none,
+            /// A copy the caller owns.
+            dupe,
+            /// Copied into the caller's buffer, which is reused across calls.
+            into: *std.ArrayList(u8),
+        };
+
+        fn hitFor(gpa: Allocator, e: chunk.Entry, now_s: u64, want: Want) !Hit {
             const live = liveValue(e, now_s);
-            return .{
-                .seq = e.seq,
-                .live = live != null,
-                .value = if (want_value and live != null) try gpa.dupe(u8, live.?) else null,
+            var hit: Hit = .{ .seq = e.seq, .live = live != null };
+            if (live) |v| switch (want) {
+                .none => {},
+                .dupe => hit.value = try gpa.dupe(u8, v),
+                .into => |out| {
+                    out.clearRetainingCapacity();
+                    try out.appendSlice(gpa, v);
+                },
             };
+            return hit;
         }
 
         fn findChunk(r: *const Run, key: []const u8) ?*const ChunkMeta {
