@@ -603,6 +603,14 @@ fn verify(full: []const u8) !record.Record {
     return record.view(h, full);
 }
 
+/// Seals the active segment, if it holds anything, and starts a new one.
+/// Lets a caller that no longer needs the records delete every old segment.
+pub fn rotate(log: *Log) !void {
+    if (log.poisoned) return error.Poisoned;
+    if (log.active_end == 0) return;
+    try log.rollover();
+}
+
 fn rollover(log: *Log) !void {
     try log.sync();
     // Reserve list space first so nothing can fail after the file exists.

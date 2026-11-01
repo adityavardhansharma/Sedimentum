@@ -43,6 +43,29 @@ and dropped from memory:
 
 `cold.idx` is part of the database: keep it with the segment files.
 
+## Stream stores: v2 and v3
+
+`sdm.streams.V2` and `sdm.streams.V3` are two more engines built around
+streams instead of one global index. A stream is every key up to its second
+`/` (`chat/42/`, `agent/7/`). Each stream keeps its newest writes in a small
+tail and everything older in sorted, immutable chunks. Only chunk fences and
+bloom filters stay in RAM, so memory stays flat as data grows.
+
+- **v2**: a write-ahead log (the v1 segment log) plus 64 KB tails in RAM.
+  Tails are sealed into chunks of plain 4 KB blocks and merged eight runs at
+  a time; runs that don't overlap (keys that grow or shrink with time) are
+  linked instead of rewritten. One lock, group commit.
+- **v3 (Lean)**: no write-ahead log. Each stream's 16 KB tail is a page in the
+  data file that is rewritten in place and recovered by sequence number and
+  checksum. Keys are front-coded, blocks are LZ4 compressed, and streams
+  are spread over one shard per core, each with its own lock and fsync.
+
+Both support get, delete, ordered and reverse scans, snapshots, durable
+writes with group commit, and `deletePrefix`, which drops a whole stream
+without reading it. `compact` copies live data into a fresh file and
+deletes the old one. They don't support TTLs, batches or compare-and-swap
+yet.
+
 ## Features
 
 - `put`, `get`, `delete`, durable or buffered
@@ -86,14 +109,19 @@ and kiban v0.2.0:
 
 ```sh
 zig build -Doptimize=ReleaseFast
-zig-out/bin/sedimentum-bench /tmp/sdm 1000000
+zig-out/bin/sedimentum-bench v1 std /tmp/sdm 1000000     # or v2, v3
+zig-out/bin/sedimentum-bench v3 agent /tmp/sdm-agent
 cd bench/kiban-bench && cargo build --release
-target/release/kiban-bench /tmp/kiban 1000000
+target/release/kiban-bench std /tmp/kiban 1000000
+target/release/kiban-bench agent /tmp/kiban-agent
 ```
 
-Each needs a new or empty directory and at least 640 records, and prints one
-JSON line per phase. A third argument to `sedimentum-bench` sets a memory
-budget in MB. Results from three 1M-record rounds: Sedimentum was faster
+`std` is the 13-phase key-value workload; `agent` seeds a million chat
+messages and then has 8 agents take turns (load the chat's newest 20
+messages, read facts, write two messages, commit). Each run needs a new or
+empty directory, prints one JSON line per phase on stdout and a progress
+line about once a second on stderr. A fifth argument sets a v1 memory budget
+in MB. Results from three 1M-record rounds: Sedimentum was faster
 in 9 of 12 workloads; kiban was faster to reopen and to scan everything in key
 order.
 
