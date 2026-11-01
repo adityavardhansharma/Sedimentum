@@ -424,15 +424,17 @@ pub const CheckReport = struct {
 pub fn check(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8) !CheckReport {
     var dir = try parent.openDir(io, sub_path, .{ .iterate = true });
     defer dir.close(io);
-    const lock_file = dir.createFile(io, "LOCK", .{
-        .truncate = false,
+    // Open the lock read-only so a read-only backup can still be checked.
+    // With no LOCK file, no writer has the directory open.
+    const lock_file: ?Io.File = dir.openFile(io, "LOCK", .{
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
         error.WouldBlock => return error.Locked,
+        error.FileNotFound => null,
         else => |e| return e,
     };
-    defer lock_file.close(io);
+    defer if (lock_file) |f| f.close(io);
 
     var ids: std.ArrayList(u64) = .empty;
     defer ids.deinit(gpa);
