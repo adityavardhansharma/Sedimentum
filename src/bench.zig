@@ -339,7 +339,6 @@ fn StreamEngine(comptime S: type) type {
         fn extra(e: *E) u64 {
             return e.db.info().meta_bytes;
         }
-
     };
 }
 
@@ -628,13 +627,13 @@ const turns_total: u64 = 40_000;
 const context_len = 20;
 
 const words = [_][]const u8{
-    "the",     "user",    "wants",   "to",       "deploy", "service", "on",       "friday",  "because", "tests",
-    "pass",    "and",     "billing", "invoice",  "for",    "march",   "is",       "late",    "please",  "check",
-    "memory",  "agent",   "said",    "we",       "should", "retry",   "with",     "backoff", "error",   "timeout",
-    "in",      "region",  "eu",      "west",     "budget", "approved", "meeting", "moved",   "tuesday", "notes",
-    "summary", "of",      "call",    "customer", "asked",  "about",   "refund",   "policy",  "next",    "steps",
-    "draft",   "email",   "reply",   "ledger",   "entry",  "matches", "bank",     "export",  "csv",     "column",
-    "date",    "amount",  "total",   "pending",
+    "the",     "user",   "wants",   "to",       "deploy", "service",  "on",      "friday",  "because", "tests",
+    "pass",    "and",    "billing", "invoice",  "for",    "march",    "is",      "late",    "please",  "check",
+    "memory",  "agent",  "said",    "we",       "should", "retry",    "with",    "backoff", "error",   "timeout",
+    "in",      "region", "eu",      "west",     "budget", "approved", "meeting", "moved",   "tuesday", "notes",
+    "summary", "of",     "call",    "customer", "asked",  "about",    "refund",  "policy",  "next",    "steps",
+    "draft",   "email",  "reply",   "ledger",   "entry",  "matches",  "bank",    "export",  "csv",     "column",
+    "date",    "amount", "total",   "pending",
 };
 
 /// A chat message as JSON, 60 to ~900 bytes of plain words: text that

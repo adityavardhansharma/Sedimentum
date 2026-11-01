@@ -175,7 +175,7 @@ pub const Builder = struct {
         try putVar(&b.block, gpa, e.key.len - shared);
         try putVar(&b.block, gpa, e.value.len);
         std.mem.writeInt(u64, try b.block.addManyAsArray(gpa, 8), e.seq, .little);
-        try b.block.append(gpa, @intFromEnum(e.kind));
+        try b.block.append(gpa, @backingInt(e.kind));
         try b.block.appendSlice(gpa, e.key[shared..]);
         try b.block.appendSlice(gpa, e.value);
         if (b.count == 0) try b.first.appendSlice(gpa, e.key);
@@ -355,7 +355,7 @@ pub const BlockIter = struct {
         const vlen = try getVar(r, &it.pos);
         if (it.pos + 9 > r.len) return error.Corrupt;
         const seq = std.mem.readInt(u64, r[it.pos..][0..8], .little);
-        const kind: Kind = @enumFromInt(r[it.pos + 8]);
+        const kind: Kind = @fromBackingInt(@intCast(r[it.pos + 8]));
         it.pos += 9;
         if (shared > kb.items.len or suffix > r.len - it.pos or vlen > r.len - it.pos - suffix) return error.Corrupt;
         kb.shrinkRetainingCapacity(@intCast(shared));

@@ -148,7 +148,7 @@ pub fn Shard(comptime cfg: Config) type {
                     .key = h[rec_header..][0..kl],
                     .value = h[rec_header + kl ..][0..vl],
                     .seq = std.mem.readInt(u64, h[4..12], .little),
-                    .kind = @enumFromInt(h[12]),
+                    .kind = @fromBackingInt(@intCast(h[12])),
                 };
             }
             /// First idx position whose key is >= `key`.
@@ -569,7 +569,7 @@ pub fn Shard(comptime cfg: Config) type {
             const h = try st.buf.addManyAsSlice(gpa, len);
             s.tail_bytes += st.buf.capacity - cap_before;
             std.mem.writeInt(u64, h[4..12], seq, .little);
-            h[12] = @intFromEnum(kind);
+            h[12] = @backingInt(kind);
             std.mem.writeInt(u16, h[13..15], @intCast(key.len), .little);
             std.mem.writeInt(u32, h[15..19], @intCast(value.len), .little);
             @memcpy(h[rec_header..][0..key.len], key);
@@ -1557,7 +1557,7 @@ pub fn Shard(comptime cfg: Config) type {
         fn manBegin(s: *Self, op: Op) !usize {
             const start = s.man_buf.items.len;
             try s.man_buf.appendNTimes(s.gpa, 0, 8);
-            try s.man_buf.append(s.gpa, @intFromEnum(op));
+            try s.man_buf.append(s.gpa, @backingInt(op));
             return start;
         }
 
@@ -1748,7 +1748,7 @@ pub fn Shard(comptime cfg: Config) type {
         fn applyManifest(s: *Self, body: []const u8) !void {
             const gpa = s.gpa;
             var r: Reader = .{ .b = body, .pos = 1 };
-            switch (@as(Op, @enumFromInt(body[0]))) {
+            switch (@as(Op, @fromBackingInt(@intCast(body[0])))) {
                 .stream => {
                     const name = try r.str();
                     const exists = s.streams.contains(name);
