@@ -24,4 +24,5 @@ jobs:
         with:
           version: 0.17.0
       - run: zig fmt --check src build.zig build.zig.zon
+      - run: zig build -Doptimize=${{ matrix.optimize }}
       - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
