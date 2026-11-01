@@ -12,6 +12,9 @@ pub const index = @import("index.zig");
 pub const cold = @import("cold.zig");
 /// The stream stores: `streams.V2` and `streams.V3` (Lean).
 pub const streams = @import("streams/Store.zig");
+/// Holo: agent memory with recall, sedimentation and token-budgeted briefs.
+pub const Holo = @import("holo/Holo.zig");
+pub const holo_text = @import("holo/text.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

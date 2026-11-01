@@ -85,6 +85,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench);
 
+    // Holo benchmarks: agent workload through memory calls, and recall quality.
+    //   zig-out/bin/sedimentum-holo-bench <agent|recall> <new-dir> [memories]
+    const holo_bench = b.addExecutable(.{
+        .name = "sedimentum-holo-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/holo/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = lean.omit_frame_pointer,
+            .unwind_tables = lean.unwind_tables,
+            .stack_check = lean.stack_check,
+            .stack_protector = lean.stack_protector,
+            .error_tracing = lean.error_tracing,
+            .strip = lean.strip,
+            .link_libc = true,
+            .imports = &.{.{ .name = "sedimentum", .module = mod }},
+        }),
+    });
+    b.installArtifact(holo_bench);
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
