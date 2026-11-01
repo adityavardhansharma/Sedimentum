@@ -75,7 +75,8 @@ const Page = extern struct {
 pub const Options = struct {
     /// Every write is durable before it returns. Off: call `sync`.
     sync_writes: bool = true,
-    /// How fast recency fades in ranking. Old memories never drop below 60%.
+    /// How fast recency fades in ranking. It breaks ties between equally
+    /// good matches (newest version wins); old memories keep 85% of their score.
     half_life_ms: u64 = 7 * 24 * 3600 * 1000,
     shards: ?usize = null,
 };
@@ -104,7 +105,11 @@ pub const Memory = struct {
 pub const Hit = struct {
     memory: Memory,
     score: f32,
+    /// Replaced or settled (only with `deep`), or an older copy of a newer
+    /// hit that matched the question the same way.
     buried: bool,
+    /// Which query terms it matched (bit per term, rarest first).
+    matched: u8 = 0,
 };
 
 pub fn freeMemories(gpa: Allocator, ms: []const Memory) void {
@@ -738,7 +743,7 @@ const Cand = struct { id: u32, score: f32 };
 fn recency(h: *const Holo, now: u64, t: u64) f32 {
     const age: f32 = @floatFromInt(now -| t);
     const hl: f32 = @floatFromInt(@max(h.options.half_life_ms, 1));
-    return 0.6 + 0.4 * @exp2(-age / hl);
+    return 0.85 + 0.15 * @exp2(-age / hl);
 }
 
 fn heatBoost(heat: u32) f32 {
@@ -782,6 +787,14 @@ const TopK = struct {
     }
 };
 
+/// Rewards matching all of a question over matching part of it: the score
+/// times the squared share of the question's weight it covers.
+fn coverage(s: f32, qsum: f32) f32 {
+    if (qsum <= 0) return s;
+    const c = s / qsum;
+    return s * c * c;
+}
+
 fn rowScore(r: *const Row, q: []const QTerm) f32 {
     const V = @Vector(max_terms, u16);
     const tags: V = r.terms;
@@ -813,6 +826,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
     var top: TopK = .{ .items = cands_buf[0..pool] };
     var nq: usize = 0;
     var avg_len: f32 = 1;
+    var qsum: f32 = 0;
     const now = h.nowMs();
     {
         h.lock.lockSharedUncancelable(h.io);
@@ -830,6 +844,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         nq = @min(ts.len, qt_buf.len);
         @memcpy(qt_buf[0..nq], all[0..nq]);
         const qt = qt_buf[0..nq];
+        for (qt) |t| qsum += t.idf;
 
         var set = try h.scopeSet(gpa, q.scope);
         defer set.deinit(gpa);
@@ -869,22 +884,20 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                         if (taken == top.items.len) break;
                         continue;
                     }
-                    const base = rowScore(r, qt);
+                    const base = coverage(rowScore(r, qt), qsum);
                     if (base == 0) continue;
                     const pg = p / page_rows;
                     top.push(.{ .id = p, .score = base * h.recency(now, r.time) * heatBoost(h.heat.items[pg]) * subjBoost(r) });
                 }
             }
         } else {
-            var qsum: f32 = 0;
-            for (qt) |t| qsum += t.idf;
             var pi = h.pages.items.len;
             while (pi > 0) {
                 pi -= 1;
                 const pg = &h.pages.items[pi];
                 if (pg.smask & set.mask == 0) continue;
                 if (pg.tmax < q.since) continue;
-                const best_rec = h.recency(now, pg.tmax) * 1.3 * 1.3;
+                const best_rec = h.recency(now, pg.tmax) * 1.1 * 1.3;
                 // Prune against the limit-th best (with slack for the rerank),
                 // not the whole pool.
                 const fl = @max(top.floor(), top.kth(limit) * 0.75);
@@ -897,7 +910,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                     for (qt) |t| {
                         if (pg.bloom[t.bit / 64] & (@as(u64, 1) << @intCast(t.bit % 64)) != 0) bound += t.idf;
                     }
-                    if (bound == 0 or bound * best_rec * heatBoost(h.heat.items[pi]) <= fl) continue;
+                    if (bound == 0 or coverage(bound, qsum) * best_rec * heatBoost(h.heat.items[pi]) <= fl) continue;
                 }
                 const first: u32 = @intCast(pi * page_rows);
                 const last: u32 = @min(h.count, first + page_rows);
@@ -911,7 +924,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                         if (top.len == top.items.len) break;
                         continue;
                     }
-                    const base = rowScore(r, qt);
+                    const base = coverage(rowScore(r, qt), qsum);
                     if (base == 0) continue;
                     top.push(.{ .id = id, .score = base * h.recency(now, r.time) * heatBoost(h.heat.items[pi]) * subjBoost(r) });
                 }
@@ -936,15 +949,20 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         if (nq == 0 and hits.items.len == limit) break;
         const m = (try h.get(gpa, c.id)) orelse continue;
         var score = c.score;
+        var matched: u8 = 0;
         if (nq > 0) {
             var mt: text.TermSet = .{};
             mt.fill(m.text);
             var bm: f32 = 0;
+            var covered: f32 = 0;
+            var mask: u8 = 0;
             const dl: f32 = @floatFromInt(mt.total);
-            for (qt_buf[0..nq]) |t| {
+            for (qt_buf[0..nq], 0..) |t, qi| {
                 for (mt.hashes[0..mt.len], 0..) |x, i| if (x == t.hash) {
                     const tf: f32 = @floatFromInt(mt.tf[i]);
                     bm += t.idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / @max(avg_len, 1)));
+                    covered += t.idf;
+                    mask |= @as(u8, 1) << @intCast(qi);
                     break;
                 };
             }
@@ -957,9 +975,11 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
                 defer h.lock.unlockShared(h.io);
                 break :blk h.row(c.id).*;
             };
-            score = bm * h.recency(now, m.time) * subjBoost(&r);
+            const cov = covered / @max(qsum, 1e-6);
+            score = bm * cov * cov * h.recency(now, m.time) * subjBoost(&r);
+            matched = mask;
         }
-        try hits.append(gpa, .{ .memory = m, .score = score, .buried = h.buried.get(c.id) });
+        try hits.append(gpa, .{ .memory = m, .score = score, .buried = h.buried.get(c.id), .matched = matched });
     }
     const Ctx = struct {
         fn gt(_: void, a: Hit, b: Hit) bool {
@@ -967,6 +987,7 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
         }
     };
     std.mem.sortUnstable(Hit, hits.items, {}, Ctx.gt);
+    if (nq > 0) sedimentHits(hits.items);
     while (hits.items.len > limit) hits.pop().?.memory.deinit(gpa);
     // Recalled pages heat up.
     for (hits.items) |x| {
@@ -978,8 +999,36 @@ pub fn recall(h: *Holo, gpa: Allocator, q: Query) ![]Hit {
     return hits.toOwnedSlice(gpa);
 }
 
+/// Read-time sedimentation: among hits that matched the same query terms
+/// about equally well (within 10%), the newest comes first and the older
+/// ones are marked buried. "We changed X to B" then outranks "X is A".
+fn sedimentHits(hits: []Hit) void {
+    var changed = true;
+    var rounds: usize = 0;
+    while (changed and rounds < hits.len) : (rounds += 1) {
+        changed = false;
+        for (0..hits.len) |i| for (i + 1..hits.len) |j| {
+            const a = &hits[i];
+            const b = &hits[j];
+            if (a.matched != b.matched or b.score < a.score * 0.9) continue;
+            if (b.memory.time > a.memory.time) {
+                std.mem.swap(Hit, a, b);
+                changed = true;
+            }
+        };
+    }
+    for (0..hits.len) |j| for (0..j) |i| {
+        const a = &hits[i];
+        const b = &hits[j];
+        if (a.matched == b.matched and b.score >= a.score * 0.9 and a.memory.time > b.memory.time) {
+            b.buried = true;
+            break;
+        }
+    };
+}
+
 fn subjBoost(r: *const Row) f32 {
-    return if (r.subj != 0) 1.3 else 1.0;
+    return if (r.subj != 0) 1.1 else 1.0;
 }
 
 /// A briefing for an agent: the memories that matter for `situation`,
@@ -1000,9 +1049,18 @@ pub fn brief(h: *Holo, gpa: Allocator, situation: []const u8, scope: []const u8,
     const now = h.nowMs();
     const Section = struct { title: []const u8, mems: []const Memory };
     var rel: [24]Memory = undefined;
-    for (hits, 0..) |x, i| rel[i] = x.memory;
+    var nrel: usize = 0;
+    var skipped: usize = 0;
+    for (hits) |x| {
+        if (x.buried) {
+            skipped += 1;
+            continue;
+        }
+        rel[nrel] = x.memory;
+        nrel += 1;
+    }
     const sections = [_]Section{
-        .{ .title = "Relevant memory", .mems = rel[0..hits.len] },
+        .{ .title = "Relevant memory", .mems = rel[0..nrel] },
         .{ .title = "Recent in this scope", .mems = rec },
     };
     for (sections) |sec| {
@@ -1031,7 +1089,7 @@ pub fn brief(h: *Holo, gpa: Allocator, situation: []const u8, scope: []const u8,
             }
         }
     }
-    return .{ .text = try out.toOwnedSlice(gpa), .tokens = used, .items = items, .buried_skipped = 0 };
+    return .{ .text = try out.toOwnedSlice(gpa), .tokens = used, .items = items, .buried_skipped = skipped };
 }
 
 fn ageValue(s: u64) u64 {
