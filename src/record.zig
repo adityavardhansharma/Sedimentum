@@ -31,6 +31,10 @@ pub const Kind = enum(u8) {
     /// torn batch looking like a torn tail instead of mid-file damage.
     batch_put = 4,
     batch_delete = 5,
+    /// A put that expires. The value starts with the expiry time as a
+    /// u64 of unix seconds (little endian), followed by the user value.
+    put_ttl = 6,
+    batch_put_ttl = 7,
     _,
 };
 
@@ -39,7 +43,15 @@ pub const Record = struct {
     kind: Kind,
     key: []const u8,
     value: []const u8 = &.{},
+    /// Unix seconds after which a `put_ttl` record no longer counts.
+    expires: u64 = 0,
 };
+
+pub const ttl_prefix_len = 8;
+
+fn hasTtl(kind: Kind) bool {
+    return kind == .put_ttl or kind == .batch_put_ttl;
+}
 
 pub const Header = struct {
     crc: u32,
@@ -64,9 +76,10 @@ pub const Header = struct {
         if (h.value_len > max_value_len) return false;
         return switch (h.kind) {
             .put => true,
+            .put_ttl => h.value_len >= ttl_prefix_len,
             .delete => h.value_len == 0,
             .batch => h.key_len == 4 and h.value_len >= header_len,
-            .batch_put, .batch_delete, _ => false,
+            .batch_put, .batch_delete, .batch_put_ttl, _ => false,
         };
     }
 
@@ -77,13 +90,14 @@ pub const Header = struct {
         if (h.value_len > max_value_len) return false;
         return switch (h.kind) {
             .batch_put => true,
+            .batch_put_ttl => h.value_len >= ttl_prefix_len,
             .batch_delete => h.value_len == 0,
             else => false,
         };
     }
 };
 
-pub const ValidateError = error{ EmptyKey, KeyTooLarge, ValueTooLarge, DeleteWithValue };
+pub const ValidateError = error{ EmptyKey, KeyTooLarge, ValueTooLarge, DeleteWithValue, MissingExpiry };
 
 pub fn validate(rec: Record) ValidateError!void {
     std.debug.assert(rec.kind != .batch);
@@ -91,10 +105,12 @@ pub fn validate(rec: Record) ValidateError!void {
     if (rec.key.len > max_key_len) return error.KeyTooLarge;
     if (rec.value.len > max_value_len) return error.ValueTooLarge;
     if (rec.kind == .delete and rec.value.len != 0) return error.DeleteWithValue;
+    if (rec.kind == .put_ttl and rec.expires == 0) return error.MissingExpiry;
 }
 
 pub fn encodedLen(rec: Record) usize {
-    return header_len + rec.key.len + rec.value.len;
+    const ttl: usize = if (hasTtl(rec.kind)) ttl_prefix_len else 0;
+    return header_len + rec.key.len + ttl + rec.value.len;
 }
 
 /// Writes `rec` into `out`, which must be exactly `encodedLen(rec)` bytes.
@@ -104,9 +120,15 @@ pub fn encode(out: []u8, rec: Record) void {
     std.mem.writeInt(u64, out[4..12], rec.seq, .little);
     out[12] = @backingInt(rec.kind);
     std.mem.writeInt(u32, out[13..17], @intCast(rec.key.len), .little);
-    std.mem.writeInt(u32, out[17..21], @intCast(rec.value.len), .little);
+    const value_len = out.len - header_len - rec.key.len;
+    std.mem.writeInt(u32, out[17..21], @intCast(value_len), .little);
     @memcpy(out[header_len..][0..rec.key.len], rec.key);
-    @memcpy(out[header_len + rec.key.len ..], rec.value);
+    var pos = header_len + rec.key.len;
+    if (hasTtl(rec.kind)) {
+        std.mem.writeInt(u64, out[pos..][0..8], rec.expires, .little);
+        pos += ttl_prefix_len;
+    }
+    @memcpy(out[pos..], rec.value);
     std.mem.writeInt(u32, out[0..4], Crc32c.hash(out[4..]), .little);
 }
 
@@ -178,19 +200,26 @@ pub fn checksumMatches(h: Header, full: []const u8) bool {
 /// Batch operation kinds are reported as plain `put` and `delete`.
 pub fn view(h: Header, full: []const u8) Record {
     const key = full[header_len..][0..h.key_len];
-    const value = full[header_len + h.key_len ..][0..h.value_len];
+    var value = full[header_len + h.key_len ..][0..h.value_len];
+    var expires: u64 = 0;
+    if (hasTtl(h.kind)) {
+        expires = std.mem.readInt(u64, value[0..8], .little);
+        value = value[ttl_prefix_len..];
+    }
     const kind: Kind = switch (h.kind) {
         .batch_put => .put,
         .batch_delete => .delete,
+        .batch_put_ttl => .put_ttl,
         else => h.kind,
     };
-    return .{ .seq = h.seq, .kind = kind, .key = key, .value = value };
+    return .{ .seq = h.seq, .kind = kind, .key = key, .value = value, .expires = expires };
 }
 
 /// The kind an operation is stored with inside a batch.
 pub fn inBatch(kind: Kind) Kind {
     return switch (kind) {
         .put => .batch_put,
+        .put_ttl => .batch_put_ttl,
         .delete => .batch_delete,
         else => unreachable,
     };
@@ -213,6 +242,20 @@ test "encode and decode round trip" {
     try std.testing.expectEqual(Kind.put, back.kind);
     try std.testing.expectEqualStrings("agent/1/note", back.key);
     try std.testing.expectEqualStrings("hello", back.value);
+}
+
+test "ttl records carry their expiry" {
+    const rec: Record = .{ .seq = 9, .kind = .put_ttl, .key = "k", .value = "v", .expires = 1234 };
+    try validate(rec);
+    var buf: [64]u8 = undefined;
+    const out = buf[0..encodedLen(rec)];
+    encode(out, rec);
+    const h = decodeHeader(out[0..header_len]);
+    try std.testing.expect(h.isPlausible() and checksumMatches(h, out));
+    const back = view(h, out);
+    try std.testing.expectEqual(@as(u64, 1234), back.expires);
+    try std.testing.expectEqualStrings("v", back.value);
+    try std.testing.expectEqual(Kind.put_ttl, back.kind);
 }
 
 test "a flipped bit fails the checksum" {

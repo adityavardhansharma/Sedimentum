@@ -45,6 +45,8 @@ pub const Entry = struct {
     offset: u32,
     /// Record length; 0 for a deletion kept only for snapshots.
     len: u32,
+    /// Unix seconds after which the value no longer counts; 0 for never.
+    expires: u32 = 0,
     deleted: bool = false,
     older: ?*Entry = null,
 
@@ -52,20 +54,26 @@ pub const Entry = struct {
         return .{ .segment = e.segment, .offset = e.offset, .len = e.len };
     }
 
-    fn at(loc: Log.Location, seq: u64) Entry {
+    fn at(loc: Log.Location, rec: record.Record) Entry {
         return .{
             .segment = @intCast(loc.segment),
             .offset = @intCast(loc.offset),
             .len = loc.len,
-            .seq = seq,
+            .seq = rec.seq,
+            .expires = @intCast(@min(rec.expires, std.math.maxInt(u32))),
         };
     }
 
-    /// The version visible at sequence `seq`, or null if none or deleted.
-    fn resolve(e: *const Entry, seq: u64) ?*const Entry {
+    pub fn expiredAt(e: *const Entry, now_s: u64) bool {
+        return e.expires != 0 and e.expires <= now_s;
+    }
+
+    /// The version visible at sequence `seq`, or null if none, deleted or
+    /// expired at `now`.
+    pub fn resolve(e: *const Entry, seq: u64, now_s: u64) ?*const Entry {
         var v: ?*const Entry = e;
         while (v) |cur| : (v = cur.older) {
-            if (cur.seq <= seq) return if (cur.deleted) null else cur;
+            if (cur.seq <= seq) return if (cur.deleted or cur.expiredAt(now_s)) null else cur;
         }
         return null;
     }
@@ -84,7 +92,12 @@ const SegStat = struct {
 pub const Snapshot = struct { seq: u64 };
 
 pub const Op = union(enum) {
-    put: struct { key: []const u8, value: []const u8 },
+    put: struct {
+        key: []const u8,
+        value: []const u8,
+        /// Seconds until the value expires; 0 for never.
+        ttl: u32 = 0,
+    },
     delete: []const u8,
 };
 
@@ -109,6 +122,8 @@ retained_versions: usize = 0,
 /// Scratch space for reading records.
 read_buf: std.ArrayList(u8) = .empty,
 compactions: u64 = 0,
+/// Fixed clock for tests, in unix seconds.
+clock_override: ?u64 = null,
 
 pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !Db {
     var idx = try Index.init(gpa);
@@ -161,11 +176,11 @@ const Loader = struct {
         st.value_ptr.min_seq = @min(st.value_ptr.min_seq, rec.seq);
 
         switch (rec.kind) {
-            .put => {
+            .put, .put_ttl => {
                 if (l.dead.get(rec.key)) |dseq| if (dseq > rec.seq) return;
                 const slot = try l.index.getOrPut(rec.key);
                 if (slot.found_existing and slot.value_ptr.seq > rec.seq) return;
-                slot.value_ptr.* = Entry.at(loc, rec.seq);
+                slot.value_ptr.* = Entry.at(loc, rec);
             },
             .delete => {
                 if (l.index.getPtr(rec.key)) |e| {
@@ -219,7 +234,8 @@ fn snapshotNeeds(db: *const Db, seq: u64) bool {
     return false;
 }
 
-/// Number of live keys.
+/// Number of keys in the index. Expired keys count until compaction or a
+/// later write removes them.
 pub fn count(db: *const Db) usize {
     return db.index.count - db.tombstone_entries;
 }
@@ -229,10 +245,19 @@ pub fn lastSeq(db: *const Db) u64 {
     return db.log.last_seq;
 }
 
-/// The live entry for `key`, if any.
+/// Current time in unix seconds.
+pub fn now(db: *const Db) u64 {
+    if (db.clock_override) |t| return t;
+    const ns = Io.Clock.real.now(db.log.io).nanoseconds;
+    return if (ns <= 0) 0 else @intCast(@divFloor(ns, std.time.ns_per_s));
+}
+
+/// The live entry for `key`, if any. Expired entries are not live.
 pub fn lookup(db: *const Db, key: []const u8) ?*Entry {
     const e = db.index.getPtr(key) orelse return null;
-    return if (e.deleted) null else e;
+    if (e.deleted) return null;
+    if (e.expires != 0 and e.expiredAt(db.now())) return null;
+    return e;
 }
 
 /// The sequence number of the live version of `key`, for `putIf`.
@@ -251,6 +276,24 @@ pub fn put(db: *Db, key: []const u8, value: []const u8) !void {
     if (db.options.sync_writes) try db.log.sync();
 }
 
+/// Like `put`, but the value disappears after `ttl` seconds. Expired
+/// records are dropped by compaction.
+pub fn putTtl(db: *Db, key: []const u8, value: []const u8, ttl: u32) !void {
+    try db.putTtlBuffered(key, value, ttl);
+    if (db.options.sync_writes) try db.log.sync();
+}
+
+pub fn putTtlBuffered(db: *Db, key: []const u8, value: []const u8, ttl: u32) !void {
+    const segments_before = db.log.segments.items.len;
+    try db.putCore(db.putRecord(key, value, ttl));
+    try db.afterAppend(segments_before);
+}
+
+fn putRecord(db: *const Db, key: []const u8, value: []const u8, ttl: u32) record.Record {
+    if (ttl == 0) return .{ .seq = 0, .kind = .put, .key = key, .value = value };
+    return .{ .seq = 0, .kind = .put_ttl, .key = key, .value = value, .expires = db.now() + ttl };
+}
+
 /// Writes `key` only if its current state matches `expect`, otherwise
 /// returns `error.Conflict` and writes nothing.
 pub fn putIf(db: *Db, key: []const u8, value: []const u8, expect: Expect) !void {
@@ -266,12 +309,16 @@ pub fn putIf(db: *Db, key: []const u8, value: []const u8, expect: Expect) !void 
 /// Applies a put without syncing, whatever `sync_writes` says.
 pub fn putBuffered(db: *Db, key: []const u8, value: []const u8) !void {
     const segments_before = db.log.segments.items.len;
-    try db.putCore(key, value);
+    try db.putCore(db.putRecord(key, value, 0));
     try db.afterAppend(segments_before);
 }
 
-fn putCore(db: *Db, key: []const u8, value: []const u8) !void {
-    try record.validate(.{ .seq = 1, .kind = .put, .key = key, .value = value });
+/// `template.seq` is ignored; the next sequence number is used.
+fn putCore(db: *Db, template: record.Record) !void {
+    const key = template.key;
+    var rec = template;
+    rec.seq = 1;
+    try record.validate(rec);
     try db.reserveStats();
     // Reserve the index slot and any history version before appending, so
     // nothing can fail between the log write and the index update.
@@ -283,11 +330,11 @@ fn putCore(db: *Db, key: []const u8, value: []const u8) !void {
     const old_copy: ?*Entry = if (keep_old) try db.gpa.create(Entry) else null;
     errdefer if (old_copy) |c| db.gpa.destroy(c);
 
-    const seq = db.log.last_seq + 1;
-    const loc = try db.log.append(.{ .seq = seq, .kind = .put, .key = key, .value = value });
-    db.noteAppended(loc, seq, true);
+    rec.seq = db.log.last_seq + 1;
+    const loc = try db.log.append(rec);
+    db.noteAppended(loc, rec.seq, true);
 
-    var new = Entry.at(loc, seq);
+    var new = Entry.at(loc, rec);
     if (slot.found_existing) {
         const old = slot.value_ptr.*;
         db.releaseBytes(old);
@@ -384,9 +431,10 @@ fn writeCore(db: *Db, ops: []const Op) !void {
     for (ops, recs) |op, *rec| {
         seq += 1;
         rec.* = switch (op) {
-            .put => |p| .{ .seq = seq, .kind = .put, .key = p.key, .value = p.value },
-            .delete => |k| .{ .seq = seq, .kind = .delete, .key = k },
+            .put => |p| db.putRecord(p.key, p.value, p.ttl),
+            .delete => |k| .{ .seq = 0, .kind = .delete, .key = k },
         };
+        rec.seq = seq;
         try record.validate(rec.*);
     }
 
@@ -440,7 +488,7 @@ fn writeCore(db: *Db, ops: []const Op) !void {
                 db.log.poisoned = true;
                 return err;
             };
-            var new = Entry.at(loc, rec.seq);
+            var new = Entry.at(loc, rec);
             if (slot.found_existing) {
                 const old = slot.value_ptr.*;
                 const placeholder = old.seq == 0;
@@ -470,6 +518,50 @@ fn writeCore(db: *Db, ops: []const Op) !void {
             db.applyDelete(k, e, rec.seq, copy);
         },
     };
+}
+
+/// Deletes every key that starts with `prefix` and returns how many there
+/// were. Up to `delete_prefix_chunk` deletions are written per atomic batch.
+pub fn deletePrefix(db: *Db, prefix: []const u8) !usize {
+    const n = try db.deletePrefixBuffered(prefix);
+    if (n > 0 and db.options.sync_writes) try db.log.sync();
+    return n;
+}
+
+pub const delete_prefix_chunk = 10_000;
+
+pub fn deletePrefixBuffered(db: *Db, prefix: []const u8) !usize {
+    const gpa = db.gpa;
+    var total: usize = 0;
+    var keys: std.ArrayList([]u8) = .empty;
+    defer keys.deinit(gpa);
+    var ops: std.ArrayList(Op) = .empty;
+    defer ops.deinit(gpa);
+    const end_buf = try gpa.alloc(u8, prefix.len);
+    defer gpa.free(end_buf);
+
+    while (true) {
+        defer {
+            for (keys.items) |k| gpa.free(k);
+            keys.clearRetainingCapacity();
+            ops.clearRetainingCapacity();
+        }
+        // Collect a chunk first: writing while iterating would invalidate
+        // the cursor.
+        var it = db.prefixIterator(prefix, false, end_buf);
+        while (keys.items.len < delete_prefix_chunk) {
+            const k = it.nextKey() orelse break;
+            const copy = try gpa.dupe(u8, k);
+            keys.append(gpa, copy) catch |err| {
+                gpa.free(copy);
+                return err;
+            };
+        }
+        if (keys.items.len == 0) return total;
+        for (keys.items) |k| try ops.append(gpa, .{ .delete = k });
+        try db.writeBuffered(ops.items);
+        total += keys.items.len;
+    }
 }
 
 /// Makes every accepted write durable.
@@ -518,7 +610,7 @@ pub fn release(db: *Db, snap: Snapshot) void {
 /// The value of `key` as of `snap`, without copying.
 pub fn getAt(db: *Db, snap: Snapshot, key: []const u8) !?[]const u8 {
     const e = db.index.getPtr(key) orelse return null;
-    const v = e.resolve(snap.seq) orelse return null;
+    const v = e.resolve(snap.seq, db.now()) orelse return null;
     return try db.readValue(v.*);
 }
 
@@ -619,6 +711,9 @@ pub fn compactWithRatio(db: *Db, dead_ratio: f64) !usize {
 }
 
 fn compactSegment(db: *Db, id: u64) !void {
+    // Records copied out of this segment can't hide anything, so judge
+    // "older data elsewhere" by the other segments as they are now.
+    const floor = db.oldestSeqOutside(id);
     var scanner = try db.log.scanSegment(id);
     defer scanner.deinit();
     while (try scanner.next()) |item| {
@@ -626,10 +721,10 @@ fn compactSegment(db: *Db, id: u64) !void {
             const body_offset = item.offset + record.header_len + 4;
             var ops = record.BatchIterator.init(item.record);
             while (try ops.next()) |op| {
-                try db.compactRecord(id, body_offset + op.offset, op.record);
+                try db.compactRecord(id, floor, body_offset + op.offset, op.record);
             }
         } else {
-            try db.compactRecord(id, item.offset, item.record);
+            try db.compactRecord(id, floor, item.offset, item.record);
         }
     }
     if (scanner.stop != .end) return error.Corrupt;
@@ -640,20 +735,28 @@ fn compactSegment(db: *Db, id: u64) !void {
     db.compactions += 1;
 }
 
-fn compactRecord(db: *Db, id: u64, offset: u64, rec: record.Record) !void {
+/// `floor` is the lowest sequence number in any other segment. A record
+/// older than `rec` can only exist elsewhere if `floor < rec.seq`.
+fn compactRecord(db: *Db, id: u64, floor: u64, offset: u64, rec: record.Record) !void {
     switch (rec.kind) {
-        .put => {
-            const e = db.lookup(rec.key) orelse return;
-            if (e.segment != id or e.offset != offset) return;
+        .put, .put_ttl => {
+            const e = db.index.getPtr(rec.key) orelse return;
+            if (e.deleted or e.segment != id or e.offset != offset) return;
+            if (e.expiredAt(db.now()) and floor >= rec.seq) {
+                // Nothing older can resurface, so the expired record can go.
+                db.releaseBytes(e.*);
+                _ = db.index.remove(rec.key);
+                return;
+            }
             try db.reserveStats();
             const loc = try db.log.appendCopy(rec);
             db.noteAppended(loc, rec.seq, true);
-            e.* = Entry.at(loc, rec.seq);
+            e.* = Entry.at(loc, rec);
         },
         .delete => {
             // A newer put already shadows anything older.
             if (db.lookup(rec.key) != null) return;
-            if (!db.olderDataMayExist(id, rec.seq)) return;
+            if (floor >= rec.seq) return;
             try db.reserveStats();
             const loc = try db.log.appendCopy(rec);
             db.noteAppended(loc, rec.seq, false);
@@ -662,15 +765,15 @@ fn compactRecord(db: *Db, id: u64, offset: u64, rec: record.Record) !void {
     }
 }
 
-/// Whether a segment other than `except` might hold a record older than
-/// `seq`, which a tombstone at `seq` would still need to hide.
-fn olderDataMayExist(db: *const Db, except: u64, seq: u64) bool {
+/// The lowest sequence number of any record outside segment `except`.
+fn oldestSeqOutside(db: *const Db, except: u64) u64 {
+    var floor: u64 = std.math.maxInt(u64);
     for (db.log.segments.items) |id| {
         if (id == except) continue;
         const st = db.seg_stats.get(id) orelse continue;
-        if (st.min_seq < seq) return true;
+        floor = @min(floor, st.min_seq);
     }
-    return false;
+    return floor;
 }
 
 // ------------------------------------------------------------ iteration
@@ -694,6 +797,8 @@ pub const Iterator = struct {
     range: Range,
     /// Snapshot sequence to read at, or null for the live state.
     at: ?u64 = null,
+    /// Unix seconds used to hide expired values.
+    now_s: u64,
 
     fn inRange(it: *const Iterator, key: []const u8) bool {
         if (it.range.reverse) return std.mem.order(u8, key, it.range.start) != .lt;
@@ -715,7 +820,9 @@ pub const Iterator = struct {
             }
             const e = it.cursor.valuePtr();
             it.step();
-            const v: ?*const Entry = if (it.at) |seq| e.resolve(seq) else if (e.deleted) null else e;
+            const v: ?*const Entry = if (it.at) |seq|
+                e.resolve(seq, it.now_s)
+            else if (e.deleted or e.expiredAt(it.now_s)) null else e;
             if (v) |found| return .{ .key = key, .entry = found };
         }
         return null;
@@ -738,7 +845,7 @@ pub fn iterator(db: *Db, range: Range) Iterator {
         (if (range.end) |end| db.index.seekBefore(end) else db.index.last())
     else
         db.index.seek(range.start);
-    return .{ .db = db, .cursor = cursor, .range = range };
+    return .{ .db = db, .cursor = cursor, .range = range, .now_s = db.now() };
 }
 
 /// Iterates `range` as of `snap`.
@@ -1042,4 +1149,59 @@ test "putIf enforces compare-and-swap" {
     try db.putIf("k", "v2", .{ .seq = s });
     try testing.expectError(error.Conflict, db.putIf("k", "v3", .{ .seq = s }));
     try testing.expectEqualStrings("v2", (try db.getView("k")).?);
+}
+
+test "ttl values expire and compaction drops them" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opts: Options = .{ .sync_writes = false, .auto_compact = false };
+    {
+        var db = try Db.open(testing.allocator, io, tmp.dir, "db", opts);
+        defer db.close();
+        db.clock_override = 1000;
+        try db.putTtl("short", "s", 10);
+        try db.putTtl("long", "l", 1000);
+        try db.put("forever", "f");
+        try db.write(&.{.{ .put = .{ .key = "batched", .value = "b", .ttl = 10 } }});
+        try testing.expectEqualStrings("s", (try db.getView("short")).?);
+
+        db.clock_override = 1010;
+        try testing.expect((try db.getView("short")) == null);
+        try testing.expect((try db.getView("batched")) == null);
+        try testing.expectEqualStrings("l", (try db.getView("long")).?);
+        var it = db.iterator(.{});
+        try testing.expectEqualStrings("forever", it.nextKey().?);
+        try testing.expectEqualStrings("long", it.nextKey().?);
+        try testing.expect(it.nextKey() == null);
+        try db.putIf("short", "again", .absent);
+        try db.sync();
+    }
+    var db = try Db.open(testing.allocator, io, tmp.dir, "db", opts);
+    defer db.close();
+    db.clock_override = 1010;
+    try testing.expectEqualStrings("again", (try db.getView("short")).?);
+    try testing.expect((try db.getView("batched")) == null);
+    try testing.expectEqualStrings("l", (try db.getView("long")).?);
+
+    // Force the old segment to be sealed, then compact: "batched" is gone.
+    db.log.options.segment_bytes = 1;
+    try db.put("x", "y");
+    _ = try db.compactWithRatio(0);
+    try testing.expect(db.index.getPtr("batched") == null);
+    try testing.expectEqualStrings("l", (try db.getView("long")).?);
+}
+
+test "deletePrefix forgets one agent" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Db.open(testing.allocator, io, tmp.dir, "db", .{ .sync_writes = false });
+    defer db.close();
+    var kb: [32]u8 = undefined;
+    for (0..25_000) |i| try db.put(try std.fmt.bufPrint(&kb, "agent/1/{d}", .{i}), "m");
+    for (0..10) |i| try db.put(try std.fmt.bufPrint(&kb, "agent/2/{d}", .{i}), "m");
+    try testing.expectEqual(@as(usize, 25_000), try db.deletePrefix("agent/1/"));
+    try testing.expectEqual(@as(usize, 10), db.count());
+    try testing.expectEqual(@as(usize, 0), try db.deletePrefix("agent/1/"));
 }
