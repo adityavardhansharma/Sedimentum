@@ -32,7 +32,7 @@ pub const Options = struct {
     /// Turn off to batch writes and call `sync` yourself.
     sync_writes: bool = true,
     /// Compact a sealed segment once at least this fraction of it is dead.
-    compact_dead_ratio: f64 = 0.5,
+    compact_dead_ratio: f64 = 0.3,
     /// Check for segments to compact whenever the log starts a new segment.
     auto_compact: bool = true,
 };
@@ -79,7 +79,7 @@ pub const Entry = struct {
     }
 };
 
-pub const Index = ordered.OrderedMap(Entry);
+pub const Index = ordered.HashedIndex(Entry);
 
 /// Per-segment bookkeeping for compaction.
 const SegStat = struct {
@@ -128,10 +128,14 @@ clock_override: ?u64 = null,
 pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !Db {
     var idx = try Index.init(gpa);
     errdefer idx.deinit();
+    // Replay fills only the hash table; the ordered tree is built once at
+    // the end, which is much faster than inserting keys in log order.
+    idx.bulk = true;
     var loader: Loader = .{ .gpa = gpa, .index = &idx };
     defer loader.deinit();
     var log = try Log.open(gpa, io, parent, sub_path, options.log, &loader);
     errdefer log.close();
+    try idx.finishBulk();
 
     var db: Db = .{ .gpa = gpa, .options = options, .log = log, .index = idx, .seg_stats = loader.stats };
     loader.stats = .empty;
@@ -162,6 +166,10 @@ const Loader = struct {
     /// Sequence of the newest tombstone seen per deleted key.
     dead: std.StringHashMapUnmanaged(u64) = .empty,
     stats: std.AutoHashMapUnmanaged(u64, SegStat) = .empty,
+    /// Records arrive one segment at a time; cache that segment's stats.
+    /// Safe because no other segment is added to `stats` meanwhile.
+    last_segment: u64 = 0,
+    last_stat: *SegStat = undefined,
 
     fn deinit(l: *Loader) void {
         var it = l.dead.keyIterator();
@@ -171,13 +179,17 @@ const Loader = struct {
     }
 
     pub fn onRecord(l: *Loader, loc: Log.Location, rec: record.Record) !void {
-        const st = try l.stats.getOrPut(l.gpa, loc.segment);
-        if (!st.found_existing) st.value_ptr.* = .{};
-        st.value_ptr.min_seq = @min(st.value_ptr.min_seq, rec.seq);
+        if (l.last_segment != loc.segment) {
+            const st = try l.stats.getOrPut(l.gpa, loc.segment);
+            if (!st.found_existing) st.value_ptr.* = .{};
+            l.last_stat = st.value_ptr;
+            l.last_segment = loc.segment;
+        }
+        l.last_stat.min_seq = @min(l.last_stat.min_seq, rec.seq);
 
         switch (rec.kind) {
             .put, .put_ttl => {
-                if (l.dead.get(rec.key)) |dseq| if (dseq > rec.seq) return;
+                if (l.dead.count() > 0) if (l.dead.get(rec.key)) |dseq| if (dseq > rec.seq) return;
                 const slot = try l.index.getOrPut(rec.key);
                 if (slot.found_existing and slot.value_ptr.seq > rec.seq) return;
                 slot.value_ptr.* = Entry.at(loc, rec);
@@ -237,7 +249,7 @@ fn snapshotNeeds(db: *const Db, seq: u64) bool {
 /// Number of keys in the index. Expired keys count until compaction or a
 /// later write removes them.
 pub fn count(db: *const Db) usize {
-    return db.index.count - db.tombstone_entries;
+    return db.index.len() - db.tombstone_entries;
 }
 
 /// The sequence number of the newest write.
@@ -815,7 +827,7 @@ pub const Iterator = struct {
         while (it.cursor.valid()) {
             const key = it.cursor.key();
             if (!it.inRange(key)) {
-                it.cursor.leaf = null;
+                it.cursor.invalidate();
                 return null;
             }
             const e = it.cursor.valuePtr();
@@ -1089,7 +1101,7 @@ test "snapshots see the past while writes continue" {
     db.release(snap);
     try testing.expectEqual(@as(usize, 0), db.retained_versions);
     try testing.expectEqual(@as(usize, 0), db.tombstone_entries);
-    try testing.expectEqual(@as(usize, 2), db.index.count);
+    try testing.expectEqual(@as(usize, 2), db.index.len());
 }
 
 test "batches apply atomically and survive reopen" {

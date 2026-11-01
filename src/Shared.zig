@@ -18,10 +18,16 @@ io: Io,
 db: Db,
 /// Guards `db` (index and log buffer).
 lock: Io.RwLock = .init,
-/// Held by the thread doing a group commit.
+/// Guards `synced_seq` and `syncing`. Held only briefly, never across fsync.
 commit_mutex: Io.Mutex = .init,
+/// Signaled when a group commit finishes.
+commit_done: Io.Condition = .init,
 /// Every write with seq <= this is durable. Guarded by `commit_mutex`.
 synced_seq: u64 = 0,
+/// Whether some thread is currently leading a group commit.
+syncing: bool = false,
+/// Held by the commit leader and by compaction, which closes files.
+file_mutex: Io.Mutex = .init,
 /// Compaction runs here rather than inside `Db` so it can hold the
 /// commit lock: it closes files a group commit might be syncing.
 auto_compact: bool = true,
@@ -102,13 +108,21 @@ pub fn deletePrefix(s: *Shared, prefix: []const u8) !usize {
 
 /// Rewrites mostly dead segments. Blocks writers and readers while it runs.
 pub fn compact(s: *Shared) !usize {
-    s.commit_mutex.lockUncancelable(s.io);
-    defer s.commit_mutex.unlock(s.io);
-    s.lock.lockUncancelable(s.io);
-    defer s.lock.unlock(s.io);
-    const n = try s.db.compact();
-    // Compaction syncs the log, so everything accepted so far is durable.
-    s.synced_seq = s.db.lastSeq();
+    s.file_mutex.lockUncancelable(s.io);
+    defer s.file_mutex.unlock(s.io);
+    const n, const durable = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const n = try s.db.compact();
+        break :blk .{ n, s.db.lastSeq() };
+    };
+    if (n > 0) {
+        // Compaction syncs the log, so everything accepted so far is durable.
+        s.commit_mutex.lockUncancelable(s.io);
+        s.synced_seq = @max(s.synced_seq, durable);
+        s.commit_done.broadcast(s.io);
+        s.commit_mutex.unlock(s.io);
+    }
     return n;
 }
 
@@ -140,12 +154,36 @@ pub fn sync(s: *Shared) !void {
 }
 
 /// Returns once every write with sequence <= `seq` is durable.
+///
+/// The first waiter becomes the leader: it writes the log buffer and calls
+/// fsync without holding any lock, so other writers keep appending in the
+/// meantime. When it finishes, everyone it covered returns and one of the
+/// rest leads the next round, which covers all of them at once.
 fn commit(s: *Shared, seq: u64) !void {
     s.commit_mutex.lockUncancelable(s.io);
     defer s.commit_mutex.unlock(s.io);
-    // A leader that ran while we waited may already have covered us.
-    if (s.synced_seq >= seq) return;
+    while (s.synced_seq < seq) {
+        if (s.syncing) {
+            s.commit_done.waitUncancelable(s.io, &s.commit_mutex);
+            continue;
+        }
+        s.syncing = true;
+        s.commit_mutex.unlock(s.io);
+        const result = s.syncNow();
+        s.commit_mutex.lockUncancelable(s.io);
+        s.syncing = false;
+        if (result) |target| {
+            s.synced_seq = @max(s.synced_seq, target);
+        } else |_| {}
+        s.commit_done.broadcast(s.io);
+        _ = try result;
+    }
+}
 
+/// Writes the buffer and fsyncs. Returns the sequence number now durable.
+fn syncNow(s: *Shared) !u64 {
+    s.file_mutex.lockUncancelable(s.io);
+    defer s.file_mutex.unlock(s.io);
     var target: u64 = undefined;
     var file: Io.File = undefined;
     {
@@ -155,7 +193,6 @@ fn commit(s: *Shared, seq: u64) !void {
         target = s.db.lastSeq();
         file = s.db.log.active;
     }
-    // fsync outside the main lock so readers and writers keep going.
     // Earlier segments were synced when they were sealed.
     file.sync(s.io) catch |err| {
         s.lock.lockUncancelable(s.io);
@@ -164,7 +201,7 @@ fn commit(s: *Shared, seq: u64) !void {
         return err;
     };
     _ = s.stats.syncs.fetchAdd(1, .monotonic);
-    s.synced_seq = target;
+    return target;
 }
 
 /// Returns a copy of the value for `key`, owned by the caller.

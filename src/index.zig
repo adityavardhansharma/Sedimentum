@@ -157,6 +157,90 @@ pub fn OrderedMap(comptime V: type) type {
             r.value_ptr.* = value;
         }
 
+        /// Inserts a key the caller knows is absent, taking ownership of
+        /// `owned` (allocated with this map's allocator). Skips the lookup
+        /// `getOrPut` does first.
+        pub fn insertNewOwned(self: *Self, owned: []const u8) Allocator.Error!GetOrPutResult {
+            const out = try self.insertRec(self.root, self.height, owned);
+            if (out.split) |sp| {
+                errdefer self.gpa.free(sp.sep);
+                const root = try self.gpa.create(Inner);
+                root.* = .{ .len = 1 };
+                root.keys[0] = sp.sep;
+                root.children[0] = self.root;
+                root.children[1] = sp.right;
+                self.root = root;
+                self.height += 1;
+            }
+            self.count += 1;
+            self.key_bytes += owned.len;
+            return out.result;
+        }
+
+        /// Replaces an empty map with `keys` (sorted, unique, owned by this
+        /// map from now on) and `vals`, filling leaves to `fill` slots.
+        /// Linear time: no searches.
+        pub fn buildSorted(self: *Self, keys: []const []const u8, vals: []const V) Allocator.Error!void {
+            std.debug.assert(self.count == 0 and self.height == 0);
+            std.debug.assert(keys.len == vals.len);
+            if (keys.len == 0) return;
+            const fill = fanout * 3 / 4;
+
+            // Leaves.
+            var level: std.ArrayList(*anyopaque) = .empty;
+            defer level.deinit(self.gpa);
+            var firsts: std.ArrayList([]const u8) = .empty;
+            defer firsts.deinit(self.gpa);
+            const first_leaf: *Leaf = @ptrCast(@alignCast(self.root));
+            var leaf = first_leaf;
+            var i: usize = 0;
+            while (i < keys.len) {
+                if (i > 0) {
+                    const next = try self.gpa.create(Leaf);
+                    next.* = .{ .prev = leaf };
+                    leaf.next = next;
+                    leaf = next;
+                }
+                const n = @min(fill, keys.len - i);
+                @memcpy(leaf.keys[0..n], keys[i..][0..n]);
+                @memcpy(leaf.vals[0..n], vals[i..][0..n]);
+                leaf.len = @intCast(n);
+                try level.append(self.gpa, leaf);
+                try firsts.append(self.gpa, keys[i]);
+                for (keys[i..][0..n]) |k| self.key_bytes += k.len;
+                self.count += n;
+                i += n;
+            }
+
+            // Inner levels: children[j] starts at firsts[j]; separators are
+            // copies of firsts[1..] within each node.
+            var height: u32 = 0;
+            while (level.items.len > 1) {
+                var next_level: std.ArrayList(*anyopaque) = .empty;
+                errdefer next_level.deinit(self.gpa);
+                var next_firsts: std.ArrayList([]const u8) = .empty;
+                errdefer next_firsts.deinit(self.gpa);
+                var j: usize = 0;
+                while (j < level.items.len) {
+                    const n = @min(fill + 1, level.items.len - j);
+                    const inner = try self.gpa.create(Inner);
+                    inner.* = .{ .len = @intCast(n - 1) };
+                    @memcpy(inner.children[0..n], level.items[j..][0..n]);
+                    for (1..n) |c| inner.keys[c - 1] = try self.gpa.dupe(u8, firsts.items[j + c]);
+                    try next_level.append(self.gpa, inner);
+                    try next_firsts.append(self.gpa, firsts.items[j]);
+                    j += n;
+                }
+                level.deinit(self.gpa);
+                firsts.deinit(self.gpa);
+                level = next_level;
+                firsts = next_firsts;
+                height += 1;
+            }
+            self.root = level.items[0];
+            self.height = height;
+        }
+
         /// `owned` is known to be absent from the map.
         fn insertRec(self: *Self, node: *anyopaque, height: u32, owned: []const u8) Allocator.Error!InsertOut {
             if (height == 0) return self.insertLeaf(@ptrCast(@alignCast(node)), owned);
@@ -344,6 +428,217 @@ pub fn OrderedMap(comptime V: type) type {
     };
 }
 
+/// An `OrderedMap` plus a hash table over the same keys. Point lookups go
+/// through the hash table (a couple of cache misses instead of one per
+/// tree comparison); ordered scans use the tree. Values live in a pool so
+/// both structures can point at them.
+pub fn HashedIndex(comptime V: type) type {
+    return struct {
+        const Self = @This();
+        const Tree = OrderedMap(*V);
+
+        gpa: Allocator,
+        tree: Tree,
+        /// Keys borrow the tree's own copies, which never move.
+        hash: std.StringHashMapUnmanaged(*V) = .empty,
+        pool: std.heap.MemoryPool(V) = .empty,
+        /// While bulk loading, only the hash table is maintained (it owns
+        /// the keys) and `finishBulk` builds the tree in one pass.
+        bulk: bool = false,
+
+        pub fn init(gpa: Allocator) Allocator.Error!Self {
+            return .{ .gpa = gpa, .tree = try Tree.init(gpa) };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.bulk) {
+                var it = self.hash.keyIterator();
+                while (it.next()) |k| self.gpa.free(k.*);
+            }
+            self.hash.deinit(self.gpa);
+            self.pool.deinit(self.gpa);
+            self.tree.deinit();
+            self.* = undefined;
+        }
+
+        pub fn len(self: *const Self) usize {
+            return self.tree.count;
+        }
+
+        /// Bytes of key data stored.
+        pub fn keyBytes(self: *const Self) usize {
+            return self.tree.key_bytes;
+        }
+
+        pub fn getPtr(self: *const Self, key: []const u8) ?*V {
+            return self.hash.get(key);
+        }
+
+        pub fn get(self: *const Self, key: []const u8) ?V {
+            return if (self.hash.get(key)) |p| p.* else null;
+        }
+
+        pub const GetOrPutResult = struct {
+            value_ptr: *V,
+            key: []const u8,
+            found_existing: bool,
+        };
+
+        /// Finds `key` or inserts it with an undefined value the caller must set.
+        pub fn getOrPut(self: *Self, key: []const u8) Allocator.Error!GetOrPutResult {
+            if (self.bulk) return self.getOrPutBulk(key);
+            if (self.hash.getEntry(key)) |e| {
+                return .{ .value_ptr = e.value_ptr.*, .key = e.key_ptr.*, .found_existing = true };
+            }
+            try self.hash.ensureUnusedCapacity(self.gpa, 1);
+            const v = try self.pool.create(self.gpa);
+            errdefer self.pool.destroy(v);
+            const owned = try self.gpa.dupe(u8, key);
+            if (self.bulk) {
+                self.hash.putAssumeCapacityNoClobber(owned, v);
+                return .{ .value_ptr = v, .key = owned, .found_existing = false };
+            }
+            errdefer self.gpa.free(owned);
+            const r = try self.tree.insertNewOwned(owned);
+            r.value_ptr.* = v;
+            self.hash.putAssumeCapacityNoClobber(r.key, v);
+            return .{ .value_ptr = v, .key = r.key, .found_existing = false };
+        }
+
+        pub fn put(self: *Self, key: []const u8, value: V) Allocator.Error!void {
+            const r = try self.getOrPut(key);
+            r.value_ptr.* = value;
+        }
+
+        fn getOrPutBulk(self: *Self, key: []const u8) Allocator.Error!GetOrPutResult {
+            const gop = try self.hash.getOrPut(self.gpa, key);
+            if (gop.found_existing) {
+                return .{ .value_ptr = gop.value_ptr.*, .key = gop.key_ptr.*, .found_existing = true };
+            }
+            errdefer self.hash.removeByPtr(gop.key_ptr);
+            const v = try self.pool.create(self.gpa);
+            errdefer self.pool.destroy(v);
+            const owned = try self.gpa.dupe(u8, key);
+            gop.key_ptr.* = owned;
+            gop.value_ptr.* = v;
+            return .{ .value_ptr = v, .key = owned, .found_existing = false };
+        }
+
+        pub fn remove(self: *Self, key: []const u8) ?V {
+            // Drop the hash entry first: it borrows the key the tree frees.
+            const kv = self.hash.fetchRemove(key) orelse return null;
+            const value = kv.value.*;
+            if (self.bulk) self.gpa.free(kv.key) else _ = self.tree.remove(key);
+            self.pool.destroy(kv.value);
+            return value;
+        }
+
+        /// Builds the tree from the hash table after a bulk load.
+        pub fn finishBulk(self: *Self) Allocator.Error!void {
+            std.debug.assert(self.bulk);
+            const n = self.hash.count();
+            const items = try self.gpa.alloc(SortItem(V), n);
+            defer self.gpa.free(items);
+            var it = self.hash.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) items[i] = .{ .key = e.key_ptr.*, .val = e.value_ptr.* };
+            sortKeys(V, items, 0);
+            const keys = try self.gpa.alloc([]const u8, n);
+            defer self.gpa.free(keys);
+            const vals = try self.gpa.alloc(*V, n);
+            defer self.gpa.free(vals);
+            for (items, keys, vals) |kv, *k, *v| {
+                k.* = kv.key;
+                v.* = kv.val;
+            }
+            // The tree takes ownership of the key copies the hash made.
+            try self.tree.buildSorted(keys, vals);
+            self.bulk = false;
+        }
+
+        pub const Cursor = struct {
+            inner: Tree.Cursor,
+
+            pub fn valid(c: Cursor) bool {
+                return c.inner.valid();
+            }
+            pub fn key(c: Cursor) []const u8 {
+                return c.inner.key();
+            }
+            pub fn valuePtr(c: Cursor) *V {
+                return c.inner.valuePtr().*;
+            }
+            pub fn next(c: *Cursor) void {
+                c.inner.next();
+            }
+            pub fn prev(c: *Cursor) void {
+                c.inner.prev();
+            }
+            pub fn invalidate(c: *Cursor) void {
+                c.inner.leaf = null;
+            }
+        };
+
+        pub fn seek(self: *const Self, key: []const u8) Cursor {
+            return .{ .inner = self.tree.seek(key) };
+        }
+        pub fn seekBefore(self: *const Self, key: []const u8) Cursor {
+            return .{ .inner = self.tree.seekBefore(key) };
+        }
+        pub fn first(self: *const Self) Cursor {
+            return .{ .inner = self.tree.first() };
+        }
+        pub fn last(self: *const Self) Cursor {
+            return .{ .inner = self.tree.last() };
+        }
+    };
+}
+
+fn SortItem(comptime V: type) type {
+    return struct {
+        key: []const u8,
+        val: *V,
+        /// Next 8 key bytes at the current depth, big endian, zero padded.
+        head: u64 = 0,
+        /// Key length if the key ends within this chunk, else maxInt.
+        tie: usize = 0,
+    };
+}
+
+/// Sorts unique keys by comparing 8-byte chunks held inline, one depth at a
+/// time, so each level touches each key's bytes once instead of on every
+/// comparison. Much faster than a comparison sort on scattered keys.
+fn sortKeys(comptime V: type, items: []SortItem(V), depth: usize) void {
+    if (items.len < 2) return;
+    for (items) |*it| {
+        var chunk: [8]u8 = @splat(0);
+        if (it.key.len > depth) {
+            const n = @min(8, it.key.len - depth);
+            @memcpy(chunk[0..n], it.key[depth..][0..n]);
+        }
+        it.head = std.mem.readInt(u64, &chunk, .big);
+        it.tie = if (it.key.len <= depth + 8) it.key.len else std.math.maxInt(usize);
+    }
+    const Item = SortItem(V);
+    std.mem.sortUnstable(Item, items, {}, struct {
+        fn lt(_: void, a: Item, b: Item) bool {
+            if (a.head != b.head) return a.head < b.head;
+            return a.tie < b.tie;
+        }
+    }.lt);
+    var start: usize = 0;
+    while (start < items.len) {
+        var end = start + 1;
+        while (end < items.len and items[end].head == items[start].head and items[end].tie == items[start].tie) end += 1;
+        // Keys that end in this chunk are unique by length; only longer
+        // keys with equal chunks need the next level.
+        if (end - start > 1 and items[start].tie == std.math.maxInt(usize)) {
+            sortKeys(V, items[start..end], depth + 8);
+        }
+        start = end;
+    }
+}
+
 /// The smallest key greater than every key starting with `prefix`, written
 /// into `buf`, or null if no such key exists (prefix is all 0xff or empty).
 pub fn prefixEnd(prefix: []const u8, buf: []u8) ?[]const u8 {
@@ -477,4 +772,51 @@ test "cursors skip leaves emptied by deletes" {
     try testing.expectEqualStrings("00099", c.key());
     try testing.expectEqualStrings("00900", m.seek("00500").key());
     try testing.expectEqualStrings("00099", m.seekBefore("00500").key());
+}
+
+test "hashed index keeps the hash and the tree in step" {
+    var m = try HashedIndex(u64).init(testing.allocator);
+    defer m.deinit();
+    var kb: [12]u8 = undefined;
+    for (0..5000) |i| try m.put(std.fmt.bufPrint(&kb, "k{d:0>5}", .{i}) catch unreachable, i);
+    for (0..5000) |i| if (i % 3 == 0) {
+        try testing.expectEqual(@as(?u64, i), m.remove(std.fmt.bufPrint(&kb, "k{d:0>5}", .{i}) catch unreachable));
+    };
+    try testing.expectEqual(@as(?u64, 4), m.get("k00004"));
+    try testing.expectEqual(@as(?u64, null), m.get("k00003"));
+    var c = m.seek("k00003");
+    try testing.expectEqualStrings("k00004", c.key());
+    try testing.expectEqual(@as(u64, 4), c.valuePtr().*);
+    c.prev();
+    try testing.expectEqualStrings("k00002", c.key());
+    try testing.expectEqual(m.tree.count, m.hash.count());
+}
+
+test "bulk load builds the same ordered view" {
+    var m = try HashedIndex(u64).init(testing.allocator);
+    defer m.deinit();
+    m.bulk = true;
+    var prng = std.Random.DefaultPrng.init(3);
+    var kb: [12]u8 = undefined;
+    for (0..10_000) |i| try m.put(std.fmt.bufPrint(&kb, "k{d:0>6}", .{prng.random().uintLessThan(u32, 20_000)}) catch unreachable, i);
+    for (0..2000) |i| _ = m.remove(std.fmt.bufPrint(&kb, "k{d:0>6}", .{i}) catch unreachable);
+    try m.put("k0", 7);
+    try m.put("k0\x00", 8);
+    try m.put("k000000000000000000", 9);
+    try m.finishBulk();
+    try testing.expectEqual(m.hash.count(), m.len());
+    var c = m.first();
+    var prev: []const u8 = "";
+    var n: usize = 0;
+    while (c.valid()) : (c.next()) {
+        try testing.expect(std.mem.order(u8, prev, c.key()) == .lt);
+        try testing.expectEqual(m.get(c.key()).?, c.valuePtr().*);
+        prev = c.key();
+        n += 1;
+    }
+    try testing.expectEqual(m.len(), n);
+    // Normal inserts and seeks keep working on the bulk-built tree.
+    try m.put("k000000x", 1);
+    try testing.expectEqualStrings("k000000x", m.seek("k000000x").key());
+    try testing.expectEqual(m.len(), m.hash.count());
 }

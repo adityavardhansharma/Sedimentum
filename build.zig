@@ -35,6 +35,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
+    // Head-to-head benchmark with kiban:
+    //   zig build -Doptimize=ReleaseFast && zig-out/bin/sedimentum-bench <dir> [records]
+    const bench = b.addExecutable(.{
+        .name = "sedimentum-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sedimentum", .module = mod }},
+        }),
+    });
+    b.installArtifact(bench);
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
