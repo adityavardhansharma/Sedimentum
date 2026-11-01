@@ -40,6 +40,8 @@ pub const Kv = streams.V3;
 pub const page_rows = 128;
 pub const max_terms = 32;
 const bloom_words = 64; // 4096 bits
+/// Terms per memory that go into its page fingerprint.
+const bloom_terms = 12;
 const none: u32 = std.math.maxInt(u32);
 const map_reserve: usize = 1 << 38;
 const page_align = std.heap.page_size_min;
@@ -439,10 +441,10 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     var order: [text.TermSet.cap]u16 = undefined;
     for (ts.hashes[0..ts.len], 0..) |x, i| {
         order[i] = @intCast(i);
-        if (ts.len > max_terms) dfs[i] = h.df(x);
+        dfs[i] = h.df(x);
     }
     const nt = @min(ts.len, max_terms);
-    if (ts.len > max_terms) {
+    {
         const Ctx = struct {
             d: []const u32,
             fn lt(c: @This(), a: u16, b: u16) bool {
@@ -501,7 +503,10 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     }
     h.cur[slot] = r;
     const pg = &h.pages.items[h.pages.items.len - 1];
-    for (0..nt) |i| {
+    // Only each memory's rarest terms go into the page fingerprint: they
+    // are the ones a question can be pruned on, and fewer bits keep the
+    // fingerprint sharp.
+    for (0..@min(nt, bloom_terms)) |i| {
         const bit = text.bloomBit(ts.hashes[order[i]]);
         pg.bloom[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
     }
