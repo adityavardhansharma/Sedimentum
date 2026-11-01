@@ -1,12 +1,13 @@
 //! Sedimentum: a small embedded key-value store for agent memory.
 //!
-//! PR 1 provides the on-disk layer: record encoding, append-only segment
-//! files and crash recovery. The ordered index and the public KV API come
-//! in later changes.
+//! Values live in append-only segment files; an ordered index in memory
+//! maps each live key to its newest record. Start with `Db`.
 
+pub const Db = @import("Db.zig");
+pub const Log = @import("Log.zig");
 pub const record = @import("record.zig");
 pub const segment = @import("segment.zig");
-pub const Log = @import("Log.zig");
+pub const index = @import("index.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
