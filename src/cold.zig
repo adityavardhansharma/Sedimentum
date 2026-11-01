@@ -473,12 +473,16 @@ pub const Reader = struct {
         const body_len = std.mem.readInt(u32, r.data[off + 4 ..][0..4], .little);
         const count = std.mem.readInt(u16, r.data[off + 8 ..][0..2], .little);
         if (limit - off - block_header < body_len or count == 0 or count > max_block_entries) return error.Corrupt;
+        // Entries carry seq and expiry that segment checksums don't cover,
+        // so a block is checked every time it is used.
+        const crc = std.mem.readInt(u32, r.data[off..][0..4], .little);
+        if (Crc32c.hash(r.data[off + 4 ..][0 .. block_header - 4 + body_len]) != crc) return error.Corrupt;
         return .{ .body = r.data[off + block_header ..][0..body_len], .remaining = count };
     }
 
     /// Checks every block's checksum and that keys are strictly increasing.
     pub fn verify(r: *const Reader) !void {
-        var it = r.first();
+        var it = try r.first();
         var prev: []const u8 = "";
         var n: u64 = 0;
         for (r.block_offsets) |o| {
@@ -565,9 +569,11 @@ pub const Reader = struct {
         }
     };
 
-    pub fn first(r: *const Reader) Cursor {
+    /// The first entry. Damage is an error, never an empty cursor: a merge
+    /// that took damage for "no entries" would drop every cold key.
+    pub fn first(r: *const Reader) !Cursor {
         var c: Cursor = .{ .r = r, .block = 0 };
-        c.enter(0) catch {};
+        try c.enter(0);
         return c;
     }
 
@@ -661,7 +667,7 @@ test "write, reopen, look up and walk both ways" {
     try testing.expect(try r.get("zzz") == null);
     try testing.expect(try r.get("agent/000/m0000001") == null);
 
-    var c = r.first();
+    var c = try r.first();
     var i: usize = 0;
     while (try c.current()) |item| : (try c.next()) {
         try testing.expectEqualStrings(keys.items[i], item.key);
@@ -703,6 +709,9 @@ test "a damaged block fails verification and a damaged footer fails open" {
         var r = (try Reader.open(testing.allocator, io, tmp.dir)).?;
         defer r.close();
         try testing.expectError(error.Corrupt, r.verify());
+        // Every reader of the block sees the damage, never an empty file.
+        try testing.expectError(error.Corrupt, r.first());
+        try testing.expectError(error.Corrupt, r.get("a"));
     }
     const len = try f.length(io);
     try f.writePositionalAll(io, "X", len - 20);

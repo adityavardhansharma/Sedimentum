@@ -210,8 +210,12 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
         const e = cur.valuePtr().*;
         if (e.in_cold) {
             db.cold_shadowed += 1;
-            // The cold entry this one replaced is no longer live.
-            if (try db.cold.?.get(cur.key())) |old| db.releaseBytes(Entry.fromCold(old));
+            // The cold entry this one replaced is no longer live. Writes made
+            // before the cold index was written are already counted in the
+            // stats saved with it, so only later ones are subtracted here.
+            if (e.seq > db.cold.?.last_seq) {
+                if (try db.cold.?.get(cur.key())) |old| db.releaseBytes(Entry.fromCold(old));
+            }
         }
         if (e.deleted) {
             db.tombstone_entries += 1;
@@ -922,7 +926,12 @@ pub fn compactWithRatio(db: *Db, dead_ratio: f64) !usize {
         const dead = 1.0 - @as(f64, @floatFromInt(live)) / @as(f64, @floatFromInt(size));
         if (dead > 0 and dead >= dead_ratio) try candidates.append(db.gpa, id);
     }
-    for (candidates.items) |id| try db.compactSegment(id);
+    for (candidates.items) |id| {
+        try db.compactSegment(id);
+        // Copying cold records forward brings their keys back into memory,
+        // so keep the budget between segments.
+        if (db.options.memory_budget > 0 and db.memoryUsed() > db.options.memory_budget) _ = try db.spill();
+    }
     return candidates.items.len;
 }
 
@@ -1048,7 +1057,7 @@ pub fn spill(db: *Db) !bool {
     defer expired.deinit(gpa);
 
     var mem = db.index.first();
-    var cc: ?coldfile.Reader.Cursor = if (db.cold) |*c| c.first() else null;
+    var cc: ?coldfile.Reader.Cursor = if (db.cold) |*c| try c.first() else null;
     while (true) {
         const mk: ?[]const u8 = if (mem.valid()) mem.key() else null;
         const ci: ?coldfile.Reader.Item = if (cc) |*c| try c.current() else null;
