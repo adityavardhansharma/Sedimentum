@@ -10,6 +10,8 @@ pub const record = @import("record.zig");
 pub const segment = @import("segment.zig");
 pub const index = @import("index.zig");
 pub const cold = @import("cold.zig");
+/// The stream stores: `streams.V2` and `streams.V3` (Lean).
+pub const streams = @import("streams/Store.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
