@@ -84,6 +84,7 @@ the other one fails with `error.WrongEngine` instead of damaging it;
 | Retention: keep the newest N of a prefix (`trim`) | no | yes | yes | no |
 | Per-stream listing with sizes (`listStreams`) | no | yes | yes | no |
 | Multi-get (`getMany`), `count(range)`, `contains` | count, contains | yes | yes | no |
+| Allocation-free reads into your buffer (`getInto`) | no | yes | yes | no |
 | RAM stays flat as data grows | with the memory cap | yes | yes | yes |
 | C ABI and CLI | yes | yes | yes | Rust only |
 
@@ -112,6 +113,28 @@ expired values are dropped there and in merges.
   `--engine v2|v3` picks the engine for a new directory; an existing one is
   detected. The C ABI opens any engine with `sdm_open_engine`.
 - An optional memory cap that moves older index entries to disk
+
+### How v2 and v3 stay fast without more RAM
+
+- **Blocks are checked once.** A block's hash is checked the first time it
+  is read in a process; a few bits per chunk remember it. `check` and
+  `verify` still hash everything.
+- **Restart points.** Every 16th entry in a block stores its whole key, and
+  the block ends with their offsets, so a lookup binary-searches to within
+  16 entries. Older chunks without them are still read.
+- **Cheap fences and filters.** Keys compare eight bytes at a time; each
+  chunk keeps an 8-byte hint of its last key so finding a chunk rarely
+  touches key bytes; bloom filters keep a key's bits in one cache line.
+- **LZ4** decodes in 16-byte copies, and data that doesn't compress is only
+  re-tried every 16th block.
+- **Merges** borrow values from the blocks they read instead of copying.
+- **Commits** sync a v3 manifest only when they must (a page that restarted
+  after a seal, or a change only the manifest records), use `fdatasync`,
+  and flush every shard a thread wrote to at the same time.
+- **Snapshots** pin each shard briefly and read every shard's sequence
+  twice for a consistent cut; they allocate nothing.
+- **Release builds** leave out frame pointers, unwind tables, stack probes
+  and symbols (binaries are about 0.6 MB).
 
 ## Recovery rules
 

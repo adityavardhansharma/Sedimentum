@@ -29,10 +29,43 @@ pub const Format = struct {
     compress: bool,
 };
 
-const magic: u32 = 0x5344_4d43; // "SDMC"
+const magic_v1: u32 = 0x5344_4d43; // "SDMC": blocks without restart points
+const magic: u32 = 0x5344_4d52; // "SDMR": blocks end in restart points
+
+/// Every `restart_every`th entry of a block stores its whole key and its
+/// offset goes in the block's trailer, so a lookup binary-searches the
+/// restarts and decodes at most this many entries.
+const restart_every = 16;
 const index_entry = 20;
 const footer_len = 24;
 const compressed_bit: u32 = 1 << 31;
+
+/// Byte-wise key order, compared eight bytes at a time.
+pub fn order(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const x = std.mem.readInt(u64, a[i..][0..8], .big);
+        const y = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (x != y) return std.math.order(x, y);
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// The eight bytes of `key` after its first `skip` bytes, zero-padded, as
+/// a number. If two keys' hints differ, they order the same way as the
+/// keys; equal hints say nothing.
+pub fn hint(key: []const u8, skip: usize) u64 {
+    var buf: [8]u8 = @splat(0);
+    if (key.len > skip) {
+        const n = @min(8, key.len - skip);
+        @memcpy(buf[0..n], key[skip..][0..n]);
+    }
+    return std.mem.readInt(u64, &buf, .big);
+}
 
 pub fn keyHash(key: []const u8) u64 {
     return std.hash.Wyhash.hash(0x51ed, key);
@@ -72,6 +105,42 @@ pub fn bloomHas(words: []const u64, h: u64) bool {
     return true;
 }
 
+/// A blocked bloom filter: each key sets its bits inside one 512-bit
+/// block, so a lookup touches one cache line instead of seven.
+const bloom_block_words = 8;
+
+pub fn blockedBloomWords(keys: usize) usize {
+    const blocks = @max(1, (keys * 10 + 511) / 512);
+    return blocks * bloom_block_words;
+}
+
+fn blockedProbe(h: u64, nblocks: usize) struct { base: usize, h1: u32, h2: u32 } {
+    const base: usize = @intCast((@as(u128, h >> 32) * nblocks) >> 32);
+    const lo: u32 = @truncate(h);
+    return .{ .base = base * bloom_block_words, .h1 = lo, .h2 = (lo >> 17 | lo << 15) | 1 };
+}
+
+pub fn blockedBloomAdd(words: []u64, h: u64) void {
+    const p = blockedProbe(h, words.len / bloom_block_words);
+    const blk = words[p.base..][0..bloom_block_words];
+    for (0..bloom_probes) |i| {
+        const bit = (p.h1 +% @as(u32, @intCast(i)) *% p.h2) & 511;
+        blk[bit >> 6] |= @as(u64, 1) << @intCast(bit & 63);
+    }
+}
+
+pub fn blockedBloomHas(words: []const u64, h: u64) bool {
+    if (words.len < bloom_block_words) return true;
+    const p = blockedProbe(h, words.len / bloom_block_words);
+    const blk = words[p.base..][0..bloom_block_words];
+    var hit = true;
+    for (0..bloom_probes) |i| {
+        const bit = (p.h1 +% @as(u32, @intCast(i)) *% p.h2) & 511;
+        hit = hit and blk[bit >> 6] & (@as(u64, 1) << @intCast(bit & 63)) != 0;
+    }
+    return hit;
+}
+
 // ---------------------------------------------------------------- varints
 
 fn putVar(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
@@ -80,7 +149,16 @@ fn putVar(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
     try list.append(gpa, @truncate(x));
 }
 
-fn getVar(b: []const u8, pos: *usize) error{Corrupt}!u64 {
+inline fn getVar(b: []const u8, pos: *usize) error{Corrupt}!u64 {
+    // Most lengths fit in one byte.
+    if (pos.* < b.len and b[pos.*] < 0x80) {
+        pos.* += 1;
+        return b[pos.* - 1];
+    }
+    return getVarSlow(b, pos);
+}
+
+fn getVarSlow(b: []const u8, pos: *usize) error{Corrupt}!u64 {
     var x: u64 = 0;
     var shift: u6 = 0;
     while (true) {
@@ -108,12 +186,14 @@ pub const Builder = struct {
     first: std.ArrayList(u8) = .empty,
     scratch: std.ArrayList(u8) = .empty,
     hashes: std.ArrayList(u64) = .empty,
+    restarts: std.ArrayList(u32) = .empty,
     nblocks: u32 = 0,
     count: u32 = 0,
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
     block_entries: u32 = 0,
     misses: u8 = 0,
+    skipped: u8 = 0,
 
     pub fn init(gpa: Allocator, fmt: Format) Builder {
         return .{ .gpa = gpa, .fmt = fmt };
@@ -122,17 +202,20 @@ pub const Builder = struct {
     pub fn deinit(b: *Builder) void {
         inline for (.{ &b.out, &b.block, &b.index, &b.keys, &b.prev, &b.first, &b.scratch }) |l| l.deinit(b.gpa);
         b.hashes.deinit(b.gpa);
+        b.restarts.deinit(b.gpa);
     }
 
     pub fn reset(b: *Builder) void {
         inline for (.{ &b.out, &b.block, &b.index, &b.keys, &b.prev, &b.first }) |l| l.clearRetainingCapacity();
         b.hashes.clearRetainingCapacity();
+        b.restarts.clearRetainingCapacity();
         b.nblocks = 0;
         b.count = 0;
         b.min_seq = std.math.maxInt(u64);
         b.max_seq = 0;
         b.block_entries = 0;
-        b.misses = 0;
+        // `misses` and `skipped` carry over: the next chunk is probably the
+        // same kind of data.
     }
 
     pub fn isEmpty(b: *const Builder) bool {
@@ -169,7 +252,9 @@ pub const Builder = struct {
             try b.keys.appendSlice(gpa, &kl);
             try b.keys.appendSlice(gpa, e.key);
         }
-        const shared: usize = if (b.fmt.front_coding and b.block_entries > 0)
+        const restart = b.block_entries % restart_every == 0;
+        if (restart) try b.restarts.append(gpa, @intCast(b.block.items.len));
+        const shared: usize = if (b.fmt.front_coding and !restart)
             std.mem.indexOfDiff(u8, b.prev.items, e.key) orelse @min(b.prev.items.len, e.key.len)
         else
             0;
@@ -192,20 +277,26 @@ pub const Builder = struct {
 
     fn flushBlock(b: *Builder) !void {
         const gpa = b.gpa;
+        for (b.restarts.items) |r| std.mem.writeInt(u32, try b.block.addManyAsArray(gpa, 4), r, .little);
+        std.mem.writeInt(u32, try b.block.addManyAsArray(gpa, 4), @intCast(b.restarts.items.len), .little);
+        b.restarts.clearRetainingCapacity();
         const raw = b.block.items;
         var stored = raw;
         var flag: u32 = 0;
-        // Data that didn't shrink twice in a row (random bytes, already
-        // compressed media) is not tried again until the next chunk.
-        if (b.fmt.compress and raw.len > 64 and b.misses < 2) {
+        // After two blocks in a row didn't shrink (random bytes, already
+        // compressed media), only every 16th block is tried, so such data
+        // costs little and a change back to text is still noticed.
+        const try_it = b.misses < 2 or b.skipped >= 15;
+        if (b.fmt.compress and raw.len > 64 and try_it) {
+            b.skipped = 0;
             try b.scratch.resize(gpa, lz4.bound(raw.len));
             const n = lz4.compress(raw, b.scratch.items);
             if (n < raw.len - raw.len / 10) {
                 stored = b.scratch.items[0..n];
                 flag = compressed_bit;
                 b.misses = 0;
-            } else b.misses += 1;
-        }
+            } else b.misses +|= 1;
+        } else if (b.fmt.compress) b.skipped +|= 1;
         const off: u32 = @intCast(b.out.items.len);
         try b.out.appendSlice(gpa, stored);
         // The key offset was written when the block started; finish its entry.
@@ -242,11 +333,11 @@ pub const Builder = struct {
         return b.out.items;
     }
 
-    /// A bloom filter over every distinct key added. Caller owns it.
+    /// A blocked bloom filter over every distinct key added. Caller owns it.
     pub fn bloom(b: *const Builder, gpa: Allocator) ![]u64 {
-        const words = try gpa.alloc(u64, bloomWords(b.hashes.items.len));
+        const words = try gpa.alloc(u64, blockedBloomWords(b.hashes.items.len));
         @memset(words, 0);
-        for (b.hashes.items) |h| bloomAdd(words, h);
+        for (b.hashes.items) |h| blockedBloomAdd(words, h);
         return words;
     }
 };
@@ -260,11 +351,27 @@ pub const View = struct {
     count: u32,
     index: []const u8,
     keys: []const u8,
+    /// Which checks already passed for these bytes: bit i for block i
+    /// (i < 63), bit 63 for the metadata. Owned by the chunk's metadata in
+    /// RAM, so each block is hashed once per process instead of on every
+    /// read. Null means check every time.
+    checked: ?*u64 = null,
+    /// Blocks end in restart points (every chunk written since they were
+    /// added; older chunks are read the old way).
+    restarts: bool = true,
+
+    const meta_bit: u64 = 1 << 63;
 
     pub fn open(bytes: []const u8) error{Corrupt}!View {
+        return openChecked(bytes, null);
+    }
+
+    /// Like `open`, but remembers passed checks in `checked`.
+    pub fn openChecked(bytes: []const u8, checked: ?*u64) error{Corrupt}!View {
         if (bytes.len < footer_len) return error.Corrupt;
         const f = bytes[bytes.len - footer_len ..];
-        if (std.mem.readInt(u32, f[20..24], .little) != magic) return error.Corrupt;
+        const m = std.mem.readInt(u32, f[20..24], .little);
+        if (m != magic and m != magic_v1) return error.Corrupt;
         const index_off = std.mem.readInt(u32, f[0..4], .little);
         const nblocks = std.mem.readInt(u32, f[4..8], .little);
         const keys_off = std.mem.readInt(u32, f[12..16], .little);
@@ -274,8 +381,14 @@ pub const View = struct {
         // The block index and first-key table steer every lookup, so they
         // are checked on every open (they are small); blocks are checked
         // when they are read.
-        if (blockHash(bytes[index_off..meta_end]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
+        const known = if (checked) |c| @atomicLoad(u64, c, .monotonic) & meta_bit != 0 else false;
+        if (!known) {
+            if (blockHash(bytes[index_off..meta_end]) != std.mem.readInt(u32, f[16..20], .little)) return error.Corrupt;
+            if (checked) |c| _ = @atomicRmw(u64, c, .Or, meta_bit, .monotonic);
+        }
         return .{
+            .checked = checked,
+            .restarts = m == magic,
             .bytes = bytes,
             .nblocks = nblocks,
             .count = std.mem.readInt(u32, f[8..12], .little),
@@ -285,8 +398,11 @@ pub const View = struct {
     }
 
     /// Checks every block hash (`open` already checked the metadata).
+    /// Checks the metadata and every block hash, ignoring checks that
+    /// passed earlier: the bytes may have been damaged since.
     pub fn verify(v: View) error{Corrupt}!void {
-        for (0..v.nblocks) |i| _ = try v.stored(i);
+        const fresh = try View.open(v.bytes);
+        for (0..v.nblocks) |i| _ = try fresh.stored(i);
     }
 
     pub fn firstKey(v: View, i: usize) error{Corrupt}![]const u8 {
@@ -303,7 +419,7 @@ pub const View = struct {
         var hi: usize = v.nblocks;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.order(u8, try v.firstKey(mid), key) == .gt) hi = mid else lo = mid + 1;
+            if (order(try v.firstKey(mid), key) == .gt) hi = mid else lo = mid + 1;
         }
         return if (lo == 0) null else lo - 1;
     }
@@ -314,7 +430,7 @@ pub const View = struct {
         var hi: usize = v.nblocks;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.order(u8, try v.firstKey(mid), key) != .lt) hi = mid else lo = mid + 1;
+            if (order(try v.firstKey(mid), key) != .lt) hi = mid else lo = mid + 1;
         }
         return if (lo == 0) null else lo - 1;
     }
@@ -329,18 +445,70 @@ pub const View = struct {
         const index_start = v.bytes.len - footer_len - v.keys.len - v.index.len;
         if (@as(u64, off) + len > index_start) return error.Corrupt;
         const bytes = v.bytes[off..][0..len];
-        if (blockHash(bytes) != std.mem.readInt(u32, e[12..16], .little)) return error.Corrupt;
+        const bit: u64 = if (i < 63) @as(u64, 1) << @intCast(i) else 0;
+        const known = if (v.checked) |c| @atomicLoad(u64, c, .monotonic) & bit != 0 else false;
+        if (!known) {
+            if (blockHash(bytes) != std.mem.readInt(u32, e[12..16], .little)) return error.Corrupt;
+            if (v.checked) |c| if (bit != 0) {
+                _ = @atomicRmw(u64, c, .Or, bit, .monotonic);
+            };
+        }
         return .{ .bytes = bytes, .raw_len = std.mem.readInt(u32, e[8..12], .little), .compressed = len_flag & compressed_bit != 0 };
     }
 
-    /// The raw bytes of block `i`: the stored bytes, or decompressed into
-    /// `scratch`.
-    pub fn block(v: View, i: usize, gpa: Allocator, scratch: *std.ArrayList(u8)) ![]const u8 {
+    /// The entries of block `i` (decompressed into `scratch` if needed)
+    /// and its restart table.
+    pub fn block(v: View, i: usize, gpa: Allocator, scratch: *std.ArrayList(u8)) !Block {
         const s = try v.stored(i);
-        if (!s.compressed) return s.bytes;
-        try scratch.resize(gpa, s.raw_len);
-        try lz4.decompress(s.bytes, scratch.items);
-        return scratch.items;
+        const raw = if (!s.compressed) s.bytes else blk: {
+            try scratch.resize(gpa, s.raw_len);
+            try lz4.decompress(s.bytes, scratch.items);
+            break :blk scratch.items;
+        };
+        if (!v.restarts) return .{ .entries = raw };
+        if (raw.len < 4) return error.Corrupt;
+        const n = std.mem.readInt(u32, raw[raw.len - 4 ..][0..4], .little);
+        if (n == 0 or @as(u64, n) * 4 + 4 > raw.len) return error.Corrupt;
+        const table = raw[raw.len - 4 - n * 4 .. raw.len - 4];
+        return .{ .entries = raw[0 .. raw.len - 4 - n * 4], .restarts = table };
+    }
+};
+
+pub const Block = struct {
+    entries: []const u8,
+    /// u32 offsets of entries that store their whole key; empty for blocks
+    /// written before restart points.
+    restarts: []const u8 = &.{},
+
+    fn restart(b: Block, i: usize) u32 {
+        return std.mem.readInt(u32, b.restarts[i * 4 ..][0..4], .little);
+    }
+
+    fn restartCount(b: Block) usize {
+        return b.restarts.len / 4;
+    }
+
+    /// The whole key stored at restart `i`.
+    fn restartKey(b: Block, i: usize) error{Corrupt}![]const u8 {
+        var pos: usize = b.restart(i);
+        if (pos >= b.entries.len) return error.Corrupt;
+        const shared = try getVar(b.entries, &pos);
+        const suffix = try getVar(b.entries, &pos);
+        _ = try getVar(b.entries, &pos);
+        if (shared != 0 or pos + 9 > b.entries.len or suffix > b.entries.len - pos - 9) return error.Corrupt;
+        return b.entries[pos + 9 ..][0..@intCast(suffix)];
+    }
+
+    /// Where to start scanning for the first entry with key >= `key`: the
+    /// last restart whose key is < `key`, or 0.
+    fn seek(b: Block, key: []const u8) error{Corrupt}!usize {
+        var lo: usize = 0;
+        var hi: usize = b.restartCount();
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (order(try b.restartKey(mid), key) == .lt) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) 0 else b.restart(lo - 1);
     }
 };
 
@@ -391,8 +559,15 @@ pub const Parsed = struct {
         p.keys.clearRetainingCapacity();
         p.offs.clearRetainingCapacity();
         p.kb.clearRetainingCapacity();
-        const raw = try v.block(bi, gpa, &p.scratch);
-        var it: BlockIter = .{ .raw = raw };
+        const blk = try v.block(bi, gpa, &p.scratch);
+        var it: BlockIter = .{ .raw = blk.entries };
+        // Size the lists once instead of growing them entry by entry.
+        if (blk.restartCount() > 0) {
+            const n = blk.restartCount() * restart_every;
+            try p.entries.ensureTotalCapacity(gpa, n);
+            try p.offs.ensureTotalCapacity(gpa, n);
+        }
+        try p.keys.ensureTotalCapacity(gpa, blk.entries.len);
         while (try it.next(gpa, &p.kb)) |e| {
             try p.offs.append(gpa, @intCast(p.keys.items.len));
             try p.keys.appendSlice(gpa, e.key);
@@ -409,10 +584,11 @@ pub const Parsed = struct {
 /// borrows the chunk bytes or `scratch`.
 pub fn get(v: View, gpa: Allocator, key: []const u8, at: u64, scratch: *std.ArrayList(u8), kb: *std.ArrayList(u8)) !?Entry {
     const bi = (try v.findBlock(key)) orelse return null;
-    var it: BlockIter = .{ .raw = try v.block(bi, gpa, scratch) };
+    const blk = try v.block(bi, gpa, scratch);
+    var it: BlockIter = .{ .raw = blk.entries, .pos = try blk.seek(key) };
     kb.clearRetainingCapacity();
     while (try it.next(gpa, kb)) |e| {
-        switch (std.mem.order(u8, e.key, key)) {
+        switch (order(e.key, key)) {
             .lt => continue,
             .gt => return null,
             .eq => if (e.seq <= at) return e,
@@ -470,7 +646,7 @@ fn buildAndCheck(fmt: Format) !void {
     for (0..view.nblocks) |bi| {
         try p.load(gpa, view, bi);
         for (p.entries.items) |e| {
-            try testing.expect(std.mem.order(u8, prev.items, e.key) != .gt);
+            try testing.expect(order(prev.items, e.key) != .gt);
             prev.clearRetainingCapacity();
             try prev.appendSlice(gpa, e.key);
         }
@@ -480,10 +656,10 @@ fn buildAndCheck(fmt: Format) !void {
     // Bloom finds every key.
     const bloom = try b.bloom(gpa);
     defer gpa.free(bloom);
-    for (0..n) |i| try testing.expect(bloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "chat/1/m{d:0>6}", .{i}))));
+    for (0..n) |i| try testing.expect(blockedBloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "chat/1/m{d:0>6}", .{i}))));
     var false_pos: usize = 0;
     for (0..10_000) |i| {
-        if (bloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "nope/{d}", .{i})))) false_pos += 1;
+        if (blockedBloomHas(bloom, keyHash(try std.fmt.bufPrint(&kbuf, "nope/{d}", .{i})))) false_pos += 1;
     }
     try testing.expect(false_pos < 300);
     // Damage is caught.
@@ -494,4 +670,89 @@ fn buildAndCheck(fmt: Format) !void {
 test "chunks round trip with and without compression" {
     try buildAndCheck(.{ .block_bytes = 4096, .front_coding = false, .compress = false });
     try buildAndCheck(.{ .block_bytes = 8192, .front_coding = true, .compress = true });
+}
+
+test "a key's versions that cross restart points are all found" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |fc| {
+        var b = Builder.init(gpa, .{ .block_bytes = 8192, .front_coding = fc, .compress = fc });
+        defer b.deinit();
+        try b.add(.{ .key = "a/1/k0", .value = "x", .seq = 1 });
+        var seq: u64 = 100;
+        while (seq > 60) : (seq -= 1) try b.add(.{ .key = "a/1/k1", .value = "v", .seq = seq });
+        try b.add(.{ .key = "a/1/k2", .value = "y", .seq = 2 });
+        const view = try View.open(try b.finish());
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        var kb: std.ArrayList(u8) = .empty;
+        defer kb.deinit(gpa);
+        for (61..101) |at| {
+            const e = (try get(view, gpa, "a/1/k1", at, &scratch, &kb)).?;
+            try testing.expectEqual(@as(u64, at), e.seq);
+        }
+        try testing.expect((try get(view, gpa, "a/1/k1", 60, &scratch, &kb)) == null);
+        try testing.expectEqual(@as(u64, 2), (try get(view, gpa, "a/1/k2", 9, &scratch, &kb)).?.seq);
+        try testing.expect((try get(view, gpa, "a/1/k15", 999, &scratch, &kb)) == null);
+    }
+}
+
+test "order and hint agree with byte order" {
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    var a: [24]u8 = undefined;
+    var b: [24]u8 = undefined;
+    for (0..20000) |_| {
+        const la = r.uintAtMost(usize, 24);
+        const lb = r.uintAtMost(usize, 24);
+        for (a[0..la]) |*c| c.* = r.uintAtMost(u8, 3);
+        for (b[0..lb]) |*c| c.* = r.uintAtMost(u8, 3);
+        const want = std.mem.order(u8, a[0..la], b[0..lb]);
+        try testing.expectEqual(want, order(a[0..la], b[0..lb]));
+        const skip = r.uintAtMost(usize, 4);
+        if (la < skip or lb < skip or !std.mem.eql(u8, a[0..skip], b[0..skip])) continue;
+        const ha = hint(a[0..la], skip);
+        const hb = hint(b[0..lb], skip);
+        if (ha != hb) try testing.expectEqual(want, std.math.order(ha, hb));
+    }
+}
+
+test "verify rechecks metadata that an earlier read already passed" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa, .{ .block_bytes = 256, .front_coding = true, .compress = false });
+    defer b.deinit();
+    var kbuf: [32]u8 = undefined;
+    for (0..200) |i| try b.add(.{ .key = try std.fmt.bufPrint(&kbuf, "v/1/k{d:0>5}", .{i}), .value = "value", .seq = i + 1 });
+    const bytes = try gpa.dupe(u8, try b.finish());
+    defer gpa.free(bytes);
+    var checked: u64 = 0;
+    const v = try View.openChecked(bytes, &checked);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(gpa);
+    _ = try get(v, gpa, "v/1/k00007", 999, &scratch, &kb);
+    try testing.expect(checked & View.meta_bit != 0);
+    // Damage the first-key table after the cached check passed.
+    bytes[bytes.len - footer_len - 1] ^= 0xff;
+    const again = try View.openChecked(bytes, &checked);
+    try testing.expectError(error.Corrupt, again.verify());
+}
+
+test "a builder keeps skipping compression across chunks" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa, .{ .block_bytes = 512, .front_coding = true, .compress = true });
+    defer b.deinit();
+    var prng = std.Random.DefaultPrng.init(9);
+    var vbuf: [200]u8 = undefined;
+    var kbuf: [32]u8 = undefined;
+    for (0..3) |c| {
+        for (0..40) |i| {
+            prng.random().bytes(&vbuf);
+            try b.add(.{ .key = try std.fmt.bufPrint(&kbuf, "r/1/{d}/{d:0>4}", .{ c, i }), .value = &vbuf, .seq = i + 1 });
+        }
+        _ = try b.finish();
+        try testing.expect(b.misses >= 2);
+        b.reset();
+        try testing.expect(b.misses >= 2);
+    }
 }

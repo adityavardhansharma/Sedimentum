@@ -165,6 +165,8 @@ pub fn Store(comptime flavor: Flavor) type {
         id: u64,
         /// v3: batches that span streams are journaled here first.
         journal: if (flavor == .v3) *Journal else void,
+        /// Odd while a batch that spans shards is being applied.
+        batch_ver: std.atomic.Value(u64) = .init(0),
 
         pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, options: Options) !*Self {
             var dir = try parent.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
@@ -414,6 +416,9 @@ pub fn Store(comptime flavor: Flavor) type {
             {
                 for (self.shards, 0..) |sh, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) sh.lock.lockUncancelable(self.io);
                 defer for (self.shards, 0..) |sh, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) sh.lock.unlock(self.io);
+                // Snapshots wait out the apply below (runs before unlock).
+                _ = self.batch_ver.fetchAdd(1, .acq_rel);
+                defer _ = self.batch_ver.fetchAdd(1, .acq_rel);
                 for (self.shards, 0..) |sh, i| {
                     if (mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
                     if (sh.poisoned) return error.Poisoned;
@@ -543,7 +548,7 @@ pub fn Store(comptime flavor: Flavor) type {
             }
             std.mem.sortUnstable(StreamInfo, out.items, {}, struct {
                 fn lt(_: void, a: StreamInfo, b: StreamInfo) bool {
-                    return std.mem.order(u8, a.name, b.name) == .lt;
+                    return chunk.order(a.name, b.name) == .lt;
                 }
             }.lt);
             return out.toOwnedSlice(gpa);
@@ -667,6 +672,13 @@ pub fn Store(comptime flavor: Flavor) type {
             return self.shardOf(key).get(gpa, key, std.math.maxInt(u64));
         }
 
+        /// Like `get`, but copies the value into `out` (replacing its
+        /// contents) instead of allocating. Returns false if there is none.
+        /// Reusing one buffer makes repeated reads allocation-free.
+        pub fn getInto(self: *Self, gpa: Allocator, key: []const u8, out: *std.ArrayList(u8)) !bool {
+            return self.shardOf(key).getInto(gpa, key, std.math.maxInt(u64), out);
+        }
+
         pub fn getAt(self: *Self, gpa: Allocator, snap: Snapshot, key: []const u8) !?[]u8 {
             const sh = self.shardOf(key);
             const i = std.mem.indexOfScalar(*Shard, self.shards, sh).?;
@@ -675,18 +687,27 @@ pub fn Store(comptime flavor: Flavor) type {
 
         /// A point-in-time view across every shard: all shard locks are
         /// held while the sequence numbers are taken.
+        /// A point-in-time view across every shard, without holding all
+        /// shard locks at once: each shard is pinned, then every shard's
+        /// seq is read twice, each under its shared lock. Seqs only grow, so two equal reads mean all
+        /// held those values together at some instant (a consistent cut);
+        /// `batch_ver` rules out a cut in the middle of a batch.
         pub fn snapshot(self: *Self) !Snapshot {
-            for (self.shards) |sh| sh.lock.lockUncancelable(self.io);
-            defer for (self.shards) |sh| sh.lock.unlock(self.io);
             var snap: Snapshot = .{};
-            var taken: usize = 0;
-            errdefer for (self.shards[0..taken]) |sh| sh.releaseLocked(sh.seq);
-            for (self.shards, 0..) |sh, i| {
-                try sh.snaps.append(self.gpa, sh.seq);
-                snap.seqs[i] = sh.seq;
-                taken += 1;
+            var v1 = self.batch_ver.load(.acquire);
+            for (self.shards, 0..) |sh, i| snap.seqs[i] = sh.pin();
+            while (true) {
+                var same = v1 & 1 == 0;
+                for (self.shards, 0..) |sh, i| {
+                    const seq = sh.visibleSeq();
+                    if (seq != snap.seqs[i]) same = false;
+                    snap.seqs[i] = seq;
+                }
+                const v2 = self.batch_ver.load(.acquire);
+                if (same and v2 == v1) return snap;
+                v1 = v2;
+                std.atomic.spinLoopHint();
             }
-            return snap;
         }
 
         pub fn release(self: *Self, snap: Snapshot) void {
@@ -701,20 +722,42 @@ pub fn Store(comptime flavor: Flavor) type {
             // every sync from it covers every shard from now on.
             if (touched_overflow) return self.syncAll();
             const t = touchedSlot(self.id, false) orelse return;
-            for (self.shards, 0..) |sh, i| {
-                const bit = @as(u32, 1) << @intCast(i);
-                if (t.mask & bit == 0) continue;
-                // A bit is cleared only once its shard synced, so a retry
-                // after an error covers what is still pending.
-                try sh.sync();
-                t.mask &= ~bit;
-            }
+            try self.syncMask(&t.mask);
             t.* = .{};
+        }
+
+        const SyncResult = @typeInfo(@TypeOf(Shard.sync)).@"fn".return_type.?;
+
+        /// Syncs the shards in `mask`, each on its own unit of concurrency
+        /// when there are several, so their device flushes overlap. A bit
+        /// is cleared only once its shard synced, so a retry after an error
+        /// covers what is still pending.
+        fn syncMask(self: *Self, mask: *u32) !void {
+            if (mask.* == 0) return;
+            var futures: [max_shards]?std.Io.Future(SyncResult) = @splat(null);
+            const last: usize = 31 - @clz(mask.*);
+            for (self.shards, 0..) |sh, i| {
+                if (mask.* & (@as(u32, 1) << @intCast(i)) == 0 or i == last) continue;
+                futures[i] = self.io.async(Shard.sync, .{sh});
+            }
+            var first_err: ?anyerror = null;
+            if (self.shards[last].sync()) |_| {
+                mask.* &= ~(@as(u32, 1) << @intCast(last));
+            } else |err| first_err = err;
+            for (&futures, 0..) |*f, i| if (f.*) |*fut| {
+                if (fut.await(self.io)) |_| {
+                    mask.* &= ~(@as(u32, 1) << @intCast(i));
+                } else |err| {
+                    if (first_err == null) first_err = err;
+                }
+            };
+            if (first_err) |e| return @as(SyncResult, @errorCast(e));
         }
 
         /// Makes every write accepted so far durable, from any thread.
         pub fn syncAll(self: *Self) !void {
-            for (self.shards) |sh| try sh.sync();
+            var all: u32 = @intCast((@as(u64, 1) << @intCast(self.shards.len)) - 1);
+            try self.syncMask(&all);
             if (touchedSlot(self.id, false)) |t| t.* = .{};
         }
 
@@ -771,7 +814,7 @@ pub fn Store(comptime flavor: Flavor) type {
                 for (it.cur, 0..) |c, i| {
                     const p = c orelse continue;
                     if (pick) |b| {
-                        const o = std.mem.order(u8, p.key, it.cur[b].?.key);
+                        const o = chunk.order(p.key, it.cur[b].?.key);
                         if ((!it.reverse and o == .lt) or (it.reverse and o == .gt)) pick = i;
                     } else pick = i;
                 }
@@ -1065,7 +1108,7 @@ fn modelTest(comptime S: type, seed: u64, time_ordered: bool) !void {
     while (mit.next()) |k| try keys.append(gpa, k.*);
     std.mem.sortUnstable([]const u8, keys.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+            return chunk.order(a, b) == .lt;
         }
     }.lt);
     for ([_]bool{ false, true }) |rev| {
@@ -1206,6 +1249,36 @@ fn crashTest(comptime S: type) !void {
     }
 }
 
+test "v3: seals that skip a durable point still survive a crash" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var kb: [32]u8 = undefined;
+    var vb: [150]u8 = @splat('w');
+    {
+        var db = try V3.open(gpa, io, tmp.dir, "db", .{ .sync_writes = true, .shards = 1 });
+        // Streams that seal at different times, some never written again
+        // after a seal, plus a dropped stream and a deleted key.
+        for (0..900) |i| {
+            try db.put(try std.fmt.bufPrint(&kb, "a/1/{d:0>5}", .{i}), &vb);
+            if (i % 3 == 0) try db.put(try std.fmt.bufPrint(&kb, "b/1/{d:0>5}", .{i}), &vb);
+            if (i < 200) try db.put(try std.fmt.bufPrint(&kb, "c/1/{d:0>5}", .{i}), &vb);
+            if (i == 400) try db.deletePrefix("c/1/");
+            if (i == 500) try db.delete("a/1/00007");
+        }
+        db.shards[0].freeMemoryForTest();
+        crashRest(V3, db);
+    }
+    var db = try V3.open(gpa, io, tmp.dir, "db", .{});
+    defer db.close();
+    for (0..900) |i| {
+        try testing.expectEqual(i != 7, try db.contains(try std.fmt.bufPrint(&kb, "a/1/{d:0>5}", .{i})));
+        if (i % 3 == 0) try testing.expect(try db.contains(try std.fmt.bufPrint(&kb, "b/1/{d:0>5}", .{i})));
+        if (i < 200) try testing.expect(!try db.contains(try std.fmt.bufPrint(&kb, "c/1/{d:0>5}", .{i})));
+    }
+}
+
 test "synced records survive a crash without close" {
     try crashTest(V2);
     try crashTest(V3);
@@ -1296,6 +1369,17 @@ fn featureTest(comptime S: type) !void {
     try expectValue(db, "t/1/a", null);
     try expectValue(db, "t/1/b", "long");
     db.setClockForTest(null);
+
+    // getInto reuses one buffer and skips expired values.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try testing.expect(try db.getInto(gpa, "t/1/c", &buf));
+    try testing.expectEqualStrings("forever", buf.items);
+    try db.put("t/1/d", "a longer value than before");
+    try testing.expect(try db.getInto(gpa, "t/1/d", &buf));
+    try testing.expectEqualStrings("a longer value than before", buf.items);
+    try testing.expect(!try db.getInto(gpa, "t/1/a", &buf)); // expired
+    try testing.expect(!try db.getInto(gpa, "t/1/none", &buf));
 
     // Compare-and-swap.
     try db.putIf("cas/1/k", "v1", .absent);
