@@ -303,6 +303,8 @@ code_of: tables.Map = .{},
 /// Bumped when a word of ours is erased: text coded outside the write
 /// lock before that is coded again.
 word_gen: std.atomic.Value(u64) = .init(0),
+/// Times the tables were rebuilt after a failed write.
+rebuilds: std.atomic.Value(u64) = .init(0),
 /// Word sightings, for giving codes to words seen twice (writer only).
 seen: []u8 = &.{},
 /// Decoding scratch for the writer.
@@ -425,6 +427,7 @@ fn recoverFailedWrite(w: *Stratum, start: u64, len: u64) void {
     // Codes may have been dropped or given out again: texts coded before
     // this must be coded again.
     _ = w.word_gen.fetchAdd(1, .release);
+    _ = w.rebuilds.fetchAdd(1, .release);
     w.synced.store(@min(synced, w.end.load(.acquire)), .release);
 }
 
@@ -1489,9 +1492,16 @@ fn rememberOne(w: *Stratum, it: Item) !u64 {
         x.lineage = if (it.subject == null) w.findLineage(scopeHash(it.scope), x.keys[0..x.nk], x.dfs[0..x.nk]) else null;
     }
     var req: WriteReq = .{ .it = it, .pre = x, .nterms = @intCast(ts.total), .hashes = ts.hashes[0..ts.len], .bound = encodeBound(it), .now = w.nowMs() };
+    const rebuilds = w.rebuilds.load(.acquire);
     const id = try w.submit(&req);
-    // Word counts are bumped here, on every core, not under the lock.
-    for (req.hashes) |hh| w.bumpDf(hh);
+    // Word counts are bumped here, on every core, not under the lock. If
+    // the tables were rebuilt meanwhile, the rebuild may have counted this
+    // memory already: skip it rather than count it twice.
+    {
+        w.readers.enter(w.io);
+        defer w.readers.leave(w.io);
+        if (w.rebuilds.load(.acquire) == rebuilds) for (req.hashes) |hh| w.bumpDf(hh);
+    }
     if (w.options.sync_writes) try w.sync();
     try w.maybeSnapshot();
     return id;
@@ -1898,7 +1908,12 @@ fn load(w: *const Stratum, gpa: Allocator, id: u64) !?Memory {
     // still matches its crc after decoding was whole the entire time.
     const vocab = &w.lanes[laneOf(id)].vocab;
     var scratch: [8192]u8 = undefined;
-    if (try wordcode.decodeInto(vocab, stored, &scratch)) |n| {
+    const fits = wordcode.decodeInto(vocab, stored, &scratch) catch |e| {
+        // Erased while we decoded: that is a deleted memory, not an error.
+        if (!w.textIntact(id, h)) return null;
+        return e;
+    };
+    if (fits) |n| {
         if (!w.textIntact(id, h)) return null;
         const bytes = try gpa.alloc(u8, head.len + n);
         @memcpy(bytes[0..head.len], head);
@@ -1908,7 +1923,13 @@ fn load(w: *const Stratum, gpa: Allocator, id: u64) !?Memory {
     var raw: std.ArrayList(u8) = .empty;
     errdefer raw.deinit(gpa);
     try raw.appendSlice(gpa, head);
-    try wordcode.decode(vocab, stored, gpa, &raw);
+    wordcode.decode(vocab, stored, gpa, &raw) catch |e| {
+        if (e == error.Corrupt and !w.textIntact(id, h)) {
+            raw.deinit(gpa);
+            return null;
+        }
+        return e;
+    };
     if (!w.textIntact(id, h)) {
         raw.deinit(gpa);
         return null;
