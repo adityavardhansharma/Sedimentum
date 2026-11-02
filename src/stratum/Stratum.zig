@@ -1480,10 +1480,12 @@ fn eraseOwn(w: *Stratum, off8: u32) !void {
     if (h.kind != .memory) return;
     const n = h.text_len;
     const at = (@as(u64, off8) << 3) + textStart(h);
-    // Words only this memory used go with it.
+    // Words only this memory used go with it, but only after its text:
+    // a reader that decoded with words already erased then finds the text
+    // changed and drops what it read.
     const words_go = h.flags & flag_coded != 0 and w.textIntact(id, h);
-    if (words_go) w.countCodes(w.storedText(id, h), -1);
-    if (words_go) try w.eraseUnusedWords(w.storedText(id, h));
+    if (words_go) try w.enc_buf.resize(w.gpa, n);
+    if (words_go) @memcpy(w.enc_buf.items, w.storedText(id, h));
     w.noteErased(@as(u64, off8) << 3, at + n);
     var zeros: [4096]u8 = @splat(0);
     var done: usize = 0;
@@ -1491,6 +1493,10 @@ fn eraseOwn(w: *Stratum, off8: u32) !void {
         const k = @min(zeros.len, n - done);
         try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..k], at + done);
         done += k;
+    }
+    if (words_go) {
+        w.countCodes(w.enc_buf.items, -1);
+        try w.eraseUnusedWords(w.enc_buf.items);
     }
     const kind = [1]u8{@backingInt(Kind.erased)};
     try w.lanes[w.me].file.writePositionalAll(w.io, &kind, (@as(u64, off8) << 3) + @offsetOf(Hdr, "kind"));
@@ -1614,6 +1620,11 @@ fn load(w: *const Stratum, gpa: Allocator, id: u64) !?Memory {
             return null;
         }
         try wordcode.decode(&w.lanes[laneOf(id)].vocab, copy, gpa, &raw);
+        // Erased while we decoded (its words may be gone too): drop it.
+        if (!w.textIntact(id, h)) {
+            raw.deinit(gpa);
+            return null;
+        }
     }
     const bytes = try raw.toOwnedSlice(gpa);
     return .{
@@ -2275,7 +2286,7 @@ pub fn scanAll(w: *Stratum, ctx: anytype, comptime f: anytype) !void {
                         pos += h.len;
                         continue;
                     };
-                    f(ctx, buf.items, h.time);
+                    if (w.textIntact(id, h)) f(ctx, buf.items, h.time);
                 }
             }
             pos += h.len;
