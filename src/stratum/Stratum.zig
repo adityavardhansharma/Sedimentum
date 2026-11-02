@@ -377,6 +377,9 @@ fn loadTables(w: *Stratum) !void {
         var it = w.forgotten.iterator();
         while (it.next()) |e| if (laneOf(e.key) == w.me) try w.eraseOwn(offOf(e.key));
     }
+    // A crash between erasing a text and its unused words leaves words no
+    // live memory uses: the counts are exact now, so erase those.
+    for (0..w.word_refs.items.len) |c| try w.eraseWordIfUnused(c);
     w.end.store(w.lanes[w.me].end, .release);
     w.synced.store(w.lanes[w.me].end, .release);
     @atomicStore(u64, &w.snap_end, if (from) |f| @min(f[w.me], w.lanes[w.me].end) else data_start, .release);
@@ -907,15 +910,19 @@ fn eraseUnusedWords(w: *Stratum, enc: []const u8) !void {
             code = 128 + ((@as(usize, op & 0x3F) << 8) | enc[i]);
             i += 1;
         }
-        if (code >= w.word_refs.items.len or w.word_refs.items[code] != 0) continue;
-        const word = w.lanes[w.me].vocab.get(code) orelse continue;
-        if (word.len == 0 or word[0] == 0) continue;
-        _ = w.codes.remove(word);
-        var zeros: [wordcode.max_word]u8 = @splat(0);
-        try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..word.len], w.word_at.items[code]);
-        @memset(@constCast(word), 0);
-        w.noteErased(w.word_at.items[code], w.word_at.items[code] + word.len);
+        try w.eraseWordIfUnused(code);
     }
+}
+
+fn eraseWordIfUnused(w: *Stratum, code: usize) !void {
+    if (code >= w.word_refs.items.len or w.word_refs.items[code] != 0) return;
+    const word = w.lanes[w.me].vocab.get(code) orelse return;
+    if (word.len == 0 or word[0] == 0) return;
+    _ = w.codes.remove(word);
+    var zeros: [wordcode.max_word]u8 = @splat(0);
+    try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..word.len], w.word_at.items[code]);
+    @memset(@constCast(word), 0);
+    w.noteErased(w.word_at.items[code], w.word_at.items[code] + word.len);
 }
 
 /// The record at `pos` if it is complete and its metadata checks out.
@@ -2993,4 +3000,42 @@ test "an idle lane is read past the end it published" {
     const hits = try a.recall(testing.allocator, .{ .about = "quokka", .limit = 5 });
     defer freeHits(testing.allocator, hits);
     try testing.expectEqual(@as(usize, 2), hits.len);
+}
+
+test "words left by a crash mid-forget are erased on the next open" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var spans: [3][2]u64 = undefined;
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        for (&spans) |*sp| {
+            const id = try w.remember("s", "the token custsecretx is here ", .{});
+            const h = w.hdrAt(id);
+            sp.* = .{ (@as(u64, offOf(id)) << 3) + textStart(h), h.text_len };
+        }
+        _ = try w.remember("t", "other words here ", .{});
+    }
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    {
+        // As a forget would before the crash: texts zeroed, words not yet.
+        var f = try sub.openFile(testing.io, "lane-000.sdm", .{ .mode = .read_write });
+        defer f.close(testing.io);
+        const zeros: [256]u8 = @splat(0);
+        for (spans) |sp| try f.writePositionalAll(testing.io, zeros[0..sp[1]], sp[0]);
+    }
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        try w.sync();
+    }
+    const bytes = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "custsecretx") == null);
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const hits = try w.recall(testing.allocator, .{ .about = "other", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqualStrings("other words here ", hits[0].memory.text);
 }
