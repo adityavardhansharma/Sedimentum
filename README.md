@@ -180,23 +180,33 @@ current value.
 - **No read locks.** Readers never wait for the writer; each turn's write is
   flushed on its own range of the file, so durable turns don't queue behind
   one flusher.
+- **Promised turns.** Open with `.flusher = true` and a write returns as soon
+  as it is in the lane; a background thread makes it durable. `promise()`
+  names everything written so far, `isDurable(p)` checks it and
+  `waitDurable(p)` waits for it, so an agent waits for the disk only before
+  it acts outside (sends a message, calls a tool). Threads that write at the
+  same time hand their memories to one writer, which appends them together.
 
 Benchmarks: `zig-out/bin/sedimentum-stratum-bench` takes the same modes as
 the Holo bench, plus `jargon` (project words that change value over time) and
 `lanes` (1 to 32 writer processes, plus a `kill -9` crash test).
 `.holo-report/stratum.html` has the results.
 
-Agent workload (1M messages, 8 threads, every turn durable), same machine:
+Agent workload (1M messages, 8 threads, every turn durable unless promised),
+same machine:
 
-| Engine  | Turns/s | p99    | RAM after reopen | Disk   |
-|---------|--------:|-------:|-----------------:|-------:|
-| Stratum |   8,312 | 5.6 ms |            12 MB | 308 MB |
-| Holo    |   5,713 | 6.8 ms |            32 MB | 408 MB |
-| v3      |   7,214 | 3.2 ms |            88 MB | 391 MB |
-| v1      |   7,750 | 2.8 ms |           229 MB | 587 MB |
+| Engine                  | Turns/s | p99    | RAM after reopen | Disk   |
+|-------------------------|--------:|-------:|-----------------:|-------:|
+| Stratum, promised turns |  33,800 | 3.3 ms |            12 MB | 308 MB |
+| Stratum                 |   8,460 | 5.6 ms |            12 MB | 308 MB |
+| Holo                    |   5,713 | 6.8 ms |            32 MB | 408 MB |
+| v3                      |   7,214 | 3.2 ms |            88 MB | 391 MB |
+| v1                      |   7,750 | 2.8 ms |           229 MB | 587 MB |
 
-Limits: turns are bound by the disk's flush rate, so they top out near 2x
-v3 on this machine. Versions with no subject and too few rare words in
+With promised turns a turn takes 56 µs at the median and is durable about
+3 ms later; the turns are then bound by CPU (about 100 µs per turn on this
+4-core machine), not by the disk. Limits: when every turn must be durable
+before it returns, turns are bound by the disk's flush rate. Versions with no subject and too few rare words in
 common stay separate, and questions in other words need the meaning table:
 there Stratum matches Holo, it doesn't beat it.
 
