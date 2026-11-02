@@ -54,6 +54,10 @@ const cms_rows = 2;
 const lane_shift = 40;
 /// Where a lane's header holds its published end.
 const pub_end_at = 128;
+/// Lane format version, a u32 in the lane header. Lanes without it were
+/// written by an older layout and are refused, never repaired.
+const format_at = 136;
+const format_version: u32 = 2;
 /// Lanes grow in steps of a quarter of their size, 4 MB to 256 MB.
 const grow_min: u64 = 4 << 20;
 const grow_max: u64 = 32 << 20;
@@ -211,6 +215,12 @@ const Lane = struct {
     heads: []u32,
     /// The lane's word code.
     vocab: tables.Vocab = .{},
+    /// Its words records (off8), in order: snapshots list these instead
+    /// of copying words, so an erased word stays erased.
+    words_recs: std.ArrayList(u32) = .empty,
+    /// No writer held it when we opened it (we hold its lock until it is
+    /// read): read it by its records, not by its published end.
+    idle: bool = false,
 
     /// The end its writer published: readers never look past it, so they
     /// never see a record that is still being written.
@@ -245,6 +255,15 @@ syncs: std.atomic.Value(u64) = .init(0),
 last_refresh: std.atomic.Value(u64) = .init(0),
 /// A failed write could not be undone: further writes are refused.
 broken: bool = false,
+/// Bytes erased in place since the last sync: [erase_lo, erase_hi).
+/// Written under the write lock; `erase_pending` tells sync to look.
+erase_pending: bool = false,
+erase_lo: u64 = std.math.maxInt(u64),
+erase_hi: u64 = 0,
+/// Our lane's word code: per code, live memories using it, and where the
+/// word's bytes are in the lane (writer only).
+word_refs: std.ArrayList(u32) = .empty,
+word_at: std.ArrayList(u64) = .empty,
 /// Size of our lane file: space past `end` is reserved ahead, so writes
 /// go straight into the map and a flush has no size change to record.
 alloc: u64 = data_start,
@@ -313,12 +332,16 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     w.me = me orelse return error.TooManyWriters;
     {
         errdefer own.close(io);
-        var len = try own.length(io);
+        const len = try own.length(io);
         if (len < data_start) {
-            const zeros: [data_start]u8 = @splat(0);
-            try own.writePositionalAll(io, &zeros, 0);
+            var head: [data_start]u8 = @splat(0);
+            std.mem.writeInt(u32, head[format_at..][0..4], format_version, .little);
+            try own.writePositionalAll(io, &head, 0);
             try own.sync(io);
-            len = data_start;
+        } else {
+            var v: [4]u8 = undefined;
+            if (try own.readPositionalAll(io, &v, format_at) != 4) return error.Corrupt;
+            if (std.mem.readInt(u32, &v, .little) != format_version) return error.UnsupportedFormat;
         }
     }
     // Open every lane that exists (lanes are created in order, no gaps).
@@ -364,13 +387,14 @@ fn loadTables(w: *Stratum) !void {
 /// the tables from disk. If that fails too, the handle refuses writes.
 /// Caller holds the write lock.
 fn recoverFailedWrite(w: *Stratum, start: u64, len: u64) void {
+    // Readers may already hold offsets into the batch: keep them out (and
+    // wait for those inside) before clearing it and rebuilding the tables.
+    w.readers.close(w.io);
+    defer w.readers.open(w.io);
     @memset(w.ownBytes()[start..][0..len], 0);
     // Bytes before `start` that were never flushed must still be flushed
     // by the next sync.
     const synced = w.synced.load(.acquire);
-    // Rebuilding changes the tables in place: keep readers out meanwhile.
-    w.readers.close(w.io);
-    defer w.readers.open(w.io);
     w.resetTables();
     w.loadTables() catch {
         w.broken = true;
@@ -390,12 +414,30 @@ fn addLane(w: *Stratum, file: Io.File, writable: bool) !void {
 /// Opens lane `i` for reading. False when it does not exist.
 fn openLane(w: *Stratum, i: usize) !bool {
     var nb: [32]u8 = undefined;
-    const f = w.dir.openFile(w.io, laneName(&nb, i), .{}) catch |err| switch (err) {
+    // A lane no writer holds may have records past the end it published
+    // (that field is not flushed with them): hold its lock until it has
+    // been read by its records.
+    var idle = true;
+    const f = w.dir.openFile(w.io, laneName(&nb, i), .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
         error.FileNotFound => return false,
+        error.WouldBlock => blk: {
+            idle = false;
+            break :blk w.dir.openFile(w.io, laneName(&nb, i), .{}) catch |e2| switch (e2) {
+                error.FileNotFound => return false,
+                else => |e| return e,
+            };
+        },
         else => |e| return e,
     };
     errdefer f.close(w.io);
+    const len = try f.length(w.io);
+    if (len >= data_start) {
+        var v: [4]u8 = undefined;
+        if (try f.readPositionalAll(w.io, &v, format_at) != 4) return error.Corrupt;
+        if (std.mem.readInt(u32, &v, .little) != format_version) return error.UnsupportedFormat;
+    }
     try w.addLane(f, false);
+    w.lanes[w.nlanes - 1].idle = idle;
     return true;
 }
 
@@ -413,7 +455,12 @@ fn resetTables(w: *Stratum) void {
     w.scopes.clear(gpa);
     w.codes.clearRetainingCapacity();
     @memset(w.seen, 0);
-    for (w.lanes[0..w.nlanes]) |*l| l.vocab.clear(gpa);
+    for (w.lanes[0..w.nlanes]) |*l| {
+        l.vocab.clear(gpa);
+        l.words_recs.clearRetainingCapacity();
+    }
+    w.word_refs.clearRetainingCapacity();
+    w.word_at.clearRetainingCapacity();
     w.scope_map.clearRetainingCapacity(gpa);
     w.scope_heads.clearRetainingCapacity(gpa);
     for (w.rules.items) |r| gpa.free(r.name);
@@ -430,8 +477,11 @@ fn freeAll(w: *Stratum) void {
     w.seen = &.{};
     w.scratch.deinit(gpa);
     w.enc_buf.deinit(gpa);
+    w.word_refs.deinit(gpa);
+    w.word_at.deinit(gpa);
     for (w.lanes[0..w.nlanes]) |*l| {
         l.vocab.deinit(gpa);
+        l.words_recs.deinit(gpa);
         gpa.free(l.heads);
         std.posix.munmap(l.map);
         l.file.close(w.io);
@@ -739,6 +789,7 @@ fn apply(w: *Stratum, lane: usize, off8: u32, h: *const Hdr, hashes: ?[]const u6
             w.scopes.bump(sid);
             try w.linkVersions(id, h, w.subjectOf(id, h));
             if (h.kind == .memory) {
+                if (lane == w.me and h.flags & flag_coded != 0 and w.textIntact(id, h)) w.countCodes(w.storedText(id, h), 1);
                 if (hashes) |hs| {
                     for (hs) |x| w.bumpDf(x);
                 } else if (w.textInto(w.gpa, id, h, &w.scratch)) |body| {
@@ -762,22 +813,108 @@ fn apply(w: *Stratum, lane: usize, off8: u32, h: *const Hdr, hashes: ?[]const u6
             try w.mput(&w.forgotten, target, 1);
             if (laneOf(target) == w.me) try w.eraseOwn(offOf(target));
         },
-        .words => try w.learnWords(lane, w.storedText(id, h)),
+        .words => try w.learnWords(lane, off8, h),
         .snapshot => {},
         _ => {},
     }
 }
 
-/// Adds a words record's words to a lane's word code.
-fn learnWords(w: *Stratum, lane: usize, payload: []const u8) !void {
+/// Adds a words record's words to a lane's word code. An erased word
+/// (zeros) keeps its code, so later codes stay in place, but is never used.
+fn learnWords(w: *Stratum, lane: usize, off8: u32, h: *const Hdr) !void {
+    const payload = w.storedText(idOf(lane, off8), h);
+    const base = (@as(u64, off8) << 3) + textStart(h);
+    try w.lanes[lane].words_recs.append(w.gpa, off8);
     var p: usize = 0;
     while (p < payload.len) {
         const n = payload[p];
         if (n == 0 or p + 1 + n > payload.len) break;
         const word = payload[p + 1 ..][0..n];
         const code = try w.lanes[lane].vocab.append(w.gpa, word);
-        if (lane == w.me) try w.codes.put(w.gpa, w.lanes[lane].vocab.get(code).?, code);
+        if (lane == w.me) {
+            try w.word_at.append(w.gpa, base + p + 1);
+            try w.word_refs.append(w.gpa, 0);
+            if (word[0] != 0) try w.codes.put(w.gpa, w.lanes[lane].vocab.get(code).?, code);
+        }
         p += 1 + n;
+    }
+}
+
+/// Our own words just written in a words record at `off` (the encoder
+/// already gave them codes).
+fn noteOwnWords(w: *Stratum, off: u64, rec: []const u8) !void {
+    const h: *const Hdr = @ptrCast(@alignCast(rec[0..hdr_len]));
+    try w.lanes[w.me].words_recs.append(w.gpa, @intCast(off >> 3));
+    const payload = rec[textStart(h)..][0..h.text_len];
+    var p: usize = 0;
+    while (p < payload.len) {
+        const n = payload[p];
+        if (n == 0) break;
+        try w.word_at.append(w.gpa, off + textStart(h) + p + 1);
+        try w.word_refs.append(w.gpa, 0);
+        p += 1 + n;
+    }
+}
+
+/// Records bytes erased in place, for the next sync. Caller holds the
+/// write lock.
+fn noteErased(w: *Stratum, lo: u64, hi: u64) void {
+    w.erase_lo = @min(w.erase_lo, lo);
+    w.erase_hi = @max(w.erase_hi, hi);
+    @atomicStore(bool, &w.erase_pending, true, .release);
+}
+
+fn textIntact(w: *const Stratum, id: u64, h: *const Hdr) bool {
+    return Crc.hash(w.storedText(id, h)) == h.text_crc;
+}
+
+/// Adds `delta` to the use count of every code in a coded text of ours.
+fn countCodes(w: *Stratum, enc: []const u8, delta: i2) void {
+    var i: usize = 0;
+    while (i < enc.len) {
+        const op = enc[i];
+        if (op >= 0xC0) {
+            i += 2 + @as(usize, op & 0x3F);
+            continue;
+        }
+        var code: usize = op;
+        i += 1;
+        if (op >= 0x80) {
+            if (i >= enc.len) return;
+            code = 128 + ((@as(usize, op & 0x3F) << 8) | enc[i]);
+            i += 1;
+        }
+        if (code >= w.word_refs.items.len) continue;
+        const r = &w.word_refs.items[code];
+        r.* = if (delta > 0) r.* +| 1 else r.* -| 1;
+    }
+}
+
+/// Erases our words that no live memory uses any more, in the lane and in
+/// RAM, so forgetting a memory forgets its rare words too. Writer only.
+fn eraseUnusedWords(w: *Stratum, enc: []const u8) !void {
+    var i: usize = 0;
+    while (i < enc.len) {
+        const op = enc[i];
+        if (op >= 0xC0) {
+            i += 2 + @as(usize, op & 0x3F);
+            continue;
+        }
+        var code: usize = op;
+        i += 1;
+        if (op >= 0x80) {
+            if (i >= enc.len) return;
+            code = 128 + ((@as(usize, op & 0x3F) << 8) | enc[i]);
+            i += 1;
+        }
+        if (code >= w.word_refs.items.len or w.word_refs.items[code] != 0) continue;
+        const word = w.lanes[w.me].vocab.get(code) orelse continue;
+        if (word.len == 0 or word[0] == 0) continue;
+        _ = w.codes.remove(word);
+        var zeros: [wordcode.max_word]u8 = @splat(0);
+        try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..word.len], w.word_at.items[code]);
+        @memset(@constCast(word), 0);
+        w.noteErased(w.word_at.items[code], w.word_at.items[code] + word.len);
     }
 }
 
@@ -799,7 +936,8 @@ fn replayLane(w: *Stratum, lane: usize, from: u64, own: bool) !void {
     const size = try w.lanes[lane].file.length(w.io);
     // Another writer's lane: only what it published (it may be writing
     // past that). A lane that never published is read by its records.
-    const published = if (own) 0 else w.lanes[lane].published();
+    const idle = w.lanes[lane].idle;
+    const published = if (own or idle) 0 else w.lanes[lane].published();
     const len = if (published >= data_start) @min(published, size) else size;
     var pos = @max(from, data_start);
     while (w.validAt(lane, pos, len)) |h| {
@@ -821,6 +959,11 @@ fn replayLane(w: *Stratum, lane: usize, from: u64, own: bool) !void {
             p += n;
         }
         w.publish();
+    } else if (idle) {
+        // Read: let a writer claim it again. (Closing would not drop the
+        // lock: the map keeps the file open.)
+        w.lanes[lane].file.unlock(w.io);
+        w.lanes[lane].idle = false;
     }
 }
 
@@ -934,7 +1077,7 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
         walked += 1;
         const b = bucketOf(key);
         for (0..w.laneCount()) |lane| {
-            var p = w.lanes[lane].heads[b];
+            var p = @atomicLoad(u32, &w.lanes[lane].heads[b], .acquire);
             var steps: usize = 0;
             while (p != 0 and steps < 64) : (steps += 1) {
                 const id = idOf(lane, p);
@@ -1000,7 +1143,11 @@ fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]cons
     const coded = enc_len < it.text.len;
     const body = if (coded) w.enc_buf.items[0..enc_len] else it.text;
     var used: usize = 0;
-    if (coder.new_words.items.len > 0) used = w.wordsRecord(room, coder.new_words.items);
+    if (coder.new_words.items.len > 0) {
+        used = w.wordsRecord(room, coder.new_words.items);
+        try w.noteOwnWords(off, room[0..used]);
+    }
+    if (coded) w.countCodes(body, 1);
 
     const off8: u32 = @intCast((off + used) >> 3);
     const heads = w.lanes[w.me].heads;
@@ -1219,6 +1366,22 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
 /// side (the disk runs several flushes at once) and none is acknowledged
 /// before everything written ahead of it is on disk.
 pub fn sync(w: *Stratum) !void {
+    // Erasures overwrite bytes below the synced end: flush those too.
+    if (@atomicLoad(bool, &w.erase_pending, .acquire)) {
+        w.wlock.lockUncancelable(w.io);
+        const lo = w.erase_lo;
+        const hi = w.erase_hi;
+        w.erase_lo = std.math.maxInt(u64);
+        w.erase_hi = 0;
+        @atomicStore(bool, &w.erase_pending, false, .release);
+        w.wlock.unlock(w.io);
+        if (hi > lo) w.flushOwn(lo, hi) catch |e| {
+            w.wlock.lockUncancelable(w.io);
+            w.noteErased(lo, hi);
+            w.wlock.unlock(w.io);
+            return e;
+        };
+    }
     const target = w.end.load(.acquire);
     const floor = w.synced.load(.acquire);
     if (floor >= target) return;
@@ -1317,6 +1480,11 @@ fn eraseOwn(w: *Stratum, off8: u32) !void {
     if (h.kind != .memory) return;
     const n = h.text_len;
     const at = (@as(u64, off8) << 3) + textStart(h);
+    // Words only this memory used go with it.
+    const words_go = h.flags & flag_coded != 0 and w.textIntact(id, h);
+    if (words_go) w.countCodes(w.storedText(id, h), -1);
+    if (words_go) try w.eraseUnusedWords(w.storedText(id, h));
+    w.noteErased(@as(u64, off8) << 3, at + n);
     var zeros: [4096]u8 = @splat(0);
     var done: usize = 0;
     while (done < n) {
@@ -1489,12 +1657,14 @@ fn recentFiltered(w: *Stratum, gpa: Allocator, scope: []const u8, n: usize, skip
     w.readers.enter(w.io);
     defer w.readers.leave(w.io);
     const sid = w.findScope(scope) orelse return out.toOwnedSlice(gpa);
+    // Lanes can appear meanwhile: read the ones there were at the start.
+    const nl = w.laneCount();
     var cur: [max_lanes]u32 = undefined;
-    for (0..w.laneCount()) |l| cur[l] = w.scopeHead(sid, l);
+    for (0..nl) |l| cur[l] = w.scopeHead(sid, l);
     while (out.items.len < n) {
         // Most recently written across lanes.
         var bl: ?usize = null;
-        for (0..w.laneCount()) |l| {
+        for (0..nl) |l| {
             if (cur[l] == 0) continue;
             if (bl == null or w.laterWrite(idOf(l, cur[l]), idOf(bl.?, cur[bl.?]))) bl = l;
         }
@@ -1736,7 +1906,8 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     // be (with slack), else follow chains and filter by scope.
     const est_chain: u64 = @as(u64, w.df(qt[0].hash)) + 1;
     if (!set.all and set.total <= 65536 and set.total <= @max(est_chain * 4, 4096)) {
-        for (0..w.scopes.len()) |i| {
+        // Scopes added since the set was made are not in it.
+        for (0..set.bits.bit_length) |i| {
             if (!set.bits.isSet(i)) continue;
             for (0..w.laneCount()) |lane| {
                 var p = w.scopeHead(i, lane);
@@ -2158,7 +2329,7 @@ fn snapshotLocked(w: *Stratum) !void {
     defer b.deinit(gpa);
     try b.appendNTimes(gpa, 0, hdr_len);
     const body_start = b.items.len;
-    try putInt(gpa, &b, u32, 2);
+    try putInt(gpa, &b, u32, 3);
     try putInt(gpa, &b, u32, @intCast(w.nlanes));
     for (w.lanes[0..w.nlanes]) |l| {
         try putInt(gpa, &b, u64, l.end);
@@ -2204,16 +2375,15 @@ fn snapshotLocked(w: *Stratum) !void {
     try putInt(gpa, &b, u32, @intCast(w.forgotten.count()));
     var fit = w.forgotten.iterator();
     while (fit.next()) |e| try putInt(gpa, &b, u64, e.key);
-    // Each lane's word code, in code order.
+    // Each lane's word code, as its words records (never the words
+    // themselves, so an erased word is not copied), then our use counts.
     for (w.lanes[0..w.nlanes]) |*l| {
-        const nv = l.vocab.len();
-        try putInt(gpa, &b, u32, @intCast(nv));
-        for (0..nv) |i| {
-            const word = l.vocab.get(i).?;
-            try putInt(gpa, &b, u8, @intCast(word.len));
-            try b.appendSlice(gpa, word);
-        }
+        try putInt(gpa, &b, u32, @intCast(l.words_recs.items.len));
+        for (l.words_recs.items) |r| try putInt(gpa, &b, u32, r);
     }
+    try putInt(gpa, &b, u32, @intCast(w.me));
+    try putInt(gpa, &b, u32, @intCast(w.word_refs.items.len));
+    for (w.word_refs.items) |r| try putInt(gpa, &b, u32, r);
     const payload = b.items.len - body_start;
     const len = std.mem.alignForward(usize, b.items.len, 8);
     try b.appendNTimes(gpa, 0, len - b.items.len);
@@ -2278,7 +2448,7 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
             return s;
         }
     };
-    if (try rd.int(data, &p, u32) != 2) return error.Corrupt;
+    if (try rd.int(data, &p, u32) != 3) return error.Corrupt;
     const nl = try rd.int(data, &p, u32);
     if (nl > w.nlanes) return error.Corrupt;
     var from: [max_lanes]u64 = @splat(data_start);
@@ -2331,14 +2501,26 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
     try w.forgotten.ensureTotalCapacity(gpa, &w.readers, w.io, nf);
     for (0..nf) |_| try w.mput(&w.forgotten, try rd.int(data, &p, u64), 1);
     for (0..nl) |l| {
-        const nv = try rd.int(data, &p, u32);
-        if (nv > tables.Vocab.max) return error.Corrupt;
-        for (0..nv) |_| {
-            const wl = try rd.int(data, &p, u8);
-            if (wl == 0) return error.Corrupt;
-            const word = try rd.bytes(data, &p, wl);
-            const code = try w.lanes[l].vocab.append(gpa, word);
-            if (l == w.me) try w.codes.put(gpa, w.lanes[l].vocab.get(code).?, code);
+        const nwr = try rd.int(data, &p, u32);
+        for (0..nwr) |_| {
+            const off8 = try rd.int(data, &p, u32);
+            const pos = @as(u64, off8) << 3;
+            const wh = w.validAt(l, pos, from[l]) orelse return error.Corrupt;
+            if (wh.kind != .words) return error.Corrupt;
+            try w.learnWords(l, off8, wh);
+        }
+    }
+    const refs_lane = try rd.int(data, &p, u32);
+    const nrefs = try rd.int(data, &p, u32);
+    if (refs_lane == w.me and nrefs == w.word_refs.items.len) {
+        for (w.word_refs.items) |*r| r.* = try rd.int(data, &p, u32);
+    } else {
+        // Written by another writer: count our lane's codes up to the
+        // snapshot point (the records after it are counted on replay).
+        var pos: u64 = data_start;
+        while (w.validAt(w.me, pos, from[w.me])) |mh| : (pos += mh.len) {
+            const id = idOf(w.me, @intCast(pos >> 3));
+            if (mh.kind == .memory and mh.flags & flag_coded != 0 and w.textIntact(id, mh)) w.countCodes(w.storedText(id, mh), 1);
         }
     }
     for (0..w.laneCount()) |l| w.lanes[l].end = from[l];
@@ -2716,4 +2898,88 @@ test "the word code: smaller lanes, same text for every reader, before and after
         defer m.deinit(testing.allocator);
         try testing.expectEqualStrings(try std.fmt.bufPrint(&more, "{s} again{d}", .{ phrase, round }), m.text);
     }
+}
+
+test "forgetting erases words only forgotten memories used, also after a snapshot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ids: [3]u64 = undefined;
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        // "custsecretx" and "kept" are coded from the second memory on.
+        for (&ids) |*id| id.* = try w.remember("s", "the token custsecretx is kept here ", .{});
+        _ = try w.remember("t", "kept here too ", .{});
+        try w.snapshot();
+        for (ids) |id| try w.forget(id);
+        try w.sync();
+        const k = (try w.recall(testing.allocator, .{ .about = "kept", .limit = 5 }));
+        defer freeHits(testing.allocator, k);
+        try testing.expectEqual(@as(usize, 1), k.len);
+        try testing.expectEqualStrings("kept here too ", k[0].memory.text);
+        try w.snapshot();
+    }
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    const bytes = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "custsecretx") == null);
+    // Words still in use survive, and reopening reads them.
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const k = (try w.recall(testing.allocator, .{ .about = "kept", .limit = 5 }));
+    defer freeHits(testing.allocator, k);
+    try testing.expectEqualStrings("kept here too ", k[0].memory.text);
+    const again = try w.remember("s", "custsecretx is back custsecretx again ", .{});
+    const m = (try w.get(testing.allocator, again)).?;
+    defer m.deinit(testing.allocator);
+    try testing.expectEqualStrings("custsecretx is back custsecretx again ", m.text);
+}
+
+test "a lane from an older layout is refused, not repaired" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        _ = try w.remember("s", "keep me", .{});
+    }
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    {
+        var f = try sub.openFile(testing.io, "lane-000.sdm", .{ .mode = .read_write });
+        defer f.close(testing.io);
+        const zero: [4]u8 = @splat(0);
+        try f.writePositionalAll(testing.io, &zero, format_at);
+    }
+    const before = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(before);
+    try testing.expectError(error.UnsupportedFormat, tmpStore(&tmp, null));
+    const after = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "an idle lane is read past the end it published" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const a = try tmpStore(&tmp, null);
+        defer a.close();
+        const b = try tmpStore(&tmp, null);
+        defer b.close();
+        _ = try b.remember("s", "one quokka", .{});
+        _ = try b.remember("s", "two quokka", .{});
+        try b.sync();
+        // As after a power cut: the records reached the disk, the
+        // published end did not.
+        const p: *u64 = @ptrCast(@alignCast(b.ownBytes()[pub_end_at..][0..8]));
+        p.* = data_start;
+    }
+    const a = try tmpStore(&tmp, null);
+    defer a.close();
+    try testing.expect(a.me == 0);
+    const hits = try a.recall(testing.allocator, .{ .about = "quokka", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 2), hits.len);
 }
