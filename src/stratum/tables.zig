@@ -375,3 +375,51 @@ test "map: readers during growth" {
     for (ths) |t| t.join();
     try std.testing.expectEqual(@as(?u64, 39998), m.get(19999));
 }
+
+/// A lane's word code: code -> word. Append only; entries never move.
+pub const Vocab = struct {
+    const chunk_bits = 10;
+    const chunk = 1 << chunk_bits;
+    /// 128 one-byte codes and 16384 two-byte codes.
+    pub const max = 128 + (1 << 14);
+
+    chunks: [(max + chunk - 1) / chunk]?*[chunk][]const u8 = @splat(null),
+    n: usize = 0,
+    bytes: usize = 0,
+
+    pub fn len(v: *const Vocab) usize {
+        return @atomicLoad(usize, &v.n, .acquire);
+    }
+
+    pub fn get(v: *const Vocab, code: usize) ?[]const u8 {
+        if (code >= v.len()) return null;
+        return v.chunks[code >> chunk_bits].?[code & (chunk - 1)];
+    }
+
+    /// Writer only. Returns the new word's code.
+    pub fn append(v: *Vocab, gpa: Allocator, word: []const u8) !u16 {
+        const id = v.n;
+        if (id >= max) return error.VocabFull;
+        if (v.chunks[id >> chunk_bits] == null) v.chunks[id >> chunk_bits] = try gpa.create([chunk][]const u8);
+        const copy = try gpa.dupe(u8, word);
+        v.chunks[id >> chunk_bits].?[id & (chunk - 1)] = copy;
+        v.bytes += word.len;
+        @atomicStore(usize, &v.n, id + 1, .release);
+        return @intCast(id);
+    }
+
+    /// Only with readers kept out.
+    pub fn clear(v: *Vocab, gpa: Allocator) void {
+        for (0..v.n) |i| gpa.free(v.chunks[i >> chunk_bits].?[i & (chunk - 1)]);
+        v.n = 0;
+        v.bytes = 0;
+    }
+
+    pub fn deinit(v: *Vocab, gpa: Allocator) void {
+        v.clear(gpa);
+        for (&v.chunks) |*c| if (c.*) |p| {
+            gpa.destroy(p);
+            c.* = null;
+        };
+    }
+};

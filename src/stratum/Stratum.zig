@@ -33,6 +33,7 @@ const Crc = std.hash.crc.@"CRC-32/ISCSI";
 const text = @import("../holo/text.zig");
 pub const Meaning = @import("../holo/Meaning.zig");
 const tables = @import("tables.zig");
+const wordcode = @import("wordcode.zig");
 
 const Stratum = @This();
 
@@ -55,22 +56,36 @@ const lane_shift = 40;
 const pub_end_at = 128;
 /// Lanes grow in steps of a quarter of their size, 4 MB to 256 MB.
 const grow_min: u64 = 4 << 20;
-const grow_max: u64 = 256 << 20;
+const grow_max: u64 = 32 << 20;
 
-const Kind = enum(u8) { memory = 1, erased = 2, snapshot = 3, forget_scope = 4, settle = 5, forget_one = 6, _ };
+const Kind = enum(u8) { memory = 1, erased = 2, snapshot = 3, forget_scope = 4, settle = 5, forget_one = 6, words = 7, _ };
+/// `Hdr.flags`: the text is in the lane's word code.
+const flag_coded: u16 = 1;
+
+/// `Hdr.flags`: a u64 follows the header: the stratum root of a memory,
+/// or the target of a marker.
+const flag_link: u16 = 2;
+
+/// Lengths of the variable parts of a record.
+const Lens = packed struct(u32) {
+    scope: u11,
+    subject: u11,
+    /// Bytes of the threads: 3-byte keys, then a varint per key for the
+    /// distance back to the previous record in that key's bucket (0: none).
+    threads: u10,
+};
 
 /// Record header. Records start on 8-byte boundaries inside a lane.
+/// After it: [link u64 when flag_link] [threads] [scope] [subject] [text].
 const Hdr = extern struct {
     len: u32,
-    /// CRC-32C of the header (but not `kind`), threads, scope and subject.
+    /// CRC-32C of the header (but not `kind`), link, threads, scope and
+    /// subject.
     crc: u32,
     kind: Kind,
     nthreads: u8,
-    scope_len: u16,
-    subject_len: u16,
     flags: u16,
-    text_len: u32,
-    nterms: u32,
+    lens: Lens,
     /// Write order across writers (microseconds of the real clock, never
     /// repeats, never goes back in one writer). Forget and settle cutoffs
     /// compare it, so a backdated `time` cannot slip under a cutoff.
@@ -78,10 +93,8 @@ const Hdr = extern struct {
     /// When it happened (ms since the epoch), as the caller gave it.
     time: u64,
     scope_hash: u64,
-    /// First version of this record's stratum; 0: it is the first.
-    root: u64,
-    /// Markers: the record or cutoff they apply to.
-    target: u64,
+    text_len: u32,
+    nterms: u32,
     /// Previous record of the same scope in this lane (off8), 0: none.
     prev_scope: u32,
     /// CRC-32C of the text. A mismatch means the text was erased.
@@ -89,15 +102,54 @@ const Hdr = extern struct {
 };
 const hdr_len = @sizeOf(Hdr);
 comptime {
-    std.debug.assert(hdr_len == 72);
+    std.debug.assert(hdr_len == 56);
+    std.debug.assert(@offsetOf(Hdr, "kind") == 8);
 }
 
-fn threadKey(t: u64) u32 {
-    return @intCast(t & 0xff_ffff);
+/// Most bytes `nthreads` threads take.
+fn threadsBound(n: usize) usize {
+    return n * 8;
 }
-fn threadPrev(t: u64) u32 {
-    return @intCast(t >> 24);
+
+/// A record's threads, decoded.
+const Threads = struct {
+    n: usize = 0,
+    key: [term_threads]u32 = undefined,
+    prev: [term_threads]u32 = undefined,
+
+    /// The previous record in `bucket`'s chain, null: the record is not in it.
+    fn prevIn(t: *const Threads, bucket: u32) ?u32 {
+        for (t.key[0..t.n], t.prev[0..t.n]) |k, p| if (bucketOf(k) == bucket) return p;
+        return null;
+    }
+    fn has(t: *const Threads, key: u32) bool {
+        return std.mem.indexOfScalar(u32, t.key[0..t.n], key) != null;
+    }
+};
+
+/// Writes threads for a record at `self` (off8). Returns the bytes used.
+fn putThreads(out: []u8, self: u32, keys: []const u32, prevs: []const u32) usize {
+    var o: usize = 0;
+    for (keys) |k| {
+        std.mem.writeInt(u24, out[o..][0..3], @intCast(k), .little);
+        o += 3;
+    }
+    for (prevs) |p| {
+        var d: u32 = if (p == 0) 0 else self - p;
+        while (d >= 0x80) : (d >>= 7) {
+            out[o] = @as(u8, @truncate(d)) | 0x80;
+            o += 1;
+        }
+        out[o] = @intCast(d);
+        o += 1;
+    }
+    return o;
 }
+
+fn linkLen(h: *const Hdr) usize {
+    return if (h.flags & flag_link != 0) 8 else 0;
+}
+
 fn bucketOf(key: u32) u32 {
     return key & (nbuckets - 1);
 }
@@ -114,12 +166,16 @@ fn offOf(id: u64) u32 {
     return @intCast(id & ((1 << lane_shift) - 1));
 }
 
-fn recordLen(nthreads: usize, scope: usize, subject: usize, body: usize) usize {
-    return std.mem.alignForward(usize, hdr_len + nthreads * 8 + scope + subject + body, 8);
+fn recordLen(link: bool, threads: usize, scope: usize, subject: usize, body: usize) usize {
+    return std.mem.alignForward(usize, hdr_len + @as(usize, if (link) 8 else 0) + threads + scope + subject + body, 8);
 }
 
 fn textStart(h: *const Hdr) usize {
-    return hdr_len + @as(usize, h.nthreads) * 8 + h.scope_len + h.subject_len;
+    return scopeStart(h) + @as(usize, h.lens.scope) + h.lens.subject;
+}
+
+fn scopeStart(h: *const Hdr) usize {
+    return hdr_len + linkLen(h) + h.lens.threads;
 }
 
 fn metaCrc(rec: []const u8, h: *const Hdr) u32 {
@@ -153,6 +209,8 @@ const Lane = struct {
     /// Records before this offset are applied to the RAM tables.
     end: u64 = data_start,
     heads: []u32,
+    /// The lane's word code.
+    vocab: tables.Vocab = .{},
 
     /// The end its writer published: readers never look past it, so they
     /// never see a record that is still being written.
@@ -207,6 +265,14 @@ scope_map: tables.Map = .{},
 /// (scope id << 8 | lane) -> newest record of the scope in that lane.
 scope_heads: tables.Map = .{},
 rules: std.ArrayList(Rule) = .empty,
+/// Word -> code in our lane's word code (writer only).
+codes: std.StringHashMapUnmanaged(u16) = .empty,
+/// Word sightings, for giving codes to words seen twice (writer only).
+seen: []u8 = &.{},
+/// Decoding scratch for the writer.
+scratch: std.ArrayList(u8) = .empty,
+/// Encoding scratch for the writer.
+enc_buf: std.ArrayList(u8) = .empty,
 /// (scope, subject) -> newest record with that subject.
 subjects: tables.Map = .{},
 /// Stratum root -> its newest version, for strata with two or more.
@@ -228,6 +294,8 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     errdefer gpa.destroy(w);
     w.* = .{ .gpa = gpa, .io = io, .dir = dir, .options = options, .cms = cms };
     errdefer w.freeAll();
+    w.seen = try gpa.alloc(u8, wordcode.seen_len);
+    @memset(w.seen, 0);
 
     // Claim the first lane no other writer holds. The OS drops the lock if
     // its holder dies, so a crashed writer's lane is reused.
@@ -343,6 +411,9 @@ fn resetTables(w: *Stratum) void {
     w.last_stamp = 0;
     w.merges = 0;
     w.scopes.clear(gpa);
+    w.codes.clearRetainingCapacity();
+    @memset(w.seen, 0);
+    for (w.lanes[0..w.nlanes]) |*l| l.vocab.clear(gpa);
     w.scope_map.clearRetainingCapacity(gpa);
     w.scope_heads.clearRetainingCapacity(gpa);
     for (w.rules.items) |r| gpa.free(r.name);
@@ -354,7 +425,13 @@ fn resetTables(w: *Stratum) void {
 
 fn freeAll(w: *Stratum) void {
     const gpa = w.gpa;
-    for (w.lanes[0..w.nlanes]) |l| {
+    w.codes.deinit(gpa);
+    gpa.free(w.seen);
+    w.seen = &.{};
+    w.scratch.deinit(gpa);
+    w.enc_buf.deinit(gpa);
+    for (w.lanes[0..w.nlanes]) |*l| {
+        l.vocab.deinit(gpa);
         gpa.free(l.heads);
         std.posix.munmap(l.map);
         l.file.close(w.io);
@@ -420,17 +497,52 @@ fn hdrAt(w: *const Stratum, id: u64) *const Hdr {
 fn recBytes(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
     return w.bytesAt(id)[0..h.len];
 }
-fn threadsOf(w: *const Stratum, id: u64, h: *const Hdr) []align(1) const u64 {
-    return std.mem.bytesAsSlice(u64, w.recBytes(id, h)[hdr_len..][0 .. @as(usize, h.nthreads) * 8]);
+fn threadsOf(w: *const Stratum, id: u64, h: *const Hdr) Threads {
+    var t: Threads = .{ .n = @min(h.nthreads, term_threads) };
+    const b = w.recBytes(id, h)[hdr_len + linkLen(h) ..][0..h.lens.threads];
+    var o: usize = 0;
+    for (0..t.n) |i| {
+        t.key[i] = std.mem.readInt(u24, b[o..][0..3], .little);
+        o += 3;
+    }
+    const self = offOf(id);
+    for (0..t.n) |i| {
+        var d: u32 = 0;
+        var shift: u5 = 0;
+        while (o < b.len) {
+            const c = b[o];
+            o += 1;
+            d |= @as(u32, c & 0x7f) << shift;
+            if (c < 0x80 or shift >= 28) break;
+            shift += 7;
+        }
+        t.prev[i] = if (d == 0 or d > self) 0 else self - d;
+    }
+    return t;
+}
+fn linkOf(w: *const Stratum, id: u64, h: *const Hdr) u64 {
+    if (h.flags & flag_link == 0) return 0;
+    return std.mem.readInt(u64, w.recBytes(id, h)[hdr_len..][0..8], .little);
 }
 fn scopeOf(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
-    return w.recBytes(id, h)[hdr_len + @as(usize, h.nthreads) * 8 ..][0..h.scope_len];
+    return w.recBytes(id, h)[scopeStart(h)..][0..h.lens.scope];
 }
 fn subjectOf(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
-    return w.recBytes(id, h)[hdr_len + @as(usize, h.nthreads) * 8 + h.scope_len ..][0..h.subject_len];
+    return w.recBytes(id, h)[scopeStart(h) + h.lens.scope ..][0..h.lens.subject];
 }
-fn textOf(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
+/// The text as stored: in the word code when `flag_coded` is set.
+fn storedText(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
     return w.recBytes(id, h)[textStart(h)..][0..h.text_len];
+}
+
+/// The text, decoded into `buf` when it is coded. error.Corrupt: the
+/// codes do not decode (the text was erased under us).
+fn textInto(w: *const Stratum, gpa: Allocator, id: u64, h: *const Hdr, buf: *std.ArrayList(u8)) ![]const u8 {
+    const stored = w.storedText(id, h);
+    if (h.flags & flag_coded == 0) return stored;
+    buf.clearRetainingCapacity();
+    try wordcode.decode(&w.lanes[laneOf(id)].vocab, stored, gpa, buf);
+    return buf.items;
 }
 
 /// Is a record newer than another? By event time, then write order.
@@ -449,8 +561,9 @@ fn laterWrite(w: *const Stratum, a: u64, b: u64) bool {
     return sa > sb or (sa == sb and a > b);
 }
 
-fn rootOf(h: *const Hdr, id: u64) u64 {
-    return if (h.root != 0) h.root else id;
+fn rootOf(w: *const Stratum, id: u64, h: *const Hdr) u64 {
+    const r = w.linkOf(id, h);
+    return if (r != 0) r else id;
 }
 
 // ------------------------------------------------------------------ scopes
@@ -584,7 +697,7 @@ fn alive(w: *const Stratum, id: u64, h: *const Hdr) bool {
     if (w.forgotten.contains(id)) return false;
     const sid = w.sidOf(h.scope_hash) orelse return false;
     if (h.stamp < w.scopes.forgot(sid)) return false;
-    return Crc.hash(w.textOf(id, h)) == h.text_crc;
+    return Crc.hash(w.storedText(id, h)) == h.text_crc;
 }
 
 /// Replaced by a newer version of its fact, or settled.
@@ -601,13 +714,13 @@ fn isBuried(w: *const Stratum, id: u64, h: *const Hdr) bool {
 /// when the newer one was forgotten.
 fn headOf(w: *const Stratum, id: u64, h: *const Hdr) u64 {
     var head = id;
-    if (h.subject_len > 0) {
+    if (h.lens.subject > 0) {
         if (w.subjects.get(subjectKey(h.scope_hash, w.subjectOf(id, h)))) |s| {
             if (s != id and w.alive(s, w.hdrAt(s)) and w.newer(s, id)) head = s;
         }
     }
     const hh = w.hdrAt(head);
-    const sh = w.strata.get(rootOf(hh, head)) orelse return head;
+    const sh = w.strata.get(w.rootOf(head, hh)) orelse return head;
     if (sh == head or !w.alive(sh, w.hdrAt(sh)) or !w.newer(sh, head)) return head;
     return sh;
 }
@@ -620,35 +733,51 @@ fn apply(w: *Stratum, lane: usize, off8: u32, h: *const Hdr, hashes: ?[]const u6
     switch (h.kind) {
         .memory, .erased => {
             const sid = try w.intern(w.scopeOf(id, h), h.scope_hash);
-            for (w.threadsOf(id, h)) |t| @atomicStore(u32, &w.lanes[lane].heads[bucketOf(threadKey(t))], off8, .release);
+            const th = w.threadsOf(id, h);
+            for (th.key[0..th.n]) |k| @atomicStore(u32, &w.lanes[lane].heads[bucketOf(k)], off8, .release);
             try w.mput(&w.scope_heads, (@as(u64, sid) << 8) | lane, off8);
             w.scopes.bump(sid);
             try w.linkVersions(id, h, w.subjectOf(id, h));
             if (h.kind == .memory) {
                 if (hashes) |hs| {
                     for (hs) |x| w.bumpDf(x);
-                } else {
+                } else if (w.textInto(w.gpa, id, h, &w.scratch)) |body| {
                     var ts: text.TermSet = .{};
-                    ts.fill(w.textOf(id, h));
+                    ts.fill(body);
                     for (ts.hashes[0..ts.len]) |x| w.bumpDf(x);
-                }
+                } else |_| {}
             }
             w.count += 1;
             w.total_terms += h.nterms;
         },
         .forget_scope, .settle => {
-            const name = w.recBytes(id, h)[hdr_len..][0..h.scope_len];
-            try w.addRule(h.kind, h.target, name);
+            const name = w.scopeOf(id, h);
+            try w.addRule(h.kind, w.linkOf(id, h), name);
             // Erasing is idempotent: redo it, in case the erase was cut
             // short by a crash, or the marker came from another writer.
-            if (h.kind == .forget_scope) try w.eraseScopeInOwnLane(name, h.target);
+            if (h.kind == .forget_scope) try w.eraseScopeInOwnLane(name, w.linkOf(id, h));
         },
         .forget_one => {
-            try w.mput(&w.forgotten, h.target, 1);
-            if (laneOf(h.target) == w.me) try w.eraseOwn(offOf(h.target));
+            const target = w.linkOf(id, h);
+            try w.mput(&w.forgotten, target, 1);
+            if (laneOf(target) == w.me) try w.eraseOwn(offOf(target));
         },
+        .words => try w.learnWords(lane, w.storedText(id, h)),
         .snapshot => {},
         _ => {},
+    }
+}
+
+/// Adds a words record's words to a lane's word code.
+fn learnWords(w: *Stratum, lane: usize, payload: []const u8) !void {
+    var p: usize = 0;
+    while (p < payload.len) {
+        const n = payload[p];
+        if (n == 0 or p + 1 + n > payload.len) break;
+        const word = payload[p + 1 ..][0..n];
+        const code = try w.lanes[lane].vocab.append(w.gpa, word);
+        if (lane == w.me) try w.codes.put(w.gpa, w.lanes[lane].vocab.get(code).?, code);
+        p += 1 + n;
     }
 }
 
@@ -811,18 +940,11 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
                 const id = idOf(lane, p);
                 const h = w.hdrAt(id);
                 const ts = w.threadsOf(id, h);
-                var next: u32 = 0;
-                for (ts) |t| if (bucketOf(threadKey(t)) == b) {
-                    next = threadPrev(t);
-                    break;
-                };
+                const next: u32 = ts.prevIn(b) orelse 0;
                 if (h.kind == .memory and h.scope_hash == scope_hash) {
                     var shared: usize = 0;
                     for (rare) |k| {
-                        for (ts) |t| if (threadKey(t) == k) {
-                            shared += 1;
-                            break;
-                        };
+                        if (ts.has(k)) shared += 1;
                     }
                     if (shared >= 3 and shared * 2 >= nrare and (shared > best_shared or (shared == best_shared and best != null and w.newer(id, best.?)))) {
                         if (w.alive(id, h)) {
@@ -842,68 +964,116 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
 /// and applies it. Caller holds the write lock, then writes `buf` at `off`.
 /// `lineage`: the version this memory continues, when the caller already
 /// looked it up (null: look it up now).
+/// Bytes `encode` may use for an item, at most.
+fn encodeBound(it: Item) usize {
+    const subject = if (it.subject) |x| x.len else 0;
+    return recordLen(true, threadsBound(term_threads), it.scope.len, subject, wordcode.bound(it.text.len)) + recordLen(false, 0, 0, 0, it.text.len);
+}
+
+/// Encodes one memory at `off` of our lane into `room`, picks its stratum
+/// and applies it; words that got a code go first, in a words record.
+/// Returns the bytes used and where the memory record starts. Caller
+/// holds the write lock.
 /// `hashes`: the memory's words, counted here unless null (counted by the
 /// caller outside the lock).
-fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: ?[]const u64, total: u32, keys: []const u32, dfs: []const u32, lineage: ??u64) !void {
+fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]const u64, total: u32, keys: []const u32, dfs: []const u32, lineage: ??u64) !struct { len: usize, rec: u64 } {
     const subject = it.subject orelse "";
     const sh = scopeHash(it.scope);
     const nk = keys.len;
 
     var root: u64 = 0;
     if (subject.len > 0) {
-        if (w.subjects.get(subjectKey(sh, subject))) |prev| root = rootOf(w.hdrAt(prev), prev);
+        if (w.subjects.get(subjectKey(sh, subject))) |prev| root = w.rootOf(prev, w.hdrAt(prev));
     } else if (lineage orelse w.findLineage(sh, keys, dfs)) |prev| {
-        root = rootOf(w.hdrAt(prev), prev);
+        root = w.rootOf(prev, w.hdrAt(prev));
         w.merges += 1;
     }
 
-    const off8: u32 = @intCast(off >> 3);
     const stamp = w.nextStamp();
     const sid = try w.intern(it.scope, sh);
+
+    // The text in the lane's word code, when that is shorter.
+    try w.enc_buf.resize(w.gpa, wordcode.bound(it.text.len));
+    var coder: wordcode.Encoder = .{ .gpa = w.gpa, .vocab = &w.lanes[w.me].vocab, .codes = &w.codes, .seen = w.seen };
+    defer coder.deinit();
+    const enc_len = try coder.encode(it.text, w.enc_buf.items);
+    const coded = enc_len < it.text.len;
+    const body = if (coded) w.enc_buf.items[0..enc_len] else it.text;
+    var used: usize = 0;
+    if (coder.new_words.items.len > 0) used = w.wordsRecord(room, coder.new_words.items);
+
+    const off8: u32 = @intCast((off + used) >> 3);
+    const heads = w.lanes[w.me].heads;
+    var prevs: [term_threads]u32 = undefined;
+    for (keys, 0..) |k, i| {
+        const b = bucketOf(k);
+        prevs[i] = heads[b];
+        // An earlier thread of this record in the same bucket: share its link.
+        for (0..i) |j| if (bucketOf(keys[j]) == b) {
+            prevs[i] = prevs[j];
+            break;
+        };
+    }
+    var tb: [threadsBound(term_threads)]u8 = undefined;
+    const tlen = putThreads(&tb, off8, keys, prevs[0..nk]);
+    const link = root != 0;
+    const buf = room[used..][0..recordLen(link, tlen, it.scope.len, subject.len, body.len)];
     const h: *Hdr = @ptrCast(@alignCast(buf[0..hdr_len]));
     h.* = .{
         .len = @intCast(buf.len),
         .crc = 0,
         .kind = .memory,
         .nthreads = @intCast(nk),
-        .scope_len = @intCast(it.scope.len),
-        .subject_len = @intCast(subject.len),
-        .flags = 0,
-        .text_len = @intCast(it.text.len),
+        .lens = .{ .scope = @intCast(it.scope.len), .subject = @intCast(subject.len), .threads = @intCast(tlen) },
+        .flags = (if (coded) flag_coded else 0) | (if (link) flag_link else 0),
+        .text_len = @intCast(body.len),
         .nterms = total,
         .stamp = stamp,
         .time = it.time orelse now,
         .scope_hash = sh,
-        .root = root,
-        .target = 0,
         .prev_scope = w.scopeHead(sid, w.me),
-        .text_crc = Crc.hash(it.text),
+        .text_crc = Crc.hash(body),
     };
-    const ts = std.mem.bytesAsSlice(u64, buf[hdr_len..][0 .. nk * 8]);
-    const heads = w.lanes[w.me].heads;
-    for (keys, 0..) |k, i| {
-        const b = bucketOf(k);
-        var prev = heads[b];
-        // An earlier thread of this record in the same bucket: share its link.
-        for (0..i) |j| if (bucketOf(keys[j]) == b) {
-            prev = threadPrev(ts[j]);
-            break;
-        };
-        ts[i] = (@as(u64, prev) << 24) | k;
+    var p: usize = hdr_len;
+    if (link) {
+        std.mem.writeInt(u64, buf[p..][0..8], root, .little);
+        p += 8;
     }
-    var p: usize = hdr_len + nk * 8;
+    @memcpy(buf[p..][0..tlen], tb[0..tlen]);
+    p += tlen;
     @memcpy(buf[p..][0..it.scope.len], it.scope);
     p += it.scope.len;
     @memcpy(buf[p..][0..subject.len], subject);
     p += subject.len;
-    @memcpy(buf[p..][0..it.text.len], it.text);
-    p += it.text.len;
+    @memcpy(buf[p..][0..body.len], body);
+    p += body.len;
     @memset(buf[p..], 0);
     h.crc = metaCrc(buf, h);
     // Only now, with the record complete, may readers reach it.
     for (keys) |k| @atomicStore(u32, &heads[bucketOf(k)], off8, .release);
     try w.applyWritten(off8, h);
     if (hashes) |hs| for (hs) |x| w.bumpDf(x);
+    return .{ .len = used + buf.len, .rec = off + used };
+}
+
+/// Writes a words record (each word: a length byte, then the word) at the
+/// start of `room`. Returns its length.
+fn wordsRecord(w: *Stratum, room: []u8, words: []const []const u8) usize {
+    var payload: usize = 0;
+    for (words) |x| payload += 1 + x.len;
+    const len = recordLen(false, 0, 0, 0, payload);
+    const buf = room[0..len];
+    var p: usize = hdr_len;
+    for (words) |x| {
+        buf[p] = @intCast(x.len);
+        @memcpy(buf[p + 1 ..][0..x.len], x);
+        p += 1 + x.len;
+    }
+    @memset(buf[p..], 0);
+    const h: *Hdr = @ptrCast(@alignCast(buf[0..hdr_len]));
+    h.* = .{ .len = @intCast(len), .crc = 0, .kind = .words, .nthreads = 0, .lens = .{ .scope = 0, .subject = 0, .threads = 0 }, .flags = 0, .text_len = @intCast(payload), .nterms = 0, .stamp = w.last_stamp, .time = 0, .scope_hash = 0, .prev_scope = 0, .text_crc = Crc.hash(buf[hdr_len..][0..payload]) };
+    h.crc = metaCrc(buf, h);
+    return len;
 }
 
 /// `apply` for a record we just encoded (its threads are already linked).
@@ -911,8 +1081,8 @@ fn applyWritten(w: *Stratum, off8: u32, h: *const Hdr) !void {
     const id = idOf(w.me, off8);
     w.last_stamp = @max(w.last_stamp, h.stamp);
     const buf: []const u8 = @as([*]const u8, @ptrCast(h))[0..h.len];
-    const scope = buf[hdr_len + @as(usize, h.nthreads) * 8 ..][0..h.scope_len];
-    const subject = buf[hdr_len + @as(usize, h.nthreads) * 8 + h.scope_len ..][0..h.subject_len];
+    const scope = buf[scopeStart(h)..][0..h.lens.scope];
+    const subject = buf[scopeStart(h) + h.lens.scope ..][0..h.lens.subject];
     const sid = try w.intern(scope, h.scope_hash);
     try w.mput(&w.scope_heads, (@as(u64, sid) << 8) | w.me, off8);
     w.scopes.bump(sid);
@@ -930,9 +1100,10 @@ fn linkVersions(w: *Stratum, id: u64, h: *const Hdr, subject: []const u8) !void 
         const cur = w.subjects.get(k);
         if (cur == null or w.newer(id, cur.?)) try w.mput(&w.subjects, k, id);
     }
-    if (h.root != 0) {
-        const cur = w.strata.get(h.root) orelse h.root;
-        if (w.newer(id, cur)) try w.mput(&w.strata, h.root, id) else if (w.strata.get(h.root) == null) try w.mput(&w.strata, h.root, cur);
+    const root = w.linkOf(id, h);
+    if (root != 0) {
+        const cur = w.strata.get(root) orelse root;
+        if (w.newer(id, cur)) try w.mput(&w.strata, root, id) else if (w.strata.get(root) == null) try w.mput(&w.strata, root, cur);
     }
 }
 
@@ -989,7 +1160,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
     for (errs) |e| if (e) |x| return x;
 
     var total: usize = 0;
-    for (items) |it| total += recordLen(term_threads, it.scope.len, if (it.subject) |s| s.len else 0, it.text.len);
+    for (items) |it| total += encodeBound(it);
     // One memory (an agent's turn): pick its threads and find the fact it
     // continues before taking the write lock, as a reader. A batch does
     // this under the lock, so its memories can continue each other.
@@ -1014,6 +1185,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
         errdefer w.recoverFailedWrite(start, total);
         const buf = w.ownBytes()[start..][0..total];
         var pos: usize = 0;
+        var first_rec: u64 = start;
         for (items, spans, 0..) |it, sp, i| {
             const hashes = pools[i / per].items[sp.start..][0..sp.len];
             var keys: [term_threads]u32 = undefined;
@@ -1026,14 +1198,14 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
                 nk = x.nk;
                 lineage = x.lineage;
             } else nk = w.chooseThreads(hashes, &keys, &dfs);
-            const len = recordLen(nk, it.scope.len, if (it.subject) |s| s.len else 0, it.text.len);
             // A batch counts words as it goes, so its later memories see
             // its earlier ones; a single memory counts after the lock.
-            try w.encode(buf[pos..][0..len], start + pos, it, now, if (pre == null) hashes else null, sp.total, keys[0..nk], dfs[0..nk], lineage);
-            pos += len;
+            const r = try w.encode(buf[pos..], start + pos, it, now, if (pre == null) hashes else null, sp.total, keys[0..nk], dfs[0..nk], lineage);
+            if (i == 0) first_rec = r.rec;
+            pos += r.len;
         }
         w.commitAppend(start + pos);
-        break :blk idOf(w.me, @intCast(start >> 3));
+        break :blk idOf(w.me, @intCast(first_rec >> 3));
     };
     // Word counts last, outside the lock.
     if (pre != null) for (pools[0].items[spans[0].start..][0..spans[0].len]) |x| w.bumpDf(x);
@@ -1066,7 +1238,7 @@ fn reserve(w: *Stratum, len: u64) !u64 {
     const off = w.end.load(.acquire);
     if (off + len >= map_reserve) return error.LaneFull;
     if (off + len > w.alloc) {
-        const step = std.math.clamp(w.alloc / 4, grow_min, grow_max);
+        const step = std.math.clamp(w.alloc / 16, grow_min, grow_max);
         const want = std.mem.alignForward(u64, @max(off + len, w.alloc + step), 4096);
         const size = @min(want, map_reserve);
         try w.lanes[w.me].file.setLength(w.io, size);
@@ -1112,14 +1284,15 @@ pub fn syncCount(w: *const Stratum) u64 {
 /// Appends a marker record to our lane and applies it. Caller holds the
 /// write lock.
 fn appendMarker(w: *Stratum, kind: Kind, scope: []const u8, target: u64) !void {
-    const len = recordLen(0, scope.len, 0, 0);
+    const len = recordLen(true, 0, scope.len, 0, 0);
     var stack: [1200]u8 align(8) = undefined;
     const buf = stack[0..len];
     const h: *Hdr = @ptrCast(@alignCast(buf[0..hdr_len]));
     const stamp = w.nextStamp();
-    h.* = .{ .len = @intCast(len), .crc = 0, .kind = kind, .nthreads = 0, .scope_len = @intCast(scope.len), .subject_len = 0, .flags = 0, .text_len = 0, .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .root = 0, .target = target, .prev_scope = 0, .text_crc = Crc.hash("") };
-    @memcpy(buf[hdr_len..][0..scope.len], scope);
-    @memset(buf[hdr_len + scope.len ..], 0);
+    h.* = .{ .len = @intCast(len), .crc = 0, .kind = kind, .nthreads = 0, .lens = .{ .scope = @intCast(scope.len), .subject = 0, .threads = 0 }, .flags = flag_link, .text_len = 0, .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .prev_scope = 0, .text_crc = Crc.hash("") };
+    std.mem.writeInt(u64, buf[hdr_len..][0..8], target, .little);
+    @memcpy(buf[hdr_len + 8 ..][0..scope.len], scope);
+    @memset(buf[hdr_len + 8 + scope.len ..], 0);
     h.crc = metaCrc(buf, h);
     if (w.broken) return error.Broken;
     const off = try w.reserve(len);
@@ -1252,15 +1425,36 @@ pub fn freeMemories(gpa: Allocator, ms: []const Memory) void {
 fn load(w: *const Stratum, gpa: Allocator, id: u64) !?Memory {
     const h = w.hdrAt(id);
     if (!w.alive(id, h)) return null;
-    const body = w.recBytes(id, h)[hdr_len + @as(usize, h.nthreads) * 8 ..][0 .. @as(usize, h.scope_len) + h.subject_len + h.text_len];
-    const raw = try gpa.dupe(u8, body);
+    const head = w.recBytes(id, h)[scopeStart(h)..][0 .. @as(usize, h.lens.scope) + h.lens.subject];
+    const stored = w.storedText(id, h);
+    var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(gpa);
+    try raw.ensureTotalCapacity(gpa, head.len + stored.len);
+    raw.appendSliceAssumeCapacity(head);
+    if (h.flags & flag_coded == 0) {
+        raw.appendSliceAssumeCapacity(stored);
+        // Erased while we copied: the copy no longer matches.
+        if (Crc.hash(raw.items[head.len..]) != h.text_crc) {
+            raw.deinit(gpa);
+            return null;
+        }
+    } else {
+        const copy = try gpa.dupe(u8, stored);
+        defer gpa.free(copy);
+        if (Crc.hash(copy) != h.text_crc) {
+            raw.deinit(gpa);
+            return null;
+        }
+        try wordcode.decode(&w.lanes[laneOf(id)].vocab, copy, gpa, &raw);
+    }
+    const bytes = try raw.toOwnedSlice(gpa);
     return .{
         .id = id,
         .time = h.time,
-        .scope = raw[0..h.scope_len],
-        .subject = raw[h.scope_len..][0..h.subject_len],
-        .text = raw[@as(usize, h.scope_len) + h.subject_len ..],
-        .raw = raw,
+        .scope = bytes[0..h.lens.scope],
+        .subject = bytes[h.lens.scope..][0..h.lens.subject],
+        .text = bytes[@as(usize, h.lens.scope) + h.lens.subject ..],
+        .raw = bytes,
     };
 }
 
@@ -1383,10 +1577,9 @@ fn coverage(s: f32, qsum: f32) f32 {
 }
 
 /// Score on threads alone: per word group, the best word the record has.
-fn threadScore(qt: []const QTerm, ts: []align(1) const u64) f32 {
+fn threadScore(qt: []const QTerm, ts: *const Threads) f32 {
     var best: [max_groups]f32 = @splat(0);
-    for (ts) |t| {
-        const k = threadKey(t);
+    for (ts.key[0..ts.n]) |k| {
         for (qt) |q| if (q.key == k) {
             best[q.group] = @max(best[q.group], q.idf);
         };
@@ -1414,13 +1607,18 @@ const Search = struct {
     }
 
     /// Scores one record and files it under its fact (its stratum).
-    fn consider(c: *Search, id: u64, h: *const Hdr) !void {
+    fn consider(c: *Search, id: u64, h: *const Hdr, known: ?*const Threads) !void {
         const w = c.w;
         if (h.kind != .memory) return;
         const sid = w.sidOf(h.scope_hash) orelse return;
         if (!c.set.has(sid)) return;
         if (w.forgotten.contains(id) or h.stamp < w.scopes.forgot(sid)) return;
-        const base = threadScore(c.qt, w.threadsOf(id, h));
+        var own: Threads = undefined;
+        const th = known orelse blk: {
+            own = w.threadsOf(id, h);
+            break :blk &own;
+        };
+        const base = threadScore(c.qt, th);
         if (base == 0) return;
         if (!c.q.deep and h.stamp < w.scopes.settled(sid)) return;
         // `since` applies to the version the answer will be.
@@ -1430,8 +1628,8 @@ const Search = struct {
         }
         // The fact this version belongs to; with `deep`, every version
         // stands for itself.
-        const root = if (c.q.deep) id else rootOf(h, id);
-        const subj: f32 = if (h.subject_len > 0) 1.1 else 1.0;
+        const root = if (c.q.deep) id else w.rootOf(id, h);
+        const subj: f32 = if (h.lens.subject > 0) 1.1 else 1.0;
         const s = coverage(base, c.qsum) * w.recency(c.now, h.time) * subj;
         const gop = try c.seen.getOrPut(c.gpa, root);
         if (gop.found_existing) {
@@ -1457,19 +1655,9 @@ const Search = struct {
             while (p != 0 and steps < budget) : (steps += 1) {
                 const id = idOf(lane, p);
                 const h = w.hdrAt(id);
-                var next: u32 = 0;
-                var found = false;
-                var has_key = false;
-                for (w.threadsOf(id, h)) |t| {
-                    const k = threadKey(t);
-                    if (!found and bucketOf(k) == b) {
-                        next = threadPrev(t);
-                        found = true;
-                    }
-                    if (k == key) has_key = true;
-                }
-                if (!found) break;
-                if (has_key) try c.consider(id, h);
+                const th = w.threadsOf(id, h);
+                const next = th.prevIn(b) orelse break;
+                if (th.has(key)) try c.consider(id, h, &th);
                 p = next;
             }
         }
@@ -1555,7 +1743,7 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
                 while (p != 0) {
                     const id = idOf(lane, p);
                     const h = w.hdrAt(id);
-                    try ctx.consider(id, h);
+                    try ctx.consider(id, h, null);
                     p = h.prev_scope;
                 }
             }
@@ -1580,6 +1768,8 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     // without seeing each other): answer it once, with its best score.
     var by_head: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer by_head.deinit(gpa);
+    var tbuf: std.ArrayList(u8) = .empty;
+    defer tbuf.deinit(gpa);
     for (ctx.cands.items[0..pool_n]) |c| {
         const vh = w.hdrAt(c.id);
         const head = if (q.deep) c.id else w.headOf(c.id, vh);
@@ -1587,8 +1777,8 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
         const dup = try by_head.getOrPut(gpa, head);
         if (dup.found_existing) {
             const prev = &hits.items[dup.value_ptr.*];
-            const other = textScore(qt, qsum, avg_len, meaning, w.textOf(c.id, vh));
-            const subj0: f32 = if (hh.subject_len > 0) 1.1 else 1.0;
+            const other = textScore(qt, qsum, avg_len, meaning, w.textInto(gpa, c.id, vh, &tbuf) catch "");
+            const subj0: f32 = if (hh.lens.subject > 0) 1.1 else 1.0;
             const sc = other.score * w.recency(now, hh.time) * subj0;
             if (sc > prev.score) {
                 prev.score = sc;
@@ -1602,7 +1792,7 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
         };
         var best = textScore(qt, qsum, avg_len, meaning, m.text);
         if (head != c.id) {
-            const other = textScore(qt, qsum, avg_len, meaning, w.textOf(c.id, vh));
+            const other = textScore(qt, qsum, avg_len, meaning, w.textInto(gpa, c.id, vh, &tbuf) catch "");
             if (other.score > best.score) best = other;
         }
         if (best.score == 0) {
@@ -1610,7 +1800,7 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
             _ = by_head.remove(head);
             continue;
         }
-        const subj: f32 = if (hh.subject_len > 0) 1.1 else 1.0;
+        const subj: f32 = if (hh.lens.subject > 0) 1.1 else 1.0;
         const score = best.score * w.recency(now, hh.time) * subj;
         dup.value_ptr.* = @intCast(hits.items.len);
         try hits.append(gpa, .{ .memory = m, .score = score, .buried = q.deep and w.isBuried(head, hh), .matched = best.mask });
@@ -1892,6 +2082,8 @@ pub fn info(w: *Stratum) Info {
 /// Calls `f(ctx, record_bytes, time)` for every live memory: the cost of
 /// answering without an index.
 pub fn scanAll(w: *Stratum, ctx: anytype, comptime f: anytype) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(w.gpa);
     w.readers.enter(w.io);
     defer w.readers.leave(w.io);
     for (0..w.laneCount()) |lane| {
@@ -1900,7 +2092,21 @@ pub fn scanAll(w: *Stratum, ctx: anytype, comptime f: anytype) !void {
         while (pos + hdr_len <= end) {
             const id = idOf(lane, @intCast(pos >> 3));
             const h = w.hdrAt(id);
-            if (h.kind == .memory and w.alive(id, h)) f(ctx, w.recBytes(id, h)[hdr_len + @as(usize, h.nthreads) * 8 ..][0 .. @as(usize, h.scope_len) + h.subject_len + h.text_len], h.time);
+            if (h.kind == .memory and w.alive(id, h)) {
+                const body = w.recBytes(id, h)[scopeStart(h)..][0 .. @as(usize, h.lens.scope) + h.lens.subject + h.text_len];
+                if (h.flags & flag_coded == 0) {
+                    f(ctx, body, h.time);
+                } else {
+                    const head = body[0 .. @as(usize, h.lens.scope) + h.lens.subject];
+                    buf.clearRetainingCapacity();
+                    try buf.appendSlice(w.gpa, head);
+                    wordcode.decode(&w.lanes[lane].vocab, body[head.len..], w.gpa, &buf) catch {
+                        pos += h.len;
+                        continue;
+                    };
+                    f(ctx, buf.items, h.time);
+                }
+            }
             pos += h.len;
         }
     }
@@ -1952,7 +2158,7 @@ fn snapshotLocked(w: *Stratum) !void {
     defer b.deinit(gpa);
     try b.appendNTimes(gpa, 0, hdr_len);
     const body_start = b.items.len;
-    try putInt(gpa, &b, u32, 1);
+    try putInt(gpa, &b, u32, 2);
     try putInt(gpa, &b, u32, @intCast(w.nlanes));
     for (w.lanes[0..w.nlanes]) |l| {
         try putInt(gpa, &b, u64, l.end);
@@ -1998,12 +2204,22 @@ fn snapshotLocked(w: *Stratum) !void {
     try putInt(gpa, &b, u32, @intCast(w.forgotten.count()));
     var fit = w.forgotten.iterator();
     while (fit.next()) |e| try putInt(gpa, &b, u64, e.key);
+    // Each lane's word code, in code order.
+    for (w.lanes[0..w.nlanes]) |*l| {
+        const nv = l.vocab.len();
+        try putInt(gpa, &b, u32, @intCast(nv));
+        for (0..nv) |i| {
+            const word = l.vocab.get(i).?;
+            try putInt(gpa, &b, u8, @intCast(word.len));
+            try b.appendSlice(gpa, word);
+        }
+    }
     const payload = b.items.len - body_start;
     const len = std.mem.alignForward(usize, b.items.len, 8);
     try b.appendNTimes(gpa, 0, len - b.items.len);
     const h: *align(1) Hdr = @ptrCast(b.items[0..hdr_len]);
     const stamp = w.last_stamp;
-    h.* = .{ .len = @intCast(len), .crc = 0, .kind = .snapshot, .nthreads = 0, .scope_len = 0, .subject_len = 0, .flags = 0, .text_len = @intCast(payload), .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .root = 0, .target = 0, .prev_scope = 0, .text_crc = Crc.hash(b.items[body_start..][0..payload]) };
+    h.* = .{ .len = @intCast(len), .crc = 0, .kind = .snapshot, .nthreads = 0, .lens = .{ .scope = 0, .subject = 0, .threads = 0 }, .flags = 0, .text_len = @intCast(payload), .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .prev_scope = 0, .text_crc = Crc.hash(b.items[body_start..][0..payload]) };
     var hcopy = h.*;
     h.crc = metaCrc(b.items, &hcopy);
     const off = try w.reserve(len);
@@ -2044,7 +2260,7 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
     const h = w.validAt(pick.lane, pick.sb.snap_off, try w.lanes[pick.lane].file.length(w.io)) orelse return null;
     if (h.kind != .snapshot) return error.Corrupt;
     const snap_id = idOf(pick.lane, @intCast(pick.sb.snap_off >> 3));
-    const data = w.textOf(snap_id, h);
+    const data = w.storedText(snap_id, h);
     if (Crc.hash(data) != h.text_crc) return error.Corrupt;
     const gpa = w.gpa;
     var p: usize = 0;
@@ -2062,7 +2278,7 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
             return s;
         }
     };
-    if (try rd.int(data, &p, u32) != 1) return error.Corrupt;
+    if (try rd.int(data, &p, u32) != 2) return error.Corrupt;
     const nl = try rd.int(data, &p, u32);
     if (nl > w.nlanes) return error.Corrupt;
     var from: [max_lanes]u64 = @splat(data_start);
@@ -2114,6 +2330,17 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
     const nf = try rd.int(data, &p, u32);
     try w.forgotten.ensureTotalCapacity(gpa, &w.readers, w.io, nf);
     for (0..nf) |_| try w.mput(&w.forgotten, try rd.int(data, &p, u64), 1);
+    for (0..nl) |l| {
+        const nv = try rd.int(data, &p, u32);
+        if (nv > tables.Vocab.max) return error.Corrupt;
+        for (0..nv) |_| {
+            const wl = try rd.int(data, &p, u8);
+            if (wl == 0) return error.Corrupt;
+            const word = try rd.bytes(data, &p, wl);
+            const code = try w.lanes[l].vocab.append(gpa, word);
+            if (l == w.me) try w.codes.put(gpa, w.lanes[l].vocab.get(code).?, code);
+        }
+    }
     for (0..w.laneCount()) |l| w.lanes[l].end = from[l];
     w.snap_progress = pick.sb.progress;
     return from;
@@ -2434,4 +2661,59 @@ test "brief fits the budget and holds one version per fact" {
 
 test {
     _ = tables;
+}
+
+test "the word code: smaller lanes, same text for every reader, before and after reopening" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const phrase = "the deploy of the ledger service moved to friday after the review with the platform team";
+    var ids: [300]u64 = undefined;
+    {
+        const a = try tmpStore(&tmp, null);
+        defer a.close();
+        const b = try tmpStore(&tmp, null);
+        defer b.close();
+        for (&ids, 0..) |*id, i| {
+            var buf: [160]u8 = undefined;
+            id.* = try a.remember("s", try std.fmt.bufPrint(&buf, "{s} note{d} \xc3\xa9t\xc3\xa9 X{d}", .{ phrase, i, i }), .{});
+        }
+        try testing.expect(a.lanes[a.me].vocab.len() > 10);
+        // Most of the text is codes now.
+        const last = a.hdrAt(ids[299]);
+        try testing.expect(last.flags & flag_coded != 0 and last.text_len < 40);
+        try a.sync();
+        try b.refresh();
+        for ([_]*Stratum{ a, b }) |s| {
+            const m = (try s.get(testing.allocator, ids[299])).?;
+            defer m.deinit(testing.allocator);
+            try testing.expectEqualStrings(phrase ++ " note299 \xc3\xa9t\xc3\xa9 X299", m.text);
+            const hits = try s.recall(testing.allocator, .{ .about = "note123 ledger", .limit = 3 });
+            defer freeHits(testing.allocator, hits);
+            try testing.expectEqualStrings(phrase ++ " note123 \xc3\xa9t\xc3\xa9 X123", hits[0].memory.text);
+        }
+        // Forgetting one coded memory erases it.
+        try a.forget(ids[5]);
+        try testing.expect(try a.get(testing.allocator, ids[5]) == null);
+    }
+    // Reopened from the snapshot, then with codes learned by replay.
+    for (0..2) |round| {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        if (round == 1) w.snap_progress = w.progress(); // no closing snapshot
+        for (ids, 0..) |id, i| {
+            const m = try w.get(testing.allocator, id);
+            if (i == 5) {
+                try testing.expect(m == null);
+                continue;
+            }
+            defer m.?.deinit(testing.allocator);
+            var buf: [160]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{s} note{d} \xc3\xa9t\xc3\xa9 X{d}", .{ phrase, i, i }), m.?.text);
+        }
+        var more: [160]u8 = undefined;
+        const id = try w.remember("s", try std.fmt.bufPrint(&more, "{s} again{d}", .{ phrase, round }), .{});
+        const m = (try w.get(testing.allocator, id)).?;
+        defer m.deinit(testing.allocator);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&more, "{s} again{d}", .{ phrase, round }), m.text);
+    }
 }
