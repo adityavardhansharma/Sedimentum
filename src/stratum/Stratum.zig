@@ -42,7 +42,8 @@ const nbuckets = 1 << bucket_bits;
 const term_threads = 24;
 const data_start = 4096;
 pub const max_lanes = 64;
-const map_reserve: usize = 1 << 38;
+/// Record offsets are u32 counts of 8 bytes, so a lane holds at most 32 GiB.
+const map_reserve: usize = 1 << 35;
 const snapshot_every: u64 = 256 << 20;
 const close_snapshot_after: u64 = 32 << 20;
 const cms_bits = 18;
@@ -63,7 +64,9 @@ const Hdr = extern struct {
     flags: u16,
     text_len: u32,
     nterms: u32,
-    /// Order across writers: never repeats, never goes back in one writer.
+    /// Write order across writers (microseconds of the real clock, never
+    /// repeats, never goes back in one writer). Forget and settle cutoffs
+    /// compare it, so a backdated `time` cannot slip under a cutoff.
     stamp: u64,
     /// When it happened (ms since the epoch), as the caller gave it.
     time: u64,
@@ -165,6 +168,8 @@ synced: std.atomic.Value(u64) = .init(data_start),
 sync_mutex: Io.Mutex = .init,
 syncs: std.atomic.Value(u64) = .init(0),
 last_refresh: std.atomic.Value(u64) = .init(0),
+/// A failed write could not be undone: further writes are refused.
+broken: bool = false,
 /// The batch being encoded (not yet in the file), under the write lock.
 pend_start: usize = std.math.maxInt(usize),
 pend_buf: []const u8 = &.{},
@@ -247,7 +252,12 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
         if (!try w.openLane(i)) break;
     }
     if (w.nlanes <= w.me) return error.Corrupt;
+    try w.loadTables();
+    return w;
+}
 
+/// Builds the RAM tables from the newest snapshot and the records after it.
+fn loadTables(w: *Stratum) !void {
     const from = w.loadSnapshot() catch blk: {
         // An unreadable snapshot is only lost speed: replay everything.
         w.resetTables();
@@ -256,10 +266,34 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     // Our own lane first, so markers from other lanes can erase in it.
     try w.replayLane(w.me, if (from) |f| f[w.me] else data_start, true);
     for (0..w.nlanes) |l| if (l != w.me) try w.replayLane(l, if (from) |f| f[l] else data_start, false);
+    if (from != null) {
+        // Markers inside the snapshot were never replayed here. Their
+        // erasures in this lane may not have happened (its writer was
+        // gone), so redo them; erasing is idempotent.
+        for (w.rules.items) |r| if (r.kind == .forget_scope) try w.eraseScopeInOwnLane(r.name, r.cutoff);
+        var it = w.forgotten.keyIterator();
+        while (it.next()) |id| if (laneOf(id.*) == w.me) try w.eraseOwn(offOf(id.*));
+    }
     w.end.store(w.lanes[w.me].end, .release);
     w.synced.store(w.lanes[w.me].end, .release);
-    w.snap_end = if (from) |f| @min(f[w.me], w.lanes[w.me].end) else data_start;
-    return w;
+    @atomicStore(u64, &w.snap_end, if (from) |f| @min(f[w.me], w.lanes[w.me].end) else data_start, .release);
+}
+
+/// After a write failed halfway, the RAM tables may point at records that
+/// never reached the file: drop what was written of the batch and rebuild
+/// the tables from disk. If that fails too, the handle refuses writes.
+/// Caller holds the write lock.
+fn recoverFailedWrite(w: *Stratum, start: u64) void {
+    w.pend_start = std.math.maxInt(usize);
+    w.pend_buf = &.{};
+    w.lanes[w.me].file.setLength(w.io, start) catch {
+        w.broken = true;
+        return;
+    };
+    w.resetTables();
+    w.loadTables() catch {
+        w.broken = true;
+    };
 }
 
 fn addLane(w: *Stratum, file: Io.File) !void {
@@ -335,7 +369,7 @@ fn freeAll(w: *Stratum) void {
 pub fn close(w: *Stratum) void {
     // A snapshot holds every lane's chain heads (4 MB a lane): only worth
     // writing when this writer added a lot that reopening would replay.
-    if (w.end.load(.acquire) -| w.snap_end >= close_snapshot_after) w.snapshot() catch {};
+    w.snapshotIfGrew(close_snapshot_after) catch {};
     const gpa = w.gpa;
     const cms = w.cms;
     w.freeAll();
@@ -352,6 +386,13 @@ fn progress(w: *const Stratum) u64 {
 
 pub fn setClockForTest(w: *Stratum, ms: ?u64) void {
     w.clock_override = ms;
+}
+
+/// The next write stamp. Caller holds the write lock.
+fn nextStamp(w: *const Stratum) u64 {
+    const ns = Io.Clock.real.now(w.io).nanoseconds;
+    const us: u64 = @intCast(@divTrunc(ns, std.time.ns_per_us));
+    return @max(us, w.last_stamp + 1);
 }
 
 fn nowMs(w: *const Stratum) u64 {
@@ -386,11 +427,12 @@ fn textOf(w: *const Stratum, id: u64, h: *const Hdr) []const u8 {
     return w.recBytes(id, h)[textStart(h)..][0..h.text_len];
 }
 
-/// Is a record later in the global order than another?
+/// Is a record newer than another? By event time, then write order.
 fn newer(w: *const Stratum, a: u64, b: u64) bool {
-    const sa = w.hdrAt(a).stamp;
-    const sb = w.hdrAt(b).stamp;
-    return sa > sb or (sa == sb and a > b);
+    const ha = w.hdrAt(a);
+    const hb = w.hdrAt(b);
+    if (ha.time != hb.time) return ha.time > hb.time;
+    return ha.stamp > hb.stamp or (ha.stamp == hb.stamp and a > b);
 }
 
 fn rootOf(h: *const Hdr, id: u64) u64 {
@@ -770,7 +812,7 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
     }
 
     const off8: u32 = @intCast(off >> 3);
-    const stamp = @max(it.time orelse now, w.last_stamp + 1);
+    const stamp = w.nextStamp();
     const sid = try w.intern(it.scope, sh);
     const h: *Hdr = @ptrCast(@alignCast(buf[0..hdr_len]));
     h.* = .{
@@ -898,8 +940,10 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
     const first = blk: {
         w.lock.lockUncancelable(w.io);
         defer w.lock.unlock(w.io);
+        if (w.broken) return error.Broken;
         const start = w.end.load(.acquire);
         if (start + total >= map_reserve) return error.LaneFull;
+        errdefer w.recoverFailedWrite(start);
         w.pend_start = start;
         w.pend_buf = buf;
         defer {
@@ -950,13 +994,20 @@ fn appendMarker(w: *Stratum, kind: Kind, scope: []const u8, target: u64) !void {
     var stack: [1200]u8 align(8) = undefined;
     const buf = stack[0..len];
     const h: *Hdr = @ptrCast(@alignCast(buf[0..hdr_len]));
-    const stamp = @max(w.nowMs(), w.last_stamp + 1);
-    h.* = .{ .len = @intCast(len), .crc = 0, .kind = kind, .nthreads = 0, .scope_len = @intCast(scope.len), .subject_len = 0, .flags = 0, .text_len = 0, .nterms = 0, .stamp = stamp, .time = stamp, .scope_hash = 0, .root = 0, .target = target, .prev_scope = 0, .text_crc = Crc.hash("") };
+    const stamp = w.nextStamp();
+    h.* = .{ .len = @intCast(len), .crc = 0, .kind = kind, .nthreads = 0, .scope_len = @intCast(scope.len), .subject_len = 0, .flags = 0, .text_len = 0, .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .root = 0, .target = target, .prev_scope = 0, .text_crc = Crc.hash("") };
     @memcpy(buf[hdr_len..][0..scope.len], scope);
     @memset(buf[hdr_len + scope.len ..], 0);
     h.crc = metaCrc(buf, h);
+    if (w.broken) return error.Broken;
     const off = w.end.load(.acquire);
-    try w.lanes[w.me].file.writePositionalAll(w.io, buf, off);
+    if (off + len >= map_reserve) return error.LaneFull;
+    w.lanes[w.me].file.writePositionalAll(w.io, buf, off) catch |e| {
+        w.lanes[w.me].file.setLength(w.io, off) catch {
+            w.broken = true;
+        };
+        return e;
+    };
     w.end.store(off + len, .release);
     w.lanes[w.me].end = off + len;
     w.last_stamp = stamp;
@@ -1106,6 +1157,7 @@ fn validId(w: *const Stratum, id: u64) bool {
 }
 
 pub fn get(w: *Stratum, gpa: Allocator, id: u64) !?Memory {
+    try w.maybeRefresh();
     w.lock.lockSharedUncancelable(w.io);
     defer w.lock.unlockShared(w.io);
     if (!w.validId(id)) return null;
@@ -1249,13 +1301,17 @@ const Search = struct {
     fn consider(c: *Search, id: u64, h: *const Hdr) !void {
         const w = c.w;
         if (h.kind != .memory) return;
-        if (h.time < c.q.since) return;
         const sid = w.scope_map.get(h.scope_hash) orelse return;
         if (!c.set.has(sid)) return;
         if (w.forgotten.contains(id) or h.stamp < w.scope_forgot.items[sid]) return;
         const base = threadScore(c.qt, w.threadsOf(id, h));
         if (base == 0) return;
         if (!c.q.deep and h.stamp < w.scope_settled.items[sid]) return;
+        // `since` applies to the version the answer will be.
+        if (c.q.since > 0) {
+            const shown = if (c.q.deep) id else w.headOf(id, h);
+            if (w.hdrAt(shown).time < c.q.since) return;
+        }
         // The fact this version belongs to; with `deep`, every version
         // stands for itself.
         const root = if (c.q.deep) id else rootOf(h, id);
@@ -1404,11 +1460,30 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     // Rerank on full text. A fact scores by its best version (the words of
     // every version lead to it) and answers with its newest.
     const avg_len: f32 = @as(f32, @floatFromInt(w.total_terms)) / @as(f32, @floatFromInt(@max(w.count, 1)));
+    // Two strata can share a head (two writers started the same subject
+    // without seeing each other): answer it once, with its best score.
+    var by_head: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer by_head.deinit(gpa);
     for (ctx.cands.items[0..pool_n]) |c| {
         const vh = w.hdrAt(c.id);
         const head = if (q.deep) c.id else w.headOf(c.id, vh);
         const hh = w.hdrAt(head);
-        const m = (try w.load(gpa, head)) orelse continue;
+        const dup = try by_head.getOrPut(gpa, head);
+        if (dup.found_existing) {
+            const prev = &hits.items[dup.value_ptr.*];
+            const other = textScore(qt, qsum, avg_len, meaning, w.textOf(c.id, vh));
+            const subj0: f32 = if (hh.subject_len > 0) 1.1 else 1.0;
+            const sc = other.score * w.recency(now, hh.time) * subj0;
+            if (sc > prev.score) {
+                prev.score = sc;
+                prev.matched = other.mask;
+            }
+            continue;
+        }
+        const m = (try w.load(gpa, head)) orelse {
+            _ = by_head.remove(head);
+            continue;
+        };
         var best = textScore(qt, qsum, avg_len, meaning, m.text);
         if (head != c.id) {
             const other = textScore(qt, qsum, avg_len, meaning, w.textOf(c.id, vh));
@@ -1416,10 +1491,12 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
         }
         if (best.score == 0) {
             m.deinit(gpa);
+            _ = by_head.remove(head);
             continue;
         }
         const subj: f32 = if (hh.subject_len > 0) 1.1 else 1.0;
         const score = best.score * w.recency(now, hh.time) * subj;
+        dup.value_ptr.* = @intCast(hits.items.len);
         try hits.append(gpa, .{ .memory = m, .score = score, .buried = q.deep and w.isBuried(head, hh), .matched = best.mask });
     }
     std.mem.sortUnstable(Hit, hits.items, {}, struct {
@@ -1723,9 +1800,18 @@ const Super = extern struct {
     pad: u32 = 0,
 };
 
+/// Writes a snapshot when our lane grew by `every` bytes since the last
+/// one. Both ends are read under the write lock.
+fn snapshotIfGrew(w: *Stratum, every: u64) !void {
+    w.lock.lockUncancelable(w.io);
+    defer w.lock.unlock(w.io);
+    if (w.end.load(.acquire) -| w.snap_end < every) return;
+    try w.snapshotLocked();
+}
+
 fn maybeSnapshot(w: *Stratum) !void {
-    if (w.end.load(.acquire) - w.snap_end < snapshot_every) return;
-    try w.snapshot();
+    if (w.end.load(.acquire) -| @atomicLoad(u64, &w.snap_end, .acquire) < snapshot_every) return;
+    try w.snapshotIfGrew(snapshot_every);
 }
 
 fn putInt(gpa: Allocator, b: *std.ArrayList(u8), comptime T: type, v: T) !void {
@@ -1738,9 +1824,13 @@ fn putInt(gpa: Allocator, b: *std.ArrayList(u8), comptime T: type, v: T) !void {
 /// superblock at it. Reopening (by any writer) loads it and replays only
 /// the records after it, lane by lane.
 pub fn snapshot(w: *Stratum) !void {
-    const gpa = w.gpa;
     w.lock.lockUncancelable(w.io);
     defer w.lock.unlock(w.io);
+    try w.snapshotLocked();
+}
+
+fn snapshotLocked(w: *Stratum) !void {
+    const gpa = w.gpa;
     var b: std.ArrayList(u8) = .empty;
     defer b.deinit(gpa);
     try b.appendNTimes(gpa, 0, hdr_len);
@@ -1814,7 +1904,7 @@ pub fn snapshot(w: *Stratum) !void {
     sb.crc = Crc.hash(std.mem.asBytes(&sb)[0..32]);
     try w.lanes[w.me].file.writePositionalAll(w.io, std.mem.asBytes(&sb), (w.snap_gen & 1) * 64);
     try w.lanes[w.me].file.sync(w.io);
-    w.snap_end = new_end;
+    @atomicStore(u64, &w.snap_end, new_end, .release);
     w.snap_progress = w.progress();
 }
 
@@ -2099,6 +2189,69 @@ test "two writers, one store: each has its lane and sees the other" {
     const none = try b.recall(testing.allocator, .{ .about = "quokka", .limit = 10 });
     defer freeHits(testing.allocator, none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "writers that have not seen each other: get, backdated writes, one answer per head" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = try tmpStore(&tmp, null);
+    defer a.close();
+    const b = try tmpStore(&tmp, null);
+    defer b.close();
+    // `get` picks up the other writer's new memory.
+    const bid = try b.remember("q", "beta wrote this", .{});
+    const got = (try a.get(testing.allocator, bid)).?;
+    got.deinit(testing.allocator);
+    // A backdated write made after another writer's forget survives it.
+    _ = try a.forgetScope("p");
+    _ = try b.remember("p", "imported walrus history", .{ .time = 1 });
+    try b.refresh();
+    const kept = try b.recall(testing.allocator, .{ .about = "walrus", .limit = 10 });
+    defer freeHits(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    // Both start the same subject; a later version answers once.
+    _ = try a.remember("r", "zeta gadget first draft", .{ .subject = "gadget", .time = 100 });
+    _ = try b.remember("r", "zeta gadget second draft", .{ .subject = "gadget", .time = 200 });
+    try a.refresh();
+    _ = try a.remember("r", "zeta gadget final", .{ .subject = "gadget", .time = 300 });
+    const hits = try a.recall(testing.allocator, .{ .about = "zeta gadget draft", .limit = 10 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("zeta gadget final", hits[0].memory.text);
+}
+
+test "since applies to the version returned" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    _ = try w.remember("m", "kumquat price is three", .{ .subject = "price", .time = 100 });
+    _ = try w.remember("m", "now it costs five", .{ .subject = "price", .time = 300 });
+    const hits = try w.recall(testing.allocator, .{ .about = "kumquat price", .since = 200, .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("now it costs five", hits[0].memory.text);
+}
+
+test "a lane taken over after a snapshot still erases forgotten text" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = try tmpStore(&tmp, null);
+    defer a.close();
+    {
+        const b = try tmpStore(&tmp, null);
+        defer b.close();
+        _ = try b.remember("s", "secret zebracode", .{});
+    }
+    _ = try a.forgetScope("s");
+    try a.snapshot();
+    const c = try tmpStore(&tmp, null);
+    c.close();
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    const bytes = try sub.readFileAlloc(testing.io, "lane-001.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "zebracode") == null);
 }
 
 test "rememberMany matches one-by-one writes" {
