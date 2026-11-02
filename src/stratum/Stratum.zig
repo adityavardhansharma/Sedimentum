@@ -985,7 +985,7 @@ fn eraseOwn(w: *Stratum, off8: u32) !void {
         try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..k], at + done);
         done += k;
     }
-    const kind = [1]u8{@intFromEnum(Kind.erased)};
+    const kind = [1]u8{@backingInt(Kind.erased)};
     try w.lanes[w.me].file.writePositionalAll(w.io, &kind, (@as(u64, off8) << 3) + @offsetOf(Hdr, "kind"));
 }
 
@@ -1768,7 +1768,7 @@ pub fn snapshot(w: *Stratum) !void {
     }
     try putInt(gpa, &b, u32, @intCast(w.rules.items.len));
     for (w.rules.items) |r| {
-        try putInt(gpa, &b, u8, @intFromEnum(r.kind));
+        try putInt(gpa, &b, u8, @backingInt(r.kind));
         try putInt(gpa, &b, u64, r.cutoff);
         try putInt(gpa, &b, u16, @intCast(r.name.len));
         try b.appendSlice(gpa, r.name);
@@ -1883,7 +1883,7 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
     }
     const nr = try rd.int(data, &p, u32);
     for (0..nr) |_| {
-        const kind: Kind = @enumFromInt(try rd.int(data, &p, u8));
+        const kind: Kind = @fromBackingInt(@intCast(try rd.int(data, &p, u8)));
         const cutoff = try rd.int(data, &p, u64);
         const nlen = try rd.int(data, &p, u16);
         const copy = try gpa.dupe(u8, try rd.bytes(data, &p, nlen));
