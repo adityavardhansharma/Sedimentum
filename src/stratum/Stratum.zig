@@ -44,6 +44,7 @@ const data_start = 4096;
 pub const max_lanes = 64;
 const map_reserve: usize = 1 << 38;
 const snapshot_every: u64 = 256 << 20;
+const close_snapshot_after: u64 = 32 << 20;
 const cms_bits = 18;
 const cms_rows = 2;
 const lane_shift = 40;
@@ -332,7 +333,9 @@ fn freeAll(w: *Stratum) void {
 }
 
 pub fn close(w: *Stratum) void {
-    if (w.progress() != w.snap_progress) w.snapshot() catch {};
+    // A snapshot holds every lane's chain heads (4 MB a lane): only worth
+    // writing when this writer added a lot that reopening would replay.
+    if (w.end.load(.acquire) -| w.snap_end >= close_snapshot_after) w.snapshot() catch {};
     const gpa = w.gpa;
     const cms = w.cms;
     w.freeAll();
@@ -522,14 +525,21 @@ fn isBuried(w: *const Stratum, id: u64, h: *const Hdr) bool {
     return head != id;
 }
 
-/// The newest live version of a memory's stratum (the memory itself when
-/// it is the newest, or when the newer one was forgotten).
+/// The newest live version of a memory's fact: through its subject (which
+/// links versions even when two writers wrote them without seeing each
+/// other) and its stratum. The memory itself when it is the newest, or
+/// when the newer one was forgotten.
 fn headOf(w: *const Stratum, id: u64, h: *const Hdr) u64 {
-    const head = w.strata.get(rootOf(h, id)) orelse return id;
-    if (head == id) return id;
+    var head = id;
+    if (h.subject_len > 0) {
+        if (w.subjects.get(subjectKey(h.scope_hash, w.subjectOf(id, h)))) |s| {
+            if (s != id and w.alive(s, w.hdrAt(s)) and w.newer(s, id)) head = s;
+        }
+    }
     const hh = w.hdrAt(head);
-    if (!w.alive(head, hh)) return id;
-    return head;
+    const sh = w.strata.get(rootOf(hh, head)) orelse return head;
+    if (sh == head or !w.alive(sh, w.hdrAt(sh)) or !w.newer(sh, head)) return head;
+    return sh;
 }
 
 /// Updates the RAM tables for one valid record. `hashes`: the text's terms,
@@ -746,17 +756,15 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
 
 /// Encodes one memory at `off` of our lane into `buf`, picks its stratum
 /// and applies it. Caller holds the write lock, then writes `buf` at `off`.
-fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const u64, total: u32) !void {
+fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const u64, total: u32, keys: []const u32, dfs: []const u32) !void {
     const subject = it.subject orelse "";
     const sh = scopeHash(it.scope);
-    var keys: [term_threads]u32 = undefined;
-    var dfs: [term_threads]u32 = undefined;
-    const nk = w.chooseThreads(hashes, &keys, &dfs);
+    const nk = keys.len;
 
     var root: u64 = 0;
     if (subject.len > 0) {
         if (w.subjects.get(subjectKey(sh, subject))) |prev| root = rootOf(w.hdrAt(prev), prev);
-    } else if (w.findLineage(sh, keys[0..nk], dfs[0..nk])) |prev| {
+    } else if (w.findLineage(sh, keys, dfs)) |prev| {
         root = rootOf(w.hdrAt(prev), prev);
         w.merges += 1;
     }
@@ -785,7 +793,7 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
     };
     const ts = std.mem.bytesAsSlice(u64, buf[hdr_len..][0 .. nk * 8]);
     const heads = w.lanes[w.me].heads;
-    for (keys[0..nk], 0..) |k, i| {
+    for (keys, 0..) |k, i| {
         const b = bucketOf(k);
         var prev = heads[b];
         if (prev == off8) {
@@ -839,8 +847,6 @@ const max_workers = 8;
 /// Saves many memories at once and returns the first id. Words are found
 /// on every core; the records go to the file in one write.
 pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
-    // See other writers' versions first, so subjects link across them.
-    try w.maybeRefresh();
     if (items.len == 0) return idOf(w.me, @intCast(w.end.load(.acquire) >> 3));
     for (items) |it| try validate(it.scope, it.subject orelse "", it.text);
     const gpa = w.gpa;
@@ -907,7 +913,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
             var dfs: [term_threads]u32 = undefined;
             const nk = w.chooseThreads(hashes, &keys, &dfs);
             const len = recordLen(nk, it.scope.len, if (it.subject) |s| s.len else 0, it.text.len);
-            try w.encode(buf[pos..][0..len], start + pos, it, now, hashes, sp.total);
+            try w.encode(buf[pos..][0..len], start + pos, it, now, hashes, sp.total, keys[0..nk], dfs[0..nk]);
             pos += len;
         }
         try w.lanes[w.me].file.writePositionalAll(w.io, buf[0..pos], start);
@@ -1340,7 +1346,7 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
         }
     }.gt);
     var qt_buf: [max_groups * (1 + max_related)]QTerm = undefined;
-    var nq = @min(ts.len, max_groups);
+    var nq: usize = @min(ts.len, max_groups);
     @memcpy(qt_buf[0..nq], all[0..nq]);
     var qsum: f32 = 0;
     for (qt_buf[0..nq], 0..) |*t, g| {
@@ -1366,7 +1372,10 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
 
     // Candidates: walk a small scope whole, or follow the chains of the
     // rarest words (and, with meaning, of words related to the rarest).
-    if (!set.all and set.total <= 65536) {
+    // Walk the scope when it is smaller than the rarest word's chain would
+    // be (with slack), else follow chains and filter by scope.
+    const est_chain: u64 = @as(u64, w.df(qt[0].hash)) + 1;
+    if (!set.all and set.total <= 65536 and set.total <= @max(est_chain * 4, 4096)) {
         for (0..w.scope_offs.items.len) |i| {
             if (!set.bits.isSet(i)) continue;
             for (0..w.nlanes) |lane| {

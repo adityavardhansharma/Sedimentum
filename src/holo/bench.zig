@@ -184,11 +184,12 @@ pub fn main(init: std.process.Init) !void {
     io_g = io;
     prog_start = nowNs(io);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const usage = "usage: sedimentum-holo-bench <agent|recall|hard|jargon> <new-dir> [memories] [meaning-model]\n";
+    const usage = "usage: sedimentum-holo-bench <agent|recall|hard|jargon|lanes> <new-dir> [memories] [meaning-model]\n";
     if (args.len < 3) return fatal(io, usage);
     const mode = args[1];
     const dir = args[2];
     const n: u64 = if (args.len > 3) std.fmt.parseInt(u64, args[3], 10) catch 0 else 1_000_000;
+    if (std.mem.eql(u8, mode, "lane-child")) return runLaneChild(io, dir, std.fmt.parseInt(u64, args[3], 10) catch 0, std.fmt.parseInt(u64, args[4], 10) catch 0);
     out = Io.File.stdout().writerStreaming(io, &out_buf);
     if (Io.Dir.cwd().openDir(io, dir, .{ .iterate = true })) |existing| {
         var d = existing;
@@ -199,6 +200,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "agent")) return runAgent(io, dir);
     if (std.mem.eql(u8, mode, "recall")) return runRecall(io, dir, n);
     if (std.mem.eql(u8, mode, "hard")) return runHard(io, dir, n, if (args.len > 4) args[4] else "models/holo-words.bin");
+    if (std.mem.eql(u8, mode, "lanes")) return runLanes(io, dir);
     if (std.mem.eql(u8, mode, "jargon")) return runJargon(io, dir, n, if (args.len > 4) args[4] else "models/holo-words.bin");
     return fatal(io, usage);
 }
@@ -1109,7 +1111,7 @@ fn runJargon(io: Io, dir: []const u8, n: u64, model_path: []const u8) !void {
     h.setClockForTest(now_ms);
     try report("jargon_load", n + evs.items.len, secondsSince(io, t), null, ",\"facts\":{d},\"versions\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{ nfacts, evs.items.len, anonKb(io), h.info().index_bytes });
 
-    const queries = @min(nfacts, 2000);
+    const queries: u64 = @min(nfacts, 2000);
     const Case = struct { name: []const u8, tagged: ?bool, brief: bool = false };
     const cases = [_]Case{
         .{ .name = "jargon_all", .tagged = null },
@@ -1180,5 +1182,204 @@ fn runJargon(io: Io, dir: []const u8, n: u64, model_path: []const u8) !void {
             tick();
         }
         try report(cs.name, asked, secondsSince(io, t), &lat, ",\"hit_at_1\":{d:.4},\"hit_at_k\":{d:.4},\"stale\":{d:.4}", .{ ratio(hit1, asked), ratio(hit5, asked), ratio(stale1, asked) });
+    }
+}
+
+// ---------------------------------------------------------- several writers
+//
+// Stratum only: N agent processes write one store at the same time, each
+// through its own lane. Checks that nothing is lost, then kills writers
+// with SIGKILL mid-write and checks that every write they had confirmed
+// (synced) survives, and that new writers can take over their lanes.
+
+extern "c" fn fork() c_int;
+extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+
+const lane_ack_every = 64;
+
+fn laneText(buf: []u8, agent: u64, k: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "agent {d} note {d} tok{d}x{d} about the build", .{ agent, k, agent, k }) catch unreachable;
+}
+
+fn spawnLaneChild(dir: []const u8, agent: u64, m: u64) !std.c.pid_t {
+    var a0: [16:0]u8 = undefined;
+    var a2: [256:0]u8 = undefined;
+    var a3: [32:0]u8 = undefined;
+    var a4: [32:0]u8 = undefined;
+    const s0 = try std.fmt.bufPrintSentinel(&a0, "bench", .{}, 0);
+    const s2 = try std.fmt.bufPrintSentinel(&a2, "{s}", .{dir}, 0);
+    const s3 = try std.fmt.bufPrintSentinel(&a3, "{d}", .{agent}, 0);
+    const s4 = try std.fmt.bufPrintSentinel(&a4, "{d}", .{m}, 0);
+    const argv = [_:null]?[*:0]const u8{ s0.ptr, "lane-child", s2.ptr, s3.ptr, s4.ptr };
+    const pid = fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        _ = execv("/proc/self/exe", &argv);
+        std.c._exit(127);
+    }
+    return pid;
+}
+
+fn ackPath(buf: []u8, dir: []const u8, agent: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}-acks/{d}", .{ dir, agent }) catch unreachable;
+}
+
+/// One writer process: `m` memories, a sync every 64, and after each sync
+/// the number of confirmed memories in its ack file.
+fn runLaneChild(io: Io, dir: []const u8, agent: u64, m: u64) !void {
+    if (!bench_options.stratum) return error.Unsupported;
+    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
+    defer h.close();
+    var pb: [300]u8 = undefined;
+    const ack = try Io.Dir.cwd().createFile(io, ackPath(&pb, dir, agent), .{ .truncate = true });
+    defer ack.close(io);
+    var sb: [32]u8 = undefined;
+    const scope = std.fmt.bufPrint(&sb, "agent/{d}", .{agent}) catch unreachable;
+    var subj_b: [48]u8 = undefined;
+    const subj = std.fmt.bufPrint(&subj_b, "agent/{d}/status", .{agent}) catch unreachable;
+    var tb: [128]u8 = undefined;
+    for (0..m) |k| {
+        _ = try h.remember(scope, laneText(&tb, agent, k), .{ .subject = if (k % 10 == 0) subj else null });
+        if ((k + 1) % lane_ack_every == 0 or k + 1 == m) {
+            try h.sync();
+            var n: [8]u8 = undefined;
+            std.mem.writeInt(u64, &n, k + 1, .little);
+            try ack.writePositionalAll(io, &n, 0);
+        }
+    }
+}
+
+const LaneCheck = struct {
+    seen: []std.DynamicBitSetUnmanaged,
+    bad: u64 = 0,
+    fn each(c: *LaneCheck, body: []const u8, _: u64) void {
+        const at = std.mem.indexOf(u8, body, "agent ") orelse return;
+        var it = std.mem.tokenizeScalar(u8, body[at + 6 ..], ' ');
+        const a = std.fmt.parseInt(usize, it.next() orelse return, 10) catch return;
+        _ = it.next();
+        const k = std.fmt.parseInt(usize, it.next() orelse return, 10) catch return;
+        if (a >= c.seen.len or k >= c.seen[a].bit_length) {
+            c.bad += 1;
+            return;
+        }
+        c.seen[a].set(k);
+    }
+};
+
+/// Opens the store as one more writer and counts which memories of each
+/// agent are there.
+fn checkLanes(io: Io, dir: []const u8, agents: u64, cap: u64) !struct { seen: []std.DynamicBitSetUnmanaged, bad: u64, lanes: usize, open_s: f64 } {
+    const t = nowNs(io);
+    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
+    defer h.close();
+    const open_s = secondsSince(io, t);
+    const seen = try driver.alloc(std.DynamicBitSetUnmanaged, agents);
+    for (seen) |*s| s.* = try .initEmpty(driver, cap);
+    var c: LaneCheck = .{ .seen = seen };
+    try h.scanAll(&c, LaneCheck.each);
+    return .{ .seen = seen, .bad = c.bad, .lanes = h.info().lanes, .open_s = open_s };
+}
+
+fn readAck(io: Io, dir: []const u8, agent: u64) u64 {
+    var pb: [300]u8 = undefined;
+    var b: [8]u8 = undefined;
+    const got = Io.Dir.cwd().readFile(io, ackPath(&pb, dir, agent), &b) catch return 0;
+    if (got.len < 8) return 0;
+    return std.mem.readInt(u64, b[0..8], .little);
+}
+
+fn runLanes(io: Io, dir: []const u8) !void {
+    if (!bench_options.stratum) return fatal(io, "lanes: only Stratum lets several processes write one store\n");
+    prog_phases = 6;
+    try Io.Dir.cwd().createDirPath(io, dir);
+    var pb: [300]u8 = undefined;
+
+    // Throughput: N writers at once, every one runs to the end.
+    for ([_]u64{ 1, 3, 8, 32 }) |nw| {
+        const m: u64 = 20_000;
+        var db: [256]u8 = undefined;
+        const sub = std.fmt.bufPrint(&db, "{s}/w{d}", .{ dir, nw }) catch unreachable;
+        try Io.Dir.cwd().createDirPath(io, std.fmt.bufPrint(&pb, "{s}-acks", .{sub}) catch unreachable);
+        var nb: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "writers_{d}", .{nw}) catch unreachable;
+        phaseStart(name, nw * m);
+        const t = nowNs(io);
+        var pids: [64]std.c.pid_t = undefined;
+        for (0..nw) |a| pids[a] = try spawnLaneChild(sub, a, m);
+        var failed: u64 = 0;
+        for (pids[0..nw]) |p| {
+            var st: c_int = 0;
+            _ = std.c.waitpid(p, &st, 0);
+            if (st != 0) failed += 1;
+        }
+        const secs = secondsSince(io, t);
+        const chk = try checkLanes(io, sub, nw, m);
+        var lost: u64 = 0;
+        for (chk.seen) |s| lost += m - s.count();
+        try report(name, nw * m, secs, null, ",\"writers\":{d},\"failed_writers\":{d},\"lost\":{d},\"garbled\":{d},\"lanes\":{d},\"reopen_s\":{d:.3},\"disk_bytes\":{d}", .{ nw, failed, lost, chk.bad, chk.lanes, chk.open_s, dirBytes(io, sub) });
+    }
+
+    // Crash: 8 writers killed with SIGKILL at random moments.
+    {
+        const nw: u64 = 8;
+        const m: u64 = 2_000_000;
+        var db: [256]u8 = undefined;
+        const sub = std.fmt.bufPrint(&db, "{s}/crash", .{dir}) catch unreachable;
+        try Io.Dir.cwd().createDirPath(io, std.fmt.bufPrint(&pb, "{s}-acks", .{sub}) catch unreachable);
+        phaseStart("crash_kill9", nw);
+        const t = nowNs(io);
+        var pids: [8]std.c.pid_t = undefined;
+        for (0..nw) |a| pids[a] = try spawnLaneChild(sub, a, m);
+        var s: u64 = 99;
+        // Kill them one by one, 100 to 600 ms apart.
+        for (pids[0..nw]) |p| {
+            const ms = 100 + splitmix(&s) % 500;
+            io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+            _ = std.c.kill(p, .KILL);
+            var st: c_int = 0;
+            _ = std.c.waitpid(p, &st, 0);
+            tick();
+        }
+        const secs = secondsSince(io, t);
+        var acked_total: u64 = 0;
+        var acks: [8]u64 = undefined;
+        for (0..nw) |a| {
+            acks[a] = readAck(io, sub, a);
+            acked_total += acks[a];
+        }
+        const chk = try checkLanes(io, sub, nw, m);
+        var lost: u64 = 0;
+        var extra: u64 = 0;
+        for (chk.seen, 0..) |bs, a| {
+            for (0..acks[a]) |k| if (!bs.isSet(k)) {
+                lost += 1;
+            };
+            extra += bs.count() -| acks[a];
+        }
+        try report("crash_kill9", acked_total, secs, null, ",\"writers\":{d},\"confirmed\":{d},\"confirmed_lost\":{d},\"unconfirmed_kept\":{d},\"garbled\":{d},\"lanes\":{d},\"reopen_s\":{d:.3}", .{ nw, acked_total, lost, extra, chk.bad, chk.lanes, chk.open_s });
+
+        // New writers take over the dead writers' lanes and finish cleanly.
+        phaseStart("crash_takeover", nw);
+        const t2 = nowNs(io);
+        var pids2: [8]std.c.pid_t = undefined;
+        const m2: u64 = 5_000;
+        for (0..nw) |a| pids2[a] = try spawnLaneChild(sub, 100 + a, m2);
+        var failed: u64 = 0;
+        for (pids2[0..nw]) |p| {
+            var st: c_int = 0;
+            _ = std.c.waitpid(p, &st, 0);
+            if (st != 0) failed += 1;
+            tick();
+        }
+        const secs2 = secondsSince(io, t2);
+        const chk2 = try checkLanes(io, sub, 108, m);
+        var lost2: u64 = 0;
+        for (0..nw) |a| {
+            for (0..acks[a]) |k| if (!chk2.seen[a].isSet(k)) {
+                lost2 += 1;
+            };
+            lost2 += m2 - chk2.seen[100 + a].count();
+        }
+        try report("crash_takeover", nw * m2, secs2, null, ",\"failed_writers\":{d},\"lost\":{d},\"garbled\":{d},\"lanes\":{d}", .{ failed, lost2, chk2.bad, chk2.lanes });
     }
 }
