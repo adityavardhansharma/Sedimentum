@@ -754,26 +754,14 @@ fn df(w: *const Stratum, x: u64) u32 {
     return m;
 }
 
-/// Counts one more memory with this word. Safe without the write lock: a
-/// count that moved meanwhile is left alone (counts are estimates).
+/// Counts one more memory with this word (a conservative update: each
+/// slot rises to at most the smallest count plus one). Safe without the
+/// write lock: writers bumping the same word at once may count it once
+/// (counts are estimates).
 fn bumpDf(w: *Stratum, x: u64) void {
-    const slots = cmsSlots(x);
     const m = w.df(x);
     if (m == std.math.maxInt(u32)) return;
-    for (slots) |s| {
-        _ = @cmpxchgStrong(u32, &w.cms[s], m, m + 1, .monotonic, .monotonic);
-    }
-}
-
-/// `bumpDf` for the writer holding the lock: no compare-and-swap, as no
-/// one else bumps meanwhile (readers only load).
-fn bumpDfLocked(w: *Stratum, x: u64) void {
-    const slots = cmsSlots(x);
-    const m = w.df(x);
-    if (m == std.math.maxInt(u32)) return;
-    for (slots) |s| {
-        if (@atomicLoad(u32, &w.cms[s], .monotonic) == m) @atomicStore(u32, &w.cms[s], m + 1, .monotonic);
-    }
+    for (cmsSlots(x)) |s| _ = @atomicRmw(u32, &w.cms[s], .Max, m + 1, .monotonic);
 }
 
 fn idf(w: *const Stratum, x: u64) f32 {
@@ -1290,7 +1278,6 @@ fn writeBatch(w: *Stratum, reqs: []*WriteReq) void {
         };
         r.result = idOf(w.me, @intCast(res.rec >> 3));
         pos += res.len;
-        for (r.hashes) |h| w.bumpDfLocked(h);
     }
     w.commitAppend(start + pos);
 }
@@ -1492,6 +1479,8 @@ fn rememberOne(w: *Stratum, it: Item) !u64 {
     }
     var req: WriteReq = .{ .it = it, .pre = x, .nterms = @intCast(ts.total), .hashes = ts.hashes[0..ts.len], .bound = encodeBound(it), .now = w.nowMs() };
     const id = try w.submit(&req);
+    // Word counts are bumped here, on every core, not under the lock.
+    for (req.hashes) |hh| w.bumpDf(hh);
     if (w.options.sync_writes) try w.sync();
     try w.maybeSnapshot();
     return id;
@@ -1875,32 +1864,41 @@ fn load(w: *const Stratum, gpa: Allocator, id: u64) !?Memory {
     if (!w.alive(id, h)) return null;
     const head = w.recBytes(id, h)[scopeStart(h)..][0 .. @as(usize, h.lens.scope) + h.lens.subject];
     const stored = w.storedText(id, h);
+    if (h.flags & flag_coded == 0) {
+        const bytes = try gpa.alloc(u8, head.len + stored.len);
+        @memcpy(bytes[0..head.len], head);
+        @memcpy(bytes[head.len..], stored);
+        // Erased while we copied: the copy no longer matches.
+        if (Crc.hash(bytes[head.len..]) != h.text_crc) {
+            gpa.free(bytes);
+            return null;
+        }
+        return memoryOf(id, h, bytes);
+    }
+    // Decoded straight from the lane into a scratch buffer, then copied
+    // once. Erasing only ever zeroes, text before words, so a text that
+    // still matches its crc after decoding was whole the entire time.
+    const vocab = &w.lanes[laneOf(id)].vocab;
+    var scratch: [8192]u8 = undefined;
+    if (try wordcode.decodeInto(vocab, stored, &scratch)) |n| {
+        if (!w.textIntact(id, h)) return null;
+        const bytes = try gpa.alloc(u8, head.len + n);
+        @memcpy(bytes[0..head.len], head);
+        @memcpy(bytes[head.len..], scratch[0..n]);
+        return memoryOf(id, h, bytes);
+    }
     var raw: std.ArrayList(u8) = .empty;
     errdefer raw.deinit(gpa);
-    try raw.ensureTotalCapacity(gpa, head.len + stored.len);
-    raw.appendSliceAssumeCapacity(head);
-    if (h.flags & flag_coded == 0) {
-        raw.appendSliceAssumeCapacity(stored);
-        // Erased while we copied: the copy no longer matches.
-        if (Crc.hash(raw.items[head.len..]) != h.text_crc) {
-            raw.deinit(gpa);
-            return null;
-        }
-    } else {
-        const copy = try gpa.dupe(u8, stored);
-        defer gpa.free(copy);
-        if (Crc.hash(copy) != h.text_crc) {
-            raw.deinit(gpa);
-            return null;
-        }
-        try wordcode.decode(&w.lanes[laneOf(id)].vocab, copy, gpa, &raw);
-        // Erased while we decoded (its words may be gone too): drop it.
-        if (!w.textIntact(id, h)) {
-            raw.deinit(gpa);
-            return null;
-        }
+    try raw.appendSlice(gpa, head);
+    try wordcode.decode(vocab, stored, gpa, &raw);
+    if (!w.textIntact(id, h)) {
+        raw.deinit(gpa);
+        return null;
     }
-    const bytes = try raw.toOwnedSlice(gpa);
+    return memoryOf(id, h, try raw.toOwnedSlice(gpa));
+}
+
+fn memoryOf(id: u64, h: *const Hdr, bytes: []u8) Memory {
     return .{
         .id = id,
         .time = h.time,
@@ -2226,40 +2224,41 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     defer by_head.deinit(gpa);
     var tbuf: std.ArrayList(u8) = .empty;
     defer tbuf.deinit(gpa);
+    // Scored from the lane (decoded into one reused buffer); only the
+    // winners are copied out, at the end.
     for (ctx.cands.items[0..pool_n]) |c| {
         const vh = w.hdrAt(c.id);
         const head = if (q.deep) c.id else w.headOf(c.id, vh);
         const hh = w.hdrAt(head);
+        const subj: f32 = if (hh.lens.subject > 0) 1.1 else 1.0;
         const dup = try by_head.getOrPut(gpa, head);
         if (dup.found_existing) {
             const prev = &hits.items[dup.value_ptr.*];
             const other = textScore(qt, qsum, avg_len, meaning, w.textInto(gpa, c.id, vh, &tbuf) catch "");
-            const subj0: f32 = if (hh.lens.subject > 0) 1.1 else 1.0;
-            const sc = other.score * w.recency(now, hh.time) * subj0;
+            const sc = other.score * w.recency(now, hh.time) * subj;
             if (sc > prev.score) {
                 prev.score = sc;
                 prev.matched = other.mask;
             }
             continue;
         }
-        const m = (try w.load(gpa, head)) orelse {
+        if (!w.alive(head, hh)) {
             _ = by_head.remove(head);
             continue;
-        };
-        var best = textScore(qt, qsum, avg_len, meaning, m.text);
+        }
+        var best = textScore(qt, qsum, avg_len, meaning, w.textInto(gpa, head, hh, &tbuf) catch "");
         if (head != c.id) {
             const other = textScore(qt, qsum, avg_len, meaning, w.textInto(gpa, c.id, vh, &tbuf) catch "");
             if (other.score > best.score) best = other;
         }
         if (best.score == 0) {
-            m.deinit(gpa);
             _ = by_head.remove(head);
             continue;
         }
-        const subj: f32 = if (hh.lens.subject > 0) 1.1 else 1.0;
         const score = best.score * w.recency(now, hh.time) * subj;
         dup.value_ptr.* = @intCast(hits.items.len);
-        try hits.append(gpa, .{ .memory = m, .score = score, .buried = q.deep and w.isBuried(head, hh), .matched = best.mask });
+        // Not loaded yet: only its id and time, for the ordering below.
+        try hits.append(gpa, .{ .memory = .{ .id = head, .time = hh.time, .scope = "", .subject = "", .text = "", .raw = &.{} }, .score = score, .buried = q.deep and w.isBuried(head, hh), .matched = best.mask });
     }
     std.mem.sortUnstable(Hit, hits.items, {}, struct {
         fn gt(_: void, a: Hit, b: Hit) bool {
@@ -2267,7 +2266,16 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
         }
     }.gt);
     if (!q.deep) sedimentHits(hits.items);
-    while (hits.items.len > limit) hits.pop().?.memory.deinit(gpa);
+    // Copy out the winners. One erased meanwhile is left out.
+    var n: usize = 0;
+    for (hits.items) |x| {
+        if (n == limit) break;
+        const m = (try w.load(gpa, x.memory.id)) orelse continue;
+        hits.items[n] = x;
+        hits.items[n].memory = m;
+        n += 1;
+    }
+    hits.shrinkRetainingCapacity(n);
     return hits.toOwnedSlice(gpa);
 }
 
@@ -2276,21 +2284,35 @@ const Scored = struct { score: f32, mask: u8 };
 /// BM25 over word groups, times the squared share of the question covered,
 /// times closeness in meaning.
 fn textScore(qt: []const QTerm, qsum: f32, avg_len: f32, meaning: ?*const Meaning, body: []const u8) Scored {
-    var mt: text.TermSet = .{};
-    mt.fill(body);
+    // Counts only the question's words as the text streams by; most words
+    // are turned away by one bit test.
+    const Match = struct {
+        qt: []const QTerm,
+        bits: u64 = 0,
+        tf: [max_groups * (1 + max_related)]u16 = @splat(0),
+        total: usize = 0,
+        pub fn term(m: *@This(), h: u64) void {
+            m.total += 1;
+            if (m.bits >> @intCast(h & 63) & 1 == 0) return;
+            for (m.qt, 0..) |t, i| if (t.hash == h) {
+                m.tf[i] +|= 1;
+                return;
+            };
+        }
+    };
+    var mt: Match = .{ .qt = qt };
+    for (qt) |t| mt.bits |= @as(u64, 1) << @intCast(t.hash & 63);
+    text.forEachTerm(body, &mt);
     var gbm: [max_groups]f32 = @splat(0);
     var gcov: [max_groups]f32 = @splat(0);
     var mask: u8 = 0;
     const dl: f32 = @floatFromInt(mt.total);
-    for (qt) |t| {
-        for (mt.hashes[0..mt.len], 0..) |x, i| if (x == t.hash) {
-            if (t.idf <= gcov[t.group]) break;
-            const tf: f32 = @floatFromInt(mt.tf[i]);
-            gbm[t.group] = t.idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / @max(avg_len, 1)));
-            gcov[t.group] = t.idf;
-            mask |= @as(u8, 1) << @intCast(t.group);
-            break;
-        };
+    for (qt, 0..) |t, i| {
+        if (mt.tf[i] == 0 or t.idf <= gcov[t.group]) continue;
+        const tf: f32 = @floatFromInt(mt.tf[i]);
+        gbm[t.group] = t.idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * dl / @max(avg_len, 1)));
+        gcov[t.group] = t.idf;
+        mask |= @as(u8, 1) << @intCast(t.group);
     }
     var bm: f32 = 0;
     var covered: f32 = 0;

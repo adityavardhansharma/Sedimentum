@@ -373,9 +373,16 @@ fn agentTurns(io: Io, h: *Holo, dir: []const u8, name: []const u8, promised: boo
     h.setClockForTest(t0_ms + clock.load(.monotonic) * 100);
     const syncs_before = h.syncCount();
     t = nowNs(io);
+    var ru0: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru0);
     for (&hs, 0..) |*hh, th| hh.* = try std.Thread.spawn(.{}, Agent.run, .{ &ags[th], h, th });
     for (hs) |hh| hh.join();
     const secs = secondsSince(io, t);
+    // CPU spent per turn, in the process and in the kernel on its behalf.
+    var ru1: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru1);
+    const user_us = (ru1.utime.sec - ru0.utime.sec) * 1_000_000 + (ru1.utime.usec - ru0.utime.usec);
+    const sys_us = (ru1.stime.sec - ru0.stime.sec) * 1_000_000 + (ru1.stime.usec - ru0.stime.usec);
     var all: Lat = .{};
     var briefs: Lat = .{};
     var deletes: u64 = 0;
@@ -393,10 +400,9 @@ fn agentTurns(io: Io, h: *Holo, dir: []const u8, name: []const u8, promised: boo
         nbriefs += ag.briefs;
         ctx += ag.context_msgs;
     }
-    try report(name, turns_total, secs, &all, ",\"durable_p50_ns\":{d},\"durable_p99_ns\":{d},\"step_us_per_turn\":{{\"recent\":{d},\"current\":{d},\"brief\":{d},\"remember\":{d},\"forget\":{d},\"sync\":{d}}},\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
-        dur.pct(0.5),                 dur.pct(0.99),        steps[0] / turns_total / 1000, steps[1] / turns_total / 1000, steps[2] / turns_total / 1000, steps[3] / turns_total / 1000, steps[4] / turns_total / 1000, steps[5] / turns_total / 1000,
-        h.syncCount() - syncs_before, deletes,              nbriefs,                       briefs.pct(0.5),               briefs.pct(0.99),              ctx,                           dirBytes(io, dir),             maxRssKb(io),
-        anonKb(io),                   h.info().index_bytes,
+    try report(name, turns_total, secs, &all, ",\"durable_p50_ns\":{d},\"durable_p99_ns\":{d},\"cpu_us_per_turn\":{{\"user\":{d},\"sys\":{d}}},\"step_us_per_turn\":{{\"recent\":{d},\"current\":{d},\"brief\":{d},\"remember\":{d},\"forget\":{d},\"sync\":{d}}},\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
+        dur.pct(0.5),                 dur.pct(0.99), @divTrunc(user_us, turns_total), @divTrunc(sys_us, turns_total), steps[0] / turns_total / 1000, steps[1] / turns_total / 1000, steps[2] / turns_total / 1000, steps[3] / turns_total / 1000, steps[4] / turns_total / 1000, steps[5] / turns_total / 1000,
+        h.syncCount() - syncs_before, deletes,       nbriefs,                         briefs.pct(0.5),                briefs.pct(0.99),              ctx,                           dirBytes(io, dir),             maxRssKb(io),                  anonKb(io),                    h.info().index_bytes,
     });
 }
 

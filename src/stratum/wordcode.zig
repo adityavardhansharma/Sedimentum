@@ -211,6 +211,38 @@ pub fn decode(vocab: *const Vocab, enc: []const u8, gpa: Allocator, out: *std.Ar
     }
 }
 
+/// Like `decode`, into a fixed buffer. Returns the length, or null when
+/// the buffer is too small.
+pub fn decodeInto(vocab: *const Vocab, enc: []const u8, out: []u8) !?usize {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < enc.len) {
+        const op = enc[i];
+        if (op < 0xC0) {
+            var code: usize = op;
+            i += 1;
+            if (op >= 0x80) {
+                if (i >= enc.len) return error.Corrupt;
+                code = 128 + ((@as(usize, op & 0x3F) << 8) | enc[i]);
+                i += 1;
+            }
+            const word = vocab.get(code) orelse return error.Corrupt;
+            if (o + word.len + 1 > out.len) return null;
+            @memcpy(out[o..][0..word.len], word);
+            out[o + word.len] = ' ';
+            o += word.len + 1;
+        } else {
+            const n = @as(usize, op & 0x3F) + 1;
+            if (i + 1 + n > enc.len) return error.Corrupt;
+            if (o + n > out.len) return null;
+            @memcpy(out[o..][0..n], enc[i + 1 ..][0..n]);
+            o += n;
+            i += 1 + n;
+        }
+    }
+    return o;
+}
+
 test "round trip, words get codes on their second sighting" {
     const gpa = std.testing.allocator;
     var vocab: Vocab = .{};
