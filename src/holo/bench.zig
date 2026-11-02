@@ -265,37 +265,9 @@ fn factSubject(buf: *[32]u8, f: u64) []const u8 {
 var clock: std.atomic.Value(u64) = .init(0);
 const t0_ms: u64 = 1_700_000_000_000;
 
-fn runAgent(io: Io, dir: []const u8) !void {
-    prog_phases = 3;
-    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
-    var mb: std.ArrayList(u8) = .empty;
-    defer mb.deinit(gpa);
-    var sb: [32]u8 = undefined;
-    var fb: [32]u8 = undefined;
-
-    phaseStart("agent_seed", seed_messages + fact_agents * facts_per_agent);
-    var t = nowNs(io);
-    var s: u64 = 99;
-    var raw_bytes: u64 = 0;
-    for (0..seed_messages) |_| {
-        const tm = clock.fetchAdd(1, .monotonic);
-        const v = try message(&mb, tm, if (tm % 2 == 0) "user" else "assistant");
-        raw_bytes += v.len;
-        _ = try h.remember(chatScope(&sb, splitmix(&s) % chats), v, .{ .time = t0_ms + tm * 100 });
-        tick();
-    }
-    for (0..fact_agents) |a| for (0..facts_per_agent) |f| {
-        const v = try fact(&mb, a, f, 0);
-        raw_bytes += v.len;
-        _ = try h.remember(agentScope(&sb, a), v, .{ .subject = factSubject(&fb, f), .time = t0_ms + clock.load(.monotonic) * 100 });
-        tick();
-    };
-    try h.sync();
-    try report("agent_seed", seed_messages + fact_agents * facts_per_agent, secondsSince(io, t), null, ",\"raw_bytes\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
-        raw_bytes, dirBytes(io, dir), maxRssKb(io), anonKb(io), h.info().index_bytes,
-    });
-
-    phaseStart("agent_turns", turns_total);
+fn agentTurns(io: Io, h: *Holo, dir: []const u8, name: []const u8, promised: bool) !void {
+    var t: i96 = undefined;
+    phaseStart(name, turns_total);
     const Agent = struct {
         lat: Lat = .{},
         deletes: u64 = 0,
@@ -305,6 +277,11 @@ fn runAgent(io: Io, dir: []const u8) !void {
         /// Time spent per step: recent, current, brief, remember, forget, sync.
         step_ns: [6]u64 = @splat(0),
         failed: ?anyerror = null,
+        /// Promised turns: no wait for the disk; each turn's promise is
+        /// checked later, and the last one waited on at the end.
+        promised: bool = false,
+        /// Time from a turn's write to it being durable (promised turns).
+        durable_lat: Lat = .{},
 
         fn run(self: *@This(), d: *Holo, th: u64) void {
             self.work(d, th) catch |e| {
@@ -314,6 +291,10 @@ fn runAgent(io: Io, dir: []const u8) !void {
 
         fn work(self: *@This(), d: *Holo, th: u64) !void {
             var st: u64 = 1000 + th;
+            const Pend = struct { p: u64, t: i96 };
+            var pend: std.ArrayList(Pend) = .empty;
+            defer pend.deinit(driver);
+            var ph: usize = 0;
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(gpa);
             var b1: [32]u8 = undefined;
@@ -365,14 +346,29 @@ fn runAgent(io: Io, dir: []const u8) !void {
                 }
                 s1 = nowNs(io_g);
                 self.step_ns[4] += @intCast(s1 - s0);
-                try d.sync();
+                if (self.promised) {
+                    if (comptime @hasDecl(Holo, "promise")) {
+                        try pend.append(driver, .{ .p = d.promise(), .t = s1 });
+                        const now = nowNs(io_g);
+                        while (ph < pend.items.len and d.isDurable(pend.items[ph].p)) : (ph += 1) {
+                            try self.durable_lat.ns.append(driver, @intCast(now - pend.items[ph].t));
+                        }
+                    } else unreachable;
+                } else try d.sync();
                 self.step_ns[5] += @intCast(nowNs(io_g) - s1);
                 try self.lat.ns.append(driver, @intCast(nowNs(io_g) - a));
                 tick();
             }
+            if (comptime @hasDecl(Holo, "promise")) if (self.promised and pend.items.len > 0) {
+                // Every promise is kept before the thread is done.
+                try d.waitDurable(pend.items[pend.items.len - 1].p);
+                const now = nowNs(io_g);
+                for (pend.items[ph..]) |x| try self.durable_lat.ns.append(driver, @intCast(now - x.t));
+            };
         }
     };
     var ags: [turn_threads]Agent = @splat(.{});
+    for (&ags) |*ag| ag.promised = promised;
     var hs: [turn_threads]std.Thread = undefined;
     h.setClockForTest(t0_ms + clock.load(.monotonic) * 100);
     const syncs_before = h.syncCount();
@@ -386,7 +382,9 @@ fn runAgent(io: Io, dir: []const u8) !void {
     var nbriefs: u64 = 0;
     var ctx: u64 = 0;
     var steps: [6]u64 = @splat(0);
+    var dur: Lat = .{};
     for (&ags) |*ag| {
+        try dur.ns.appendSlice(driver, ag.durable_lat.ns.items);
         for (&steps, ag.step_ns) |*x, y| x.* += y;
         if (ag.failed) |e| return e;
         try all.ns.appendSlice(driver, ag.lat.ns.items);
@@ -395,11 +393,50 @@ fn runAgent(io: Io, dir: []const u8) !void {
         nbriefs += ag.briefs;
         ctx += ag.context_msgs;
     }
-    try report("agent_turns", turns_total, secs, &all, ",\"step_us_per_turn\":{{\"recent\":{d},\"current\":{d},\"brief\":{d},\"remember\":{d},\"forget\":{d},\"sync\":{d}}},\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
-        steps[0] / turns_total / 1000, steps[1] / turns_total / 1000, steps[2] / turns_total / 1000, steps[3] / turns_total / 1000, steps[4] / turns_total / 1000, steps[5] / turns_total / 1000,
-        h.syncCount() - syncs_before,  deletes,                       nbriefs,                       briefs.pct(0.5),               briefs.pct(0.99),              ctx,
-        dirBytes(io, dir),             maxRssKb(io),                  anonKb(io),                    h.info().index_bytes,
+    try report(name, turns_total, secs, &all, ",\"durable_p50_ns\":{d},\"durable_p99_ns\":{d},\"step_us_per_turn\":{{\"recent\":{d},\"current\":{d},\"brief\":{d},\"remember\":{d},\"forget\":{d},\"sync\":{d}}},\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
+        dur.pct(0.5),                 dur.pct(0.99),        steps[0] / turns_total / 1000, steps[1] / turns_total / 1000, steps[2] / turns_total / 1000, steps[3] / turns_total / 1000, steps[4] / turns_total / 1000, steps[5] / turns_total / 1000,
+        h.syncCount() - syncs_before, deletes,              nbriefs,                       briefs.pct(0.5),               briefs.pct(0.99),              ctx,                           dirBytes(io, dir),             maxRssKb(io),
+        anonKb(io),                   h.info().index_bytes,
     });
+}
+
+fn runAgent(io: Io, dir: []const u8) !void {
+    prog_phases = if (@hasDecl(Holo, "promise")) 4 else 3;
+    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false });
+    var mb: std.ArrayList(u8) = .empty;
+    defer mb.deinit(gpa);
+    var sb: [32]u8 = undefined;
+    var fb: [32]u8 = undefined;
+
+    phaseStart("agent_seed", seed_messages + fact_agents * facts_per_agent);
+    var t = nowNs(io);
+    var s: u64 = 99;
+    var raw_bytes: u64 = 0;
+    for (0..seed_messages) |_| {
+        const tm = clock.fetchAdd(1, .monotonic);
+        const v = try message(&mb, tm, if (tm % 2 == 0) "user" else "assistant");
+        raw_bytes += v.len;
+        _ = try h.remember(chatScope(&sb, splitmix(&s) % chats), v, .{ .time = t0_ms + tm * 100 });
+        tick();
+    }
+    for (0..fact_agents) |a| for (0..facts_per_agent) |f| {
+        const v = try fact(&mb, a, f, 0);
+        raw_bytes += v.len;
+        _ = try h.remember(agentScope(&sb, a), v, .{ .subject = factSubject(&fb, f), .time = t0_ms + clock.load(.monotonic) * 100 });
+        tick();
+    };
+    try h.sync();
+    try report("agent_seed", seed_messages + fact_agents * facts_per_agent, secondsSince(io, t), null, ",\"raw_bytes\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
+        raw_bytes, dirBytes(io, dir), maxRssKb(io), anonKb(io), h.info().index_bytes,
+    });
+
+    try agentTurns(io, h, dir, "agent_turns", false);
+    if (comptime @hasDecl(Holo, "promise")) {
+        // Same store, now with promised turns.
+        h.close();
+        h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, .{ .sync_writes = false, .flusher = true });
+        try agentTurns(io, h, dir, "agent_turns_promised", true);
+    }
 
     phaseStart("agent_reopen", 1);
     t = nowNs(io);

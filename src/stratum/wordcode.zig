@@ -113,6 +113,77 @@ pub const Encoder = struct {
     }
 };
 
+/// The key a word has in a lane's code table (word -> code + 1).
+pub fn wordKey(word: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x70de, word) >> 1;
+}
+
+/// Encodes `text` with the codes the lane has now, reading only (any
+/// thread, inside the readers' gate). Words without a code are copied as
+/// literals and listed in `cand`, for `learn` to give codes later.
+/// With `gpa` null, `cand` has a fixed buffer and words past it are not
+/// listed.
+pub fn encodeKnown(vocab: *const Vocab, map: *const tables.Map, text: []const u8, out: []u8, cand: ?*std.ArrayList([]const u8), gpa: ?Allocator) !usize {
+    var o: usize = 0;
+    var lit_start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (!isWordByte(text[i]) or (i > 0 and isWordByte(text[i - 1]))) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < text.len and isWordByte(text[j])) j += 1;
+        const word = text[i..j];
+        const coded = j < text.len and text[j] == ' ' and word.len >= 2 and word.len <= max_word;
+        if (!coded) {
+            i = j;
+            continue;
+        }
+        const code: ?usize = blk: {
+            const v = map.get(wordKey(word)) orelse break :blk null;
+            if (v == 0) break :blk null;
+            const c = v - 1;
+            const known = vocab.get(c) orelse break :blk null;
+            if (!std.mem.eql(u8, known, word)) break :blk null;
+            break :blk c;
+        };
+        if (code) |c| {
+            o = Encoder.literal(out, o, text[lit_start..i]);
+            if (c < 128) {
+                out[o] = @intCast(c);
+                o += 1;
+            } else {
+                const x = c - 128;
+                out[o] = 0x80 | @as(u8, @intCast(x >> 8));
+                out[o + 1] = @truncate(x);
+                o += 2;
+            }
+            lit_start = j + 1;
+            i = j + 1;
+        } else {
+            if (cand) |cl| {
+                if (gpa) |a| try cl.append(a, word) else cl.appendBounded(word) catch {};
+            }
+            i = j;
+        }
+    }
+    return Encoder.literal(out, o, text[lit_start..]);
+}
+
+/// Counts sightings of words without a code and gives a code to those seen
+/// before (writer only). New words go to `new_words`, to be written down.
+pub fn learn(gpa: Allocator, vocab: *Vocab, map: *tables.Map, readers: *tables.Readers, io: std.Io, seen: []u8, cand: []const []const u8, new_words: *std.ArrayList([]const u8)) !void {
+    for (cand) |word| {
+        const k = wordKey(word);
+        if (map.get(k)) |v| if (v != 0) continue;
+        if (!sighted(seen, word) or vocab.len() >= Vocab.max) continue;
+        const c = try vocab.append(gpa, word);
+        try map.put(gpa, readers, io, k, c + 1);
+        try new_words.append(gpa, vocab.get(c).?);
+    }
+}
+
 /// Decodes into `out` (appending). error.Corrupt on a code the vocabulary
 /// does not have or a run past the end.
 pub fn decode(vocab: *const Vocab, enc: []const u8, gpa: Allocator, out: *std.ArrayList(u8)) !void {

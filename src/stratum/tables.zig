@@ -88,6 +88,10 @@ pub const Lock = struct {
         while (l.state.swap(2, .acquire) != 0) io.futexWaitUncancelable(u32, &l.state.raw, 2);
     }
 
+    pub fn tryLock(l: *Lock) bool {
+        return l.state.load(.monotonic) == 0 and l.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
     pub fn unlock(l: *Lock, io: Io) void {
         if (l.state.swap(0, .release) == 2) io.futexWake(u32, &l.state.raw, 1);
     }

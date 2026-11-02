@@ -205,6 +205,10 @@ pub const Options = struct {
     half_life_ms: u64 = 7 * 24 * 3600 * 1000,
     /// Word meanings; with them, questions in other words find memories.
     meaning: ?*const Meaning = null,
+    /// A background thread makes writes durable as they come, many at a
+    /// time. Writers then take a `promise` instead of calling `sync`, and
+    /// wait on it (`waitDurable`) only before acting outside the machine.
+    flusher: bool = false,
 };
 
 const Lane = struct {
@@ -252,6 +256,16 @@ end: std.atomic.Value(u64) = .init(data_start),
 synced: std.atomic.Value(u64) = .init(data_start),
 
 syncs: std.atomic.Value(u64) = .init(0),
+/// Single memories waiting for the writer holding the lock (newest first).
+req_head: std.atomic.Value(?*WriteReq) = .init(null),
+/// Bumped by every append; the flusher sleeps on it.
+wseq: std.atomic.Value(u32) = .init(0),
+flusher_waiting: std.atomic.Value(bool) = .init(false),
+/// Bumped after every flush; `waitDurable` sleeps on it.
+dseq: std.atomic.Value(u32) = .init(0),
+flusher_stop: std.atomic.Value(bool) = .init(false),
+flusher_err: ?anyerror = null,
+flusher_thread: ?std.Thread = null,
 last_refresh: std.atomic.Value(u64) = .init(0),
 /// A failed write could not be undone: further writes are refused.
 broken: bool = false,
@@ -285,13 +299,18 @@ scope_map: tables.Map = .{},
 scope_heads: tables.Map = .{},
 rules: std.ArrayList(Rule) = .empty,
 /// Word -> code in our lane's word code (writer only).
-codes: std.StringHashMapUnmanaged(u16) = .empty,
+code_of: tables.Map = .{},
+/// Bumped when a word of ours is erased: text coded outside the write
+/// lock before that is coded again.
+word_gen: std.atomic.Value(u64) = .init(0),
 /// Word sightings, for giving codes to words seen twice (writer only).
 seen: []u8 = &.{},
 /// Decoding scratch for the writer.
 scratch: std.ArrayList(u8) = .empty,
 /// Encoding scratch for the writer.
 enc_buf: std.ArrayList(u8) = .empty,
+cand_buf: std.ArrayList([]const u8) = .empty,
+new_words: std.ArrayList([]const u8) = .empty,
 /// (scope, subject) -> newest record with that subject.
 subjects: tables.Map = .{},
 /// Stratum root -> its newest version, for strata with two or more.
@@ -356,6 +375,7 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     if (w.nlanes <= w.me) return error.Corrupt;
     w.alloc = try own.length(io);
     try w.loadTables();
+    if (options.flusher) w.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{w});
     return w;
 }
 
@@ -456,7 +476,7 @@ fn resetTables(w: *Stratum) void {
     w.last_stamp = 0;
     w.merges = 0;
     w.scopes.clear(gpa);
-    w.codes.clearRetainingCapacity();
+    w.code_of.clearRetainingCapacity(gpa);
     @memset(w.seen, 0);
     for (w.lanes[0..w.nlanes]) |*l| {
         l.vocab.clear(gpa);
@@ -475,11 +495,13 @@ fn resetTables(w: *Stratum) void {
 
 fn freeAll(w: *Stratum) void {
     const gpa = w.gpa;
-    w.codes.deinit(gpa);
+    w.code_of.deinit(gpa);
     gpa.free(w.seen);
     w.seen = &.{};
     w.scratch.deinit(gpa);
     w.enc_buf.deinit(gpa);
+    w.cand_buf.deinit(gpa);
+    w.new_words.deinit(gpa);
     w.word_refs.deinit(gpa);
     w.word_at.deinit(gpa);
     for (w.lanes[0..w.nlanes]) |*l| {
@@ -501,6 +523,13 @@ fn freeAll(w: *Stratum) void {
 }
 
 pub fn close(w: *Stratum) void {
+    if (w.flusher_thread) |t| {
+        w.flusher_stop.store(true, .release);
+        _ = w.wseq.fetchAdd(1, .release);
+        w.io.futexWake(u32, &w.wseq.raw, 1);
+        t.join();
+        w.flusher_thread = null;
+    }
     // A snapshot holds every lane's chain heads (4 MB a lane): only worth
     // writing when this writer added a lot that reopening would replay.
     w.snapshotIfGrew(close_snapshot_after) catch {};
@@ -736,6 +765,17 @@ fn bumpDf(w: *Stratum, x: u64) void {
     }
 }
 
+/// `bumpDf` for the writer holding the lock: no compare-and-swap, as no
+/// one else bumps meanwhile (readers only load).
+fn bumpDfLocked(w: *Stratum, x: u64) void {
+    const slots = cmsSlots(x);
+    const m = w.df(x);
+    if (m == std.math.maxInt(u32)) return;
+    for (slots) |s| {
+        if (@atomicLoad(u32, &w.cms[s], .monotonic) == m) @atomicStore(u32, &w.cms[s], m + 1, .monotonic);
+    }
+}
+
 fn idf(w: *const Stratum, x: u64) f32 {
     const n: f32 = @floatFromInt(@max(w.count, 1));
     const d: f32 = @floatFromInt(w.df(x));
@@ -837,7 +877,7 @@ fn learnWords(w: *Stratum, lane: usize, off8: u32, h: *const Hdr) !void {
         if (lane == w.me) {
             try w.word_at.append(w.gpa, base + p + 1);
             try w.word_refs.append(w.gpa, 0);
-            if (word[0] != 0) try w.codes.put(w.gpa, w.lanes[lane].vocab.get(code).?, code);
+            if (word[0] != 0) try w.mput(&w.code_of, wordcode.wordKey(word), code + 1);
         }
         p += 1 + n;
     }
@@ -918,9 +958,10 @@ fn eraseWordIfUnused(w: *Stratum, code: usize) !void {
     if (code >= w.word_refs.items.len or w.word_refs.items[code] != 0) return;
     const word = w.lanes[w.me].vocab.get(code) orelse return;
     if (word.len == 0 or word[0] == 0) return;
-    _ = w.codes.remove(word);
-    var zeros: [wordcode.max_word]u8 = @splat(0);
-    try w.lanes[w.me].file.writePositionalAll(w.io, zeros[0..word.len], w.word_at.items[code]);
+    const k = wordcode.wordKey(word);
+    if (w.code_of.get(k) == code + 1) try w.mput(&w.code_of, k, 0);
+    _ = w.word_gen.fetchAdd(1, .release);
+    @memset(w.ownBytes()[w.word_at.items[code]..][0..word.len], 0);
     @memset(@constCast(word), 0);
     w.noteErased(w.word_at.items[code], w.word_at.items[code] + word.len);
 }
@@ -1126,7 +1167,156 @@ fn encodeBound(it: Item) usize {
 /// holds the write lock.
 /// `hashes`: the memory's words, counted here unless null (counted by the
 /// caller outside the lock).
-fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]const u64, total: u32, keys: []const u32, dfs: []const u32, lineage: ??u64) !struct { len: usize, rec: u64 } {
+/// What a single memory's writer works out before the write lock.
+const SinglePre = struct { keys: [term_threads]u32, dfs: [term_threads]u32, nk: usize, lineage: ?u64, text: PreText };
+
+/// One memory waiting to be written by the writer holding the lock.
+const WriteReq = struct {
+    it: Item,
+    pre: SinglePre,
+    nterms: u32,
+    /// Its words, counted by the writer that writes it.
+    hashes: []const u64,
+    bound: usize,
+    now: u64,
+    next: ?*WriteReq = null,
+    result: u64 = 0,
+    err: ?anyerror = null,
+    done: std.atomic.Value(u32) = .init(0),
+    sleeping: std.atomic.Value(bool) = .init(false),
+};
+
+fn submit(w: *Stratum, r: *WriteReq) !u64 {
+    var head = w.req_head.load(.monotonic);
+    while (true) {
+        r.next = head;
+        head = w.req_head.cmpxchgWeak(head, r, .release, .monotonic) orelse break;
+    }
+    var spins: usize = 0;
+    // done: 0 waiting, 1 written (the combiner may still touch `r`), 2 let go.
+    while (r.done.load(.acquire) != 2) {
+        if (r.done.load(.acquire) == 1) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        if (w.wlock.tryLock()) {
+            w.combine();
+            continue;
+        }
+        if (spins < 100) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        r.sleeping.store(true, .seq_cst);
+        if (r.done.load(.seq_cst) == 0)
+            w.io.futexWaitTimeout(u32, &r.done.raw, 0, .{ .duration = .{ .raw = .fromMicroseconds(200), .clock = .awake } }) catch {};
+        r.sleeping.store(false, .monotonic);
+    }
+    if (r.err) |e| return e;
+    return r.result;
+}
+
+/// Writes every waiting memory, then lets go of the lock (taken by the
+/// caller), and goes again if more came meanwhile.
+fn combine(w: *Stratum) void {
+    while (true) {
+        var batch: [64]*WriteReq = undefined;
+        var done_list: [64]*WriteReq = undefined;
+        var nd: usize = 0;
+        while (true) {
+            var list = w.req_head.swap(null, .acquire);
+            if (list == null) break;
+            // Oldest first.
+            var n: usize = 0;
+            while (list) |r| : (list = r.next) {
+                if (n == batch.len) {
+                    std.mem.reverse(*WriteReq, batch[0..n]);
+                    w.writeBatch(batch[0..n]);
+                    for (batch[0..n]) |x| release(w, x);
+                    n = 0;
+                }
+                batch[n] = r;
+                n += 1;
+            }
+            std.mem.reverse(*WriteReq, batch[0..n]);
+            w.writeBatch(batch[0..n]);
+            for (batch[0..n]) |x| {
+                if (nd < done_list.len) {
+                    done_list[nd] = x;
+                    nd += 1;
+                } else release(w, x);
+            }
+            if (nd == done_list.len) break;
+        }
+        w.wlock.unlock(w.io);
+        w.wakeFlusher();
+        for (done_list[0..nd]) |x| release(w, x);
+        if (w.req_head.load(.acquire) == null or !w.wlock.tryLock()) return;
+    }
+}
+
+/// Tells a waiting writer its memory is written. After the last store
+/// the request may be gone: only its address is used (for the wake).
+fn release(w: *Stratum, x: *WriteReq) void {
+    x.done.store(1, .seq_cst);
+    const sleeping = x.sleeping.load(.seq_cst);
+    const addr = &x.done.raw;
+    x.done.store(2, .release);
+    if (sleeping) w.io.futexWake(u32, addr, 1);
+}
+
+/// Writes single memories in one append. Caller holds the write lock.
+fn writeBatch(w: *Stratum, reqs: []*WriteReq) void {
+    if (reqs.len == 0) return;
+    if (w.broken) {
+        for (reqs) |r| r.err = error.Broken;
+        return;
+    }
+    var total: usize = 0;
+    for (reqs) |r| total += r.bound;
+    const start = w.reserve(total) catch |e| {
+        for (reqs) |r| r.err = e;
+        return;
+    };
+    const buf = w.ownBytes()[start..][0..total];
+    var pos: usize = 0;
+    for (reqs) |r| {
+        const x = r.pre;
+        const res = w.encode(buf[pos..], start + pos, r.it, r.now, null, r.nterms, x.keys[0..x.nk], x.dfs[0..x.nk], x.lineage, x.text) catch |e| {
+            w.recoverFailedWrite(start, total);
+            for (reqs) |q| q.err = e;
+            return;
+        };
+        r.result = idOf(w.me, @intCast(res.rec >> 3));
+        pos += res.len;
+        for (r.hashes) |h| w.bumpDfLocked(h);
+    }
+    w.commitAppend(start + pos);
+}
+
+/// A text coded outside the write lock (with the codes there were then).
+const PreText = struct { body: []const u8, coded: bool, cand: []const []const u8, gen: u64 };
+
+/// Codes a text with the lane's codes, reading only. Inside the readers'
+/// gate. `buf` holds at least `wordcode.bound(text.len)` bytes.
+/// `preEncode` with candidates kept in a fixed buffer while they fit
+/// (beyond it, they are dropped: those words just stay uncoded for now).
+fn preEncodeInto(w: *Stratum, text_: []const u8, buf: []u8, cand: *std.ArrayList([]const u8), _: [][]const u8) !PreText {
+    const gen = w.word_gen.load(.acquire);
+    const n = try wordcode.encodeKnown(&w.lanes[w.me].vocab, &w.code_of, text_, buf, cand, null);
+    const coded = n < text_.len;
+    return .{ .body = if (coded) buf[0..n] else text_, .coded = coded, .cand = cand.items, .gen = gen };
+}
+
+fn preEncode(w: *Stratum, text_: []const u8, buf: []u8, cand: *std.ArrayList([]const u8)) !PreText {
+    const gen = w.word_gen.load(.acquire);
+    const n = try wordcode.encodeKnown(&w.lanes[w.me].vocab, &w.code_of, text_, buf, cand, w.gpa);
+    const coded = n < text_.len;
+    return .{ .body = if (coded) buf[0..n] else text_, .coded = coded, .cand = cand.items, .gen = gen };
+}
+
+fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]const u64, total: u32, keys: []const u32, dfs: []const u32, lineage: ??u64, pre_text: ?PreText) !struct { len: usize, rec: u64 } {
     const subject = it.subject orelse "";
     const sh = scopeHash(it.scope);
     const nk = keys.len;
@@ -1142,16 +1332,23 @@ fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]cons
     const stamp = w.nextStamp();
     const sid = try w.intern(it.scope, sh);
 
-    // The text in the lane's word code, when that is shorter.
-    try w.enc_buf.resize(w.gpa, wordcode.bound(it.text.len));
-    var coder: wordcode.Encoder = .{ .gpa = w.gpa, .vocab = &w.lanes[w.me].vocab, .codes = &w.codes, .seen = w.seen };
-    defer coder.deinit();
-    const enc_len = try coder.encode(it.text, w.enc_buf.items);
-    const coded = enc_len < it.text.len;
-    const body = if (coded) w.enc_buf.items[0..enc_len] else it.text;
+    // The text in the lane's word code, when that is shorter: coded
+    // before the lock when it could be (and no word was erased since).
+    var pt: PreText = undefined;
+    if (pre_text != null and pre_text.?.gen == w.word_gen.load(.acquire)) {
+        pt = pre_text.?;
+    } else {
+        try w.enc_buf.resize(w.gpa, wordcode.bound(it.text.len));
+        w.cand_buf.clearRetainingCapacity();
+        pt = try w.preEncode(it.text, w.enc_buf.items, &w.cand_buf);
+    }
+    w.new_words.clearRetainingCapacity();
+    try wordcode.learn(w.gpa, &w.lanes[w.me].vocab, &w.code_of, &w.readers, w.io, w.seen, pt.cand, &w.new_words);
+    const coded = pt.coded;
+    const body = pt.body;
     var used: usize = 0;
-    if (coder.new_words.items.len > 0) {
-        used = w.wordsRecord(room, coder.new_words.items);
+    if (w.new_words.items.len > 0) {
+        used = w.wordsRecord(room, w.new_words.items);
         try w.noteOwnWords(off, room[0..used]);
     }
     if (coded) w.countCodes(body, 1);
@@ -1269,9 +1466,41 @@ pub fn remember(w: *Stratum, scope: []const u8, body: []const u8, opts: Remember
 
 const max_workers = 8;
 
+/// One memory (an agent's turn), with nothing allocated: its words, its
+/// threads, the fact it continues and its coded text are all worked out
+/// before the write lock, then the lock holder writes it.
+fn rememberOne(w: *Stratum, it: Item) !u64 {
+    try validate(it.scope, it.subject orelse "", it.text);
+    var ts: text.TermSet = .{};
+    ts.fill(it.text);
+    var stack_enc: [4096]u8 = undefined;
+    var heap_enc: []u8 = &.{};
+    defer w.gpa.free(heap_enc);
+    const need = wordcode.bound(it.text.len);
+    if (need > stack_enc.len) heap_enc = try w.gpa.alloc(u8, need);
+    var cand_stack: [256][]const u8 = undefined;
+    var cand: std.ArrayList([]const u8) = .initBuffer(&cand_stack);
+    defer if (cand.items.ptr != &cand_stack) cand.deinit(w.gpa);
+    var x: SinglePre = undefined;
+    {
+        w.readers.enter(w.io);
+        defer w.readers.leave(w.io);
+        x.text = try w.preEncodeInto(it.text, if (heap_enc.len > 0) heap_enc else &stack_enc, &cand, &cand_stack);
+        const hashes = ts.hashes[0..ts.len];
+        x.nk = w.chooseThreads(hashes, &x.keys, &x.dfs);
+        x.lineage = if (it.subject == null) w.findLineage(scopeHash(it.scope), x.keys[0..x.nk], x.dfs[0..x.nk]) else null;
+    }
+    var req: WriteReq = .{ .it = it, .pre = x, .nterms = @intCast(ts.total), .hashes = ts.hashes[0..ts.len], .bound = encodeBound(it), .now = w.nowMs() };
+    const id = try w.submit(&req);
+    if (w.options.sync_writes) try w.sync();
+    try w.maybeSnapshot();
+    return id;
+}
+
 /// Saves many memories at once and returns the first id. Words are found
 /// on every core; the records go to the file in one write.
 pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
+    if (items.len == 1) return w.rememberOne(items[0]);
     if (items.len == 0) return idOf(w.me, @intCast(w.end.load(.acquire) >> 3));
     for (items) |it| try validate(it.scope, it.subject orelse "", it.text);
     const gpa = w.gpa;
@@ -1315,20 +1544,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
 
     var total: usize = 0;
     for (items) |it| total += encodeBound(it);
-    // One memory (an agent's turn): pick its threads and find the fact it
-    // continues before taking the write lock, as a reader. A batch does
-    // this under the lock, so its memories can continue each other.
-    const Pre = struct { keys: [term_threads]u32, dfs: [term_threads]u32, nk: usize, lineage: ?u64 };
-    var pre: ?Pre = null;
-    if (items.len == 1) {
-        w.readers.enter(w.io);
-        defer w.readers.leave(w.io);
-        var x: Pre = undefined;
-        const hashes = pools[0].items[spans[0].start..][0..spans[0].len];
-        x.nk = w.chooseThreads(hashes, &x.keys, &x.dfs);
-        x.lineage = if (items[0].subject == null) w.findLineage(scopeHash(items[0].scope), x.keys[0..x.nk], x.dfs[0..x.nk]) else null;
-        pre = x;
-    }
+    const pre: ?SinglePre = null;
 
     const first = blk: {
         w.wlock.lockUncancelable(w.io);
@@ -1346,7 +1562,9 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
             var dfs: [term_threads]u32 = undefined;
             var nk: usize = undefined;
             var lineage: ??u64 = null;
+            var pt: ?PreText = null;
             if (pre) |x| {
+                pt = x.text;
                 keys = x.keys;
                 dfs = x.dfs;
                 nk = x.nk;
@@ -1354,13 +1572,14 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
             } else nk = w.chooseThreads(hashes, &keys, &dfs);
             // A batch counts words as it goes, so its later memories see
             // its earlier ones; a single memory counts after the lock.
-            const r = try w.encode(buf[pos..], start + pos, it, now, if (pre == null) hashes else null, sp.total, keys[0..nk], dfs[0..nk], lineage);
+            const r = try w.encode(buf[pos..], start + pos, it, now, if (pre == null) hashes else null, sp.total, keys[0..nk], dfs[0..nk], lineage, pt);
             if (i == 0) first_rec = r.rec;
             pos += r.len;
         }
         w.commitAppend(start + pos);
         break :blk idOf(w.me, @intCast(first_rec >> 3));
     };
+    w.wakeFlusher();
     // Word counts last, outside the lock.
     if (pre != null) for (pools[0].items[spans[0].start..][0..spans[0].len]) |x| w.bumpDf(x);
     if (w.options.sync_writes) try w.sync();
@@ -1429,6 +1648,54 @@ fn commitAppend(w: *Stratum, new_end: u64) void {
     w.end.store(new_end, .release);
     @atomicStore(u64, &w.lanes[w.me].end, new_end, .release);
     w.publish();
+    _ = w.wseq.fetchAdd(1, .release);
+}
+
+/// Wakes the flusher after an append. Called after the write lock is let
+/// go, so the system call is not made while others wait.
+fn wakeFlusher(w: *Stratum) void {
+    if (w.flusher_waiting.load(.acquire)) w.io.futexWake(u32, &w.wseq.raw, 1);
+}
+
+/// A promise for everything written so far: durable once `isDurable`
+/// says so. Costs one load.
+pub fn promise(w: *const Stratum) u64 {
+    return w.end.load(.acquire);
+}
+
+pub fn isDurable(w: *const Stratum, p: u64) bool {
+    return w.synced.load(.acquire) >= p;
+}
+
+/// Waits until a promise is durable. Without the flusher, flushes itself.
+pub fn waitDurable(w: *Stratum, p: u64) !void {
+    if (w.flusher_thread == null) return w.sync();
+    while (w.synced.load(.acquire) < p) {
+        if (w.flusher_err) |e| return e;
+        const d = w.dseq.load(.acquire);
+        if (w.synced.load(.acquire) >= p) break;
+        w.io.futexWaitTimeout(u32, &w.dseq.raw, d, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch {};
+    }
+}
+
+fn flusherLoop(w: *Stratum) void {
+    while (true) {
+        const seen = w.wseq.load(.acquire);
+        const pending = w.end.load(.acquire) > w.synced.load(.acquire) or @atomicLoad(bool, &w.erase_pending, .acquire);
+        if (pending) {
+            w.sync() catch |e| {
+                w.flusher_err = e;
+            };
+            _ = w.dseq.fetchAdd(1, .release);
+            w.io.futexWake(u32, &w.dseq.raw, std.math.maxInt(u32));
+            continue;
+        }
+        if (w.flusher_stop.load(.acquire)) return;
+        w.flusher_waiting.store(true, .seq_cst);
+        if (w.wseq.load(.seq_cst) == seen and !w.flusher_stop.load(.acquire))
+            w.io.futexWaitTimeout(u32, &w.wseq.raw, seen, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
+        w.flusher_waiting.store(false, .release);
+    }
 }
 
 fn publish(w: *Stratum) void {
