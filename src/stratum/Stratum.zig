@@ -422,6 +422,9 @@ fn recoverFailedWrite(w: *Stratum, start: u64, len: u64) void {
     w.loadTables() catch {
         w.broken = true;
     };
+    // Codes may have been dropped or given out again: texts coded before
+    // this must be coded again.
+    _ = w.word_gen.fetchAdd(1, .release);
     w.synced.store(@min(synced, w.end.load(.acquire)), .release);
 }
 
@@ -1331,6 +1334,14 @@ fn encode(w: *Stratum, room: []u8, off: u64, it: Item, now: u64, hashes: ?[]cons
     }
     w.new_words.clearRetainingCapacity();
     try wordcode.learn(w.gpa, &w.lanes[w.me].vocab, &w.code_of, &w.readers, w.io, w.seen, pt.cand, &w.new_words);
+    if (w.new_words.items.len > 0) {
+        // Words learned from this text: code it again so it uses them.
+        // Then forgetting it drops their last use and erases them too.
+        try w.enc_buf.resize(w.gpa, wordcode.bound(it.text.len));
+        const n = try wordcode.encodeKnown(&w.lanes[w.me].vocab, &w.code_of, it.text, w.enc_buf.items, null, null);
+        pt.body = w.enc_buf.items[0..n];
+        pt.coded = true;
+    }
     const coded = pt.coded;
     const body = pt.body;
     var used: usize = 0;
@@ -1672,11 +1683,18 @@ fn flusherLoop(w: *Stratum) void {
         const seen = w.wseq.load(.acquire);
         const pending = w.end.load(.acquire) > w.synced.load(.acquire) or @atomicLoad(bool, &w.erase_pending, .acquire);
         if (pending) {
+            var failed = false;
             w.sync() catch |e| {
                 w.flusher_err = e;
+                failed = true;
             };
             _ = w.dseq.fetchAdd(1, .release);
             w.io.futexWake(u32, &w.dseq.raw, std.math.maxInt(u32));
+            if (!failed) continue;
+            // The disk keeps failing: stop when asked, else retry after a
+            // pause rather than at once.
+            if (w.flusher_stop.load(.acquire)) return;
+            w.io.futexWaitTimeout(u32, &w.wseq.raw, w.wseq.load(.acquire), .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
             continue;
         }
         if (w.flusher_stop.load(.acquire)) return;
@@ -3241,6 +3259,26 @@ test "forgetting erases words only forgotten memories used, also after a snapsho
     const m = (try w.get(testing.allocator, again)).?;
     defer m.deinit(testing.allocator);
     try testing.expectEqualStrings("custsecretx is back custsecretx again ", m.text);
+}
+
+test "a word learned from the memory being forgotten is erased with it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    // Seen twice in one text: it gets a code while this memory is written.
+    const id = try w.remember("s", "custsecretx custsecretx ", .{});
+    const m = (try w.get(testing.allocator, id)).?;
+    try testing.expectEqualStrings("custsecretx custsecretx ", m.text);
+    m.deinit(testing.allocator);
+    try w.forget(id);
+    try w.sync();
+    // Before any reopen (which also sweeps unused words).
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    const bytes = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "custsecretx") == null);
 }
 
 test "a lane from an older layout is refused, not repaired" {
