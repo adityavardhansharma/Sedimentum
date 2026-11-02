@@ -1472,6 +1472,24 @@ pub const Info = struct {
     index_bytes: usize,
 };
 
+/// How many times the store flushed to disk.
+pub fn syncCount(h: *Holo) u64 {
+    return h.kv.syncCount();
+}
+
+/// Calls `f(ctx, record_bytes, time)` for every stored memory, oldest
+/// first: the cost of answering without an index.
+pub fn scanAll(h: *Holo, ctx: anytype, comptime f: anytype) !void {
+    var it = try h.kv.iterator(.{ .start = "~m/", .end = "~m0" }, null);
+    defer it.deinit();
+    while (try it.next()) |p| {
+        const tl = std.mem.readInt(u16, p.value[0..2], .little);
+        const bl = std.mem.readInt(u16, p.value[2 + tl ..][0..2], .little);
+        const tm = std.mem.readInt(u64, p.value[4 + tl + bl ..][0..8], .little);
+        f(ctx, p.value, tm);
+    }
+}
+
 pub fn info(h: *Holo) Info {
     h.lock.lockSharedUncancelable(h.io);
     defer h.lock.unlockShared(h.io);

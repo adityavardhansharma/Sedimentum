@@ -16,6 +16,9 @@ pub const streams = @import("streams/Store.zig");
 pub const Holo = @import("holo/Holo.zig");
 pub const holo_text = @import("holo/text.zig");
 pub const holo_meaning = @import("holo/Meaning.zig");
+/// Stratum: facts over their whole life, one lane file per writer; the
+/// memory structure behind Sedimentum.
+pub const Stratum = @import("stratum/Stratum.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

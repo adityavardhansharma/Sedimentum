@@ -17,7 +17,10 @@
 const std = @import("std");
 const Io = std.Io;
 const sdm = @import("sedimentum");
-const Holo = sdm.Holo;
+const bench_options = @import("bench_options");
+/// The engine under test: Holo, or Stratum (`sedimentum-stratum-bench`).
+const Holo = if (bench_options.stratum) sdm.Stratum else sdm.Holo;
+const engine_name = if (bench_options.stratum) "stratum" else "holo";
 
 var io_g: Io = undefined;
 
@@ -96,7 +99,7 @@ fn report(phase: []const u8, ops: u64, secs: f64, lat: ?*Lat, comptime extra_fmt
     const p50 = if (lat) |l| l.pct(0.50) else 0;
     const p99 = if (lat) |l| l.pct(0.99) else 0;
     const w = &out.interface;
-    try w.print("{{\"engine\":\"holo\",\"phase\":\"{s}\",\"ops\":{d},\"seconds\":{d:.6},\"ops_per_sec\":{d:.1},\"p50_ns\":{d},\"p99_ns\":{d}", .{
+    try w.print("{{\"engine\":\"" ++ engine_name ++ "\",\"phase\":\"{s}\",\"ops\":{d},\"seconds\":{d:.6},\"ops_per_sec\":{d:.1},\"p50_ns\":{d},\"p99_ns\":{d}", .{
         phase, ops, secs, @as(f64, @floatFromInt(ops)) / secs, p50, p99,
     });
     try w.print(extra_fmt, extra);
@@ -181,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
     io_g = io;
     prog_start = nowNs(io);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const usage = "usage: sedimentum-holo-bench <agent|recall|hard> <new-dir> [memories] [meaning-model]\n";
+    const usage = "usage: sedimentum-holo-bench <agent|recall|hard|jargon> <new-dir> [memories] [meaning-model]\n";
     if (args.len < 3) return fatal(io, usage);
     const mode = args[1];
     const dir = args[2];
@@ -196,6 +199,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "agent")) return runAgent(io, dir);
     if (std.mem.eql(u8, mode, "recall")) return runRecall(io, dir, n);
     if (std.mem.eql(u8, mode, "hard")) return runHard(io, dir, n, if (args.len > 4) args[4] else "models/holo-words.bin");
+    if (std.mem.eql(u8, mode, "jargon")) return runJargon(io, dir, n, if (args.len > 4) args[4] else "models/holo-words.bin");
     return fatal(io, usage);
 }
 
@@ -355,7 +359,7 @@ fn runAgent(io: Io, dir: []const u8) !void {
     var ags: [turn_threads]Agent = @splat(.{});
     var hs: [turn_threads]std.Thread = undefined;
     h.setClockForTest(t0_ms + clock.load(.monotonic) * 100);
-    const syncs_before = h.kv.syncCount();
+    const syncs_before = h.syncCount();
     t = nowNs(io);
     for (&hs, 0..) |*hh, th| hh.* = try std.Thread.spawn(.{}, Agent.run, .{ &ags[th], h, th });
     for (hs) |hh| hh.join();
@@ -374,7 +378,7 @@ fn runAgent(io: Io, dir: []const u8) !void {
         ctx += ag.context_msgs;
     }
     try report("agent_turns", turns_total, secs, &all, ",\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
-        h.kv.syncCount() - syncs_before, deletes, nbriefs, briefs.pct(0.5), briefs.pct(0.99), ctx, dirBytes(io, dir), maxRssKb(io), anonKb(io), h.info().index_bytes,
+        h.syncCount() - syncs_before, deletes, nbriefs, briefs.pct(0.5), briefs.pct(0.99), ctx, dirBytes(io, dir), maxRssKb(io), anonKb(io), h.info().index_bytes,
     });
 
     phaseStart("agent_reopen", 1);
@@ -672,19 +676,23 @@ fn runRecall(io: Io, dir: []const u8, n: u64) !void {
             // newest wins. Generous: knows the exact phrasing.
             var best_t: u64 = 0;
             var best_has = false;
-            var it = try h.kv.iterator(.{ .start = "~m/", .end = "~m0" }, null);
-            defer it.deinit();
-            while (try it.next()) |p| {
-                if (std.mem.indexOf(u8, p.value, ent) == null) continue;
-                if (std.mem.indexOf(u8, p.value, attrs[f.attr]) == null) continue;
-                const tl = std.mem.readInt(u16, p.value[0..2], .little);
-                const bl = std.mem.readInt(u16, p.value[2 + tl ..][0..2], .little);
-                const tm = std.mem.readInt(u64, p.value[4 + tl + bl ..][0..8], .little);
-                if (tm >= best_t) {
-                    best_t = tm;
-                    best_has = std.mem.indexOf(u8, p.value, want) != null;
+            const Scan = struct {
+                ent: []const u8,
+                attr: []const u8,
+                want: []const u8,
+                best_t: *u64,
+                best_has: *bool,
+                fn each(c: *const @This(), body: []const u8, tm: u64) void {
+                    if (std.mem.indexOf(u8, body, c.ent) == null) return;
+                    if (std.mem.indexOf(u8, body, c.attr) == null) return;
+                    if (tm >= c.best_t.*) {
+                        c.best_t.* = tm;
+                        c.best_has.* = std.mem.indexOf(u8, body, c.want) != null;
+                    }
                 }
-            }
+            };
+            const sc: Scan = .{ .ent = ent, .attr = attrs[f.attr], .want = want, .best_t = &best_t, .best_has = &best_has };
+            try h.scanAll(&sc, Scan.each);
             lat.ns.append(driver, @intCast(nowNs(io) - a)) catch {};
             if (best_has) hit1 += 1;
             tick();
@@ -989,4 +997,188 @@ fn runHard(io: Io, dir: []const u8, n: u64, model_path: []const u8) !void {
         });
     }
     h.close();
+}
+
+// ------------------------------------------------------------ jargon test
+//
+// Project words the meaning table has never seen. Each fact is restated 2
+// to 5 times; every restatement names the setting with one of three made-up
+// synonyms (in turn), so older versions use words the newest one does not.
+// The question uses the first synonym. The right answer is the newest
+// value; an older value at the top is stale. Half the facts carry a
+// subject, half do not (the store must work out on its own that they are
+// versions of one fact, or fail to).
+
+const jargon_templates = [_][]const u8{
+    "@ % is set to #",
+    "we changed the @ % to #",
+    "@ now runs % at #",
+    "heads up: % for @ became #",
+};
+
+const JFact = struct { project: u64, chat: u64, tagged: bool, versions: u8, at: [5]u64 };
+
+fn jargonSyn(buf: *[24]u8, fi: u64, k: u64) []const u8 {
+    return rareWord(buf, 'j', fi * 3 + k);
+}
+fn jargonVal(buf: *[24]u8, fi: u64, ver: u64) []const u8 {
+    return rareWord(buf, 'w', fi * 8 + ver);
+}
+
+fn fillJargon(buf: *std.ArrayList(u8), tmpl: []const u8, ent: []const u8, syn: []const u8, val: []const u8) !void {
+    for (tmpl) |c| switch (c) {
+        '@' => try buf.appendSlice(gpa, ent),
+        '%' => try buf.appendSlice(gpa, syn),
+        '#' => try buf.appendSlice(gpa, val),
+        else => try buf.append(gpa, c),
+    };
+}
+
+fn runJargon(io: Io, dir: []const u8, n: u64, model_path: []const u8) !void {
+    prog_phases = 6;
+    const model_bytes = try Io.Dir.cwd().readFileAlloc(io, model_path, driver, .unlimited);
+    const meaning = try Holo.Meaning.load(driver, model_bytes);
+    defer meaning.deinit(driver);
+    driver.free(model_bytes);
+    var cw = try loadChatWords(io, model_path, 4000);
+    defer cw.deinit(driver);
+
+    const nfacts = @max(n / 500, 100);
+    const facts = try driver.alloc(JFact, nfacts);
+    defer driver.free(facts);
+    var s: u64 = 4242;
+    for (facts) |*f| {
+        const nv: u8 = @intCast(2 + splitmix(&s) % 4);
+        var at: [5]u64 = @splat(0);
+        for (0..nv) |v| at[v] = splitmix(&s) % n;
+        std.mem.sortUnstable(u64, at[0..nv], {}, std.sort.asc(u64));
+        for (1..nv) |v| at[v] = @max(at[v], at[v - 1] + 1);
+        for (0..nv) |v| at[v] = @min(at[v], n - 1);
+        f.* = .{ .project = splitmix(&s) % projects, .chat = splitmix(&s) % chats_per_project, .tagged = splitmix(&s) % 2 == 0, .versions = nv, .at = at };
+    }
+    const Ev = struct { pos: u64, fact: u32, ver: u8 };
+    var evs: std.ArrayList(Ev) = .empty;
+    defer evs.deinit(driver);
+    for (facts, 0..) |f, i| for (0..f.versions) |v| try evs.append(driver, .{ .pos = f.at[v], .fact = @intCast(i), .ver = @intCast(v) });
+    std.mem.sortUnstable(Ev, evs.items, {}, struct {
+        fn lt(_: void, a: Ev, b: Ev) bool {
+            return a.pos < b.pos or (a.pos == b.pos and a.ver < b.ver);
+        }
+    }.lt);
+
+    const opts: Holo.Options = .{ .sync_writes = false, .half_life_ms = 3 * 24 * 3600 * 1000, .meaning = meaning };
+    var h = try Holo.open(gpa, io, Io.Dir.cwd(), dir, opts);
+    defer h.close();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var batch: Batch = .{};
+    defer batch.deinit();
+    var scb: [48]u8 = undefined;
+    var sjb: [64]u8 = undefined;
+
+    phaseStart("jargon_load", n + evs.items.len);
+    var t = nowNs(io);
+    var ei: usize = 0;
+    for (0..n) |i| {
+        const tm = t0_ms + i * 1000;
+        while (ei < evs.items.len and evs.items[ei].pos == i) : (ei += 1) {
+            const e = evs.items[ei];
+            const f = facts[e.fact];
+            var eb: [24]u8 = undefined;
+            var sb: [24]u8 = undefined;
+            var vb: [24]u8 = undefined;
+            const ent = entity(&eb, e.fact);
+            buf.clearRetainingCapacity();
+            try chatFiller(&buf, cw.items, e.fact *% 77 +% e.ver, 4);
+            try fillJargon(&buf, jargon_templates[e.ver % jargon_templates.len], ent, jargonSyn(&sb, e.fact, e.ver % 3), jargonVal(&vb, e.fact, e.ver));
+            try buf.appendSlice(gpa, ". ");
+            try chatFiller(&buf, cw.items, e.fact *% 91 +% e.ver, 4);
+            const subj: ?[]const u8 = if (f.tagged) (std.fmt.bufPrint(&sjb, "{s}/setting", .{ent}) catch unreachable) else null;
+            const sc = std.fmt.bufPrint(&scb, "proj/{d:0>3}/chat/{d:0>2}", .{ f.project, f.chat }) catch unreachable;
+            try batch.add(h, sc, buf.items, subj, tm);
+        }
+        buf.clearRetainingCapacity();
+        var ss = i *% 0x2545F4914F6CDD1D +% 5;
+        try chatFiller(&buf, cw.items, splitmix(&ss), 8 + splitmix(&ss) % 30);
+        const sc = std.fmt.bufPrint(&scb, "proj/{d:0>3}/chat/{d:0>2}", .{ splitmix(&ss) % projects, splitmix(&ss) % chats_per_project }) catch unreachable;
+        try batch.add(h, sc, buf.items, null, tm);
+    }
+    try batch.flush(h);
+    try h.sync();
+    const now_ms = t0_ms + n * 1000;
+    h.setClockForTest(now_ms);
+    try report("jargon_load", n + evs.items.len, secondsSince(io, t), null, ",\"facts\":{d},\"versions\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{ nfacts, evs.items.len, anonKb(io), h.info().index_bytes });
+
+    const queries = @min(nfacts, 2000);
+    const Case = struct { name: []const u8, tagged: ?bool, brief: bool = false };
+    const cases = [_]Case{
+        .{ .name = "jargon_all", .tagged = null },
+        .{ .name = "jargon_with_subject", .tagged = true },
+        .{ .name = "jargon_no_subject", .tagged = false },
+        .{ .name = "jargon_brief_2000tok", .tagged = null, .brief = true },
+    };
+    for (cases) |cs| {
+        phaseStart(cs.name, queries);
+        var lat: Lat = .{};
+        defer lat.ns.deinit(driver);
+        var asked: u64 = 0;
+        var hit1: u64 = 0;
+        var hit5: u64 = 0;
+        var stale1: u64 = 0;
+        var qs: u64 = 9;
+        t = nowNs(io);
+        var tries: u64 = 0;
+        while (asked < queries and tries < queries * 10) : (tries += 1) {
+            const fi = splitmix(&qs) % nfacts;
+            const f = facts[fi];
+            if (cs.tagged) |tg| if (f.tagged != tg) continue;
+            asked += 1;
+            var eb: [24]u8 = undefined;
+            var sb: [24]u8 = undefined;
+            var vb: [24]u8 = undefined;
+            const ent = entity(&eb, fi);
+            const want = jargonVal(&vb, fi, f.versions - 1);
+            var qb: [128]u8 = undefined;
+            const question = std.fmt.bufPrint(&qb, "what is the {s} of {s}?", .{ jargonSyn(&sb, fi, 0), ent }) catch unreachable;
+            var pb: [16]u8 = undefined;
+            const proj = std.fmt.bufPrint(&pb, "proj/{d:0>3}", .{f.project}) catch unreachable;
+            const st = nowNs(io);
+            if (cs.brief) {
+                const b = try h.brief(gpa, question, proj, 2000);
+                lat.ns.append(driver, @intCast(nowNs(io) - st)) catch {};
+                defer b.deinit(gpa);
+                if (std.mem.indexOf(u8, b.text, want) != null) hit5 += 1;
+                for (0..f.versions - 1) |v| {
+                    var ob: [24]u8 = undefined;
+                    if (std.mem.indexOf(u8, b.text, jargonVal(&ob, fi, v)) != null) {
+                        stale1 += 1;
+                        break;
+                    }
+                }
+            } else {
+                const hits = try h.recall(gpa, .{ .about = question, .limit = 5 });
+                lat.ns.append(driver, @intCast(nowNs(io) - st)) catch {};
+                defer Holo.freeHits(gpa, hits);
+                for (hits, 0..) |x, rank| {
+                    const has = std.mem.indexOf(u8, x.memory.text, want) != null;
+                    if (rank == 0 and !has) {
+                        for (0..f.versions - 1) |v| {
+                            var ob: [24]u8 = undefined;
+                            if (std.mem.indexOf(u8, x.memory.text, jargonVal(&ob, fi, v)) != null) {
+                                stale1 += 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (rank == 0 and has) hit1 += 1;
+                    if (has) {
+                        hit5 += 1;
+                        break;
+                    }
+                }
+            }
+            tick();
+        }
+        try report(cs.name, asked, secondsSince(io, t), &lat, ",\"hit_at_1\":{d:.4},\"hit_at_k\":{d:.4},\"stale\":{d:.4}", .{ ratio(hit1, asked), ratio(hit5, asked), ratio(stale1, asked) });
+    }
 }
