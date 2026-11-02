@@ -290,10 +290,14 @@ fn recoverFailedWrite(w: *Stratum, start: u64) void {
         w.broken = true;
         return;
     };
+    // Bytes before `start` that were never flushed must still be flushed
+    // by the next sync.
+    const synced = w.synced.load(.acquire);
     w.resetTables();
     w.loadTables() catch {
         w.broken = true;
     };
+    w.synced.store(@min(synced, w.end.load(.acquire)), .release);
 }
 
 fn addLane(w: *Stratum, file: Io.File) !void {
@@ -433,6 +437,14 @@ fn newer(w: *const Stratum, a: u64, b: u64) bool {
     const hb = w.hdrAt(b);
     if (ha.time != hb.time) return ha.time > hb.time;
     return ha.stamp > hb.stamp or (ha.stamp == hb.stamp and a > b);
+}
+
+/// Was a record written later than another? Each lane's chains are in
+/// this order, so merging lanes by it is exact.
+fn laterWrite(w: *const Stratum, a: u64, b: u64) bool {
+    const sa = w.hdrAt(a).stamp;
+    const sb = w.hdrAt(b).stamp;
+    return sa > sb or (sa == sb and a > b);
 }
 
 fn rootOf(h: *const Hdr, id: u64) u64 {
@@ -871,8 +883,17 @@ fn applyWritten(w: *Stratum, off8: u32, h: *const Hdr, hashes: []const u64) !voi
     const sid = try w.intern(scope, h.scope_hash);
     try w.scope_heads.put(w.gpa, (@as(u64, sid) << 8) | w.me, off8);
     w.scope_count.items[sid] += 1;
-    if (subject.len > 0) try w.subjects.put(w.gpa, subjectKey(h.scope_hash, subject), id);
-    if (h.root != 0) try w.strata.put(w.gpa, h.root, id);
+    // Same rule as replay: the newest by `newer` wins, so importing an
+    // older version never changes the current answer.
+    if (subject.len > 0) {
+        const gop = try w.subjects.getOrPut(w.gpa, subjectKey(h.scope_hash, subject));
+        if (!gop.found_existing or w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
+    }
+    if (h.root != 0) {
+        const gop = try w.strata.getOrPut(w.gpa, h.root);
+        if (!gop.found_existing) gop.value_ptr.* = h.root;
+        if (w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
+    }
     for (hashes) |x| w.bumpDf(x);
     w.count += 1;
     w.total_terms += h.nterms;
@@ -1164,7 +1185,8 @@ pub fn get(w: *Stratum, gpa: Allocator, id: u64) !?Memory {
     return w.load(gpa, id);
 }
 
-/// The newest `n` memories in one scope, newest first, from every writer.
+/// The `n` memories most recently written to one scope, newest first, from
+/// every writer.
 pub fn recent(w: *Stratum, gpa: Allocator, scope: []const u8, n: usize) ![]Memory {
     return w.recentFiltered(gpa, scope, n, false);
 }
@@ -1182,11 +1204,11 @@ fn recentFiltered(w: *Stratum, gpa: Allocator, scope: []const u8, n: usize, skip
     var cur: [max_lanes]u32 = undefined;
     for (0..w.nlanes) |l| cur[l] = w.scope_heads.get((@as(u64, sid) << 8) | l) orelse 0;
     while (out.items.len < n) {
-        // Newest across lanes by stamp.
+        // Most recently written across lanes.
         var bl: ?usize = null;
         for (0..w.nlanes) |l| {
             if (cur[l] == 0) continue;
-            if (bl == null or w.newer(idOf(l, cur[l]), idOf(bl.?, cur[bl.?]))) bl = l;
+            if (bl == null or w.laterWrite(idOf(l, cur[l]), idOf(bl.?, cur[bl.?]))) bl = l;
         }
         const l = bl orelse break;
         const id = idOf(l, cur[l]);
@@ -1627,7 +1649,8 @@ fn sameFact(a: *const Hit, b: *const Hit) bool {
     return a.matched == b.matched and @popCount(a.matched) >= 2 and b.score >= a.score * 0.9;
 }
 
-/// Newest memories across the scope set, for questions with no words.
+/// The most recently written memories across the scope set, for questions
+/// with no words.
 fn newestInto(w: *const Stratum, gpa: Allocator, set: *const ScopeSet, q: Query, limit: usize, hits: *std.ArrayList(Hit)) !void {
     const Cur = struct { lane: usize, off8: u32 };
     var cursors: std.ArrayList(Cur) = .empty;
@@ -1643,7 +1666,7 @@ fn newestInto(w: *const Stratum, gpa: Allocator, set: *const ScopeSet, q: Query,
         var bi: ?usize = null;
         for (cursors.items, 0..) |c, i| {
             if (c.off8 == 0) continue;
-            if (bi == null or w.newer(idOf(c.lane, c.off8), idOf(cursors.items[bi.?].lane, cursors.items[bi.?].off8))) bi = i;
+            if (bi == null or w.laterWrite(idOf(c.lane, c.off8), idOf(cursors.items[bi.?].lane, cursors.items[bi.?].off8))) bi = i;
         }
         const i = bi orelse break;
         const id = idOf(cursors.items[i].lane, cursors.items[i].off8);
@@ -2218,6 +2241,29 @@ test "writers that have not seen each other: get, backdated writes, one answer p
     defer freeHits(testing.allocator, hits);
     try testing.expectEqual(@as(usize, 1), hits.len);
     try testing.expectEqualStrings("zeta gadget final", hits[0].memory.text);
+}
+
+test "importing an older version changes nothing, before or after reopening" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        _ = try w.remember("m", "plan is blue", .{ .subject = "plan", .time = 300 });
+        _ = try w.remember("m", "plan was red", .{ .subject = "plan", .time = 100 });
+        const c = (try w.current(testing.allocator, "m", "plan")).?;
+        defer c.deinit(testing.allocator);
+        try testing.expectEqualStrings("plan is blue", c.text);
+        // Recent lists by when memories were written.
+        const r = try w.recent(testing.allocator, "m", 1);
+        defer freeMemories(testing.allocator, r);
+        try testing.expectEqualStrings("plan was red", r[0].text);
+    }
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const c = (try w.current(testing.allocator, "m", "plan")).?;
+    defer c.deinit(testing.allocator);
+    try testing.expectEqualStrings("plan is blue", c.text);
 }
 
 test "since applies to the version returned" {
