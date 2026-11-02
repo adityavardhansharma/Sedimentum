@@ -302,6 +302,8 @@ fn runAgent(io: Io, dir: []const u8) !void {
         briefs: u64 = 0,
         brief_ns: Lat = .{},
         context_msgs: u64 = 0,
+        /// Time spent per step: recent, current, brief, remember, forget, sync.
+        step_ns: [6]u64 = @splat(0),
         failed: ?anyerror = null,
 
         fn run(self: *@This(), d: *Holo, th: u64) void {
@@ -324,12 +326,17 @@ fn runAgent(io: Io, dir: []const u8) !void {
                 const roll = splitmix(&st) % 100;
                 const chat = if (roll < 80) splitmix(&st) % hot_chats else splitmix(&st) % chats;
                 const cs = chatScope(&b1, chat);
+                var s0 = nowNs(io_g);
                 const ctx = try d.recent(gpa, cs, context_len);
                 self.context_msgs += ctx.len;
                 Holo.freeMemories(gpa, ctx);
+                var s1 = nowNs(io_g);
+                self.step_ns[0] += @intCast(s1 - s0);
                 for (0..3) |_| {
                     if (try d.current(gpa, ascope, factSubject(&b3, splitmix(&st) % facts_per_agent))) |m| m.deinit(gpa);
                 }
+                s0 = nowNs(io_g);
+                self.step_ns[1] += @intCast(s0 - s1);
                 if (splitmix(&st) % 100 < 3) {
                     // Where the KV engines read the whole chat, Holo briefs.
                     const t1 = clock.load(.monotonic);
@@ -340,6 +347,8 @@ fn runAgent(io: Io, dir: []const u8) !void {
                     br.deinit(gpa);
                     self.briefs += 1;
                 }
+                s1 = nowNs(io_g);
+                self.step_ns[2] += @intCast(s1 - s0);
                 const t1 = clock.fetchAdd(2, .monotonic);
                 _ = try d.remember(cs, try message(&buf, t1, "user"), .{ .time = t0_ms + t1 * 100 });
                 _ = try d.remember(cs, try message(&buf, t1 + 1, "assistant"), .{ .time = t0_ms + t1 * 100 + 100 });
@@ -347,12 +356,17 @@ fn runAgent(io: Io, dir: []const u8) !void {
                     const f = splitmix(&st) % facts_per_agent;
                     _ = try d.remember(ascope, try fact(&buf, agent, f, t1), .{ .subject = factSubject(&b3, f), .time = t0_ms + t1 * 100 });
                 }
+                s0 = nowNs(io_g);
+                self.step_ns[3] += @intCast(s0 - s1);
                 if (splitmix(&st) % 1000 < 10) {
                     const victim = hot_chats + splitmix(&st) % (chats - hot_chats);
                     _ = try d.forgetScope(chatScope(&b3, victim));
                     self.deletes += 1;
                 }
+                s1 = nowNs(io_g);
+                self.step_ns[4] += @intCast(s1 - s0);
                 try d.sync();
+                self.step_ns[5] += @intCast(nowNs(io_g) - s1);
                 try self.lat.ns.append(driver, @intCast(nowNs(io_g) - a));
                 tick();
             }
@@ -371,7 +385,9 @@ fn runAgent(io: Io, dir: []const u8) !void {
     var deletes: u64 = 0;
     var nbriefs: u64 = 0;
     var ctx: u64 = 0;
+    var steps: [6]u64 = @splat(0);
     for (&ags) |*ag| {
+        for (&steps, ag.step_ns) |*x, y| x.* += y;
         if (ag.failed) |e| return e;
         try all.ns.appendSlice(driver, ag.lat.ns.items);
         try briefs.ns.appendSlice(driver, ag.brief_ns.ns.items);
@@ -379,8 +395,10 @@ fn runAgent(io: Io, dir: []const u8) !void {
         nbriefs += ag.briefs;
         ctx += ag.context_msgs;
     }
-    try report("agent_turns", turns_total, secs, &all, ",\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
-        h.syncCount() - syncs_before, deletes, nbriefs, briefs.pct(0.5), briefs.pct(0.99), ctx, dirBytes(io, dir), maxRssKb(io), anonKb(io), h.info().index_bytes,
+    try report("agent_turns", turns_total, secs, &all, ",\"step_us_per_turn\":{{\"recent\":{d},\"current\":{d},\"brief\":{d},\"remember\":{d},\"forget\":{d},\"sync\":{d}}},\"fsyncs\":{d},\"chat_deletes\":{d},\"briefs\":{d},\"brief_p50_ns\":{d},\"brief_p99_ns\":{d},\"context_msgs\":{d},\"disk_bytes\":{d},\"rss_kb\":{d},\"anon_kb\":{d},\"index_bytes\":{d}", .{
+        steps[0] / turns_total / 1000, steps[1] / turns_total / 1000, steps[2] / turns_total / 1000, steps[3] / turns_total / 1000, steps[4] / turns_total / 1000, steps[5] / turns_total / 1000,
+        h.syncCount() - syncs_before,  deletes,                       nbriefs,                       briefs.pct(0.5),               briefs.pct(0.99),              ctx,
+        dirBytes(io, dir),             maxRssKb(io),                  anonKb(io),                    h.info().index_bytes,
     });
 
     phaseStart("agent_reopen", 1);

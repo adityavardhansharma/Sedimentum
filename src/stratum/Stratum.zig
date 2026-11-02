@@ -27,10 +27,12 @@
 
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Crc = std.hash.crc.@"CRC-32/ISCSI";
 const text = @import("../holo/text.zig");
 pub const Meaning = @import("../holo/Meaning.zig");
+const tables = @import("tables.zig");
 
 const Stratum = @This();
 
@@ -49,6 +51,11 @@ const close_snapshot_after: u64 = 32 << 20;
 const cms_bits = 18;
 const cms_rows = 2;
 const lane_shift = 40;
+/// Where a lane's header holds its published end.
+const pub_end_at = 128;
+/// Lanes grow in steps of a quarter of their size, 4 MB to 256 MB.
+const grow_min: u64 = 4 << 20;
+const grow_max: u64 = 256 << 20;
 
 const Kind = enum(u8) { memory = 1, erased = 2, snapshot = 3, forget_scope = 4, settle = 5, forget_one = 6, _ };
 
@@ -146,6 +153,13 @@ const Lane = struct {
     /// Records before this offset are applied to the RAM tables.
     end: u64 = data_start,
     heads: []u32,
+
+    /// The end its writer published: readers never look past it, so they
+    /// never see a record that is still being written.
+    fn published(l: *const Lane) u64 {
+        const p: *const u64 = @ptrCast(@alignCast(l.map[pub_end_at..][0..8]));
+        return @atomicLoad(u64, p, .acquire);
+    }
 };
 
 /// A forget or settle that applies to a scope and everything below it.
@@ -157,7 +171,10 @@ dir: Io.Dir,
 options: Options,
 clock_override: ?u64 = null,
 
-lock: Io.RwLock = .init,
+/// One writer at a time (appends, refresh, forget).
+wlock: tables.Lock = .{},
+/// Readers take no lock: they only announce themselves here.
+readers: tables.Readers = .{},
 lanes: [max_lanes]Lane = undefined,
 nlanes: usize = 0,
 /// The lane this handle writes.
@@ -165,14 +182,14 @@ me: usize = 0,
 /// End of our lane (bytes written).
 end: std.atomic.Value(u64) = .init(data_start),
 synced: std.atomic.Value(u64) = .init(data_start),
-sync_mutex: Io.Mutex = .init,
+
 syncs: std.atomic.Value(u64) = .init(0),
 last_refresh: std.atomic.Value(u64) = .init(0),
 /// A failed write could not be undone: further writes are refused.
 broken: bool = false,
-/// The batch being encoded (not yet in the file), under the write lock.
-pend_start: usize = std.math.maxInt(usize),
-pend_buf: []const u8 = &.{},
+/// Size of our lane file: space past `end` is reserved ahead, so writes
+/// go straight into the map and a flush has no size change to record.
+alloc: u64 = data_start,
 
 cms: []u32,
 count: u64 = 0,
@@ -184,24 +201,18 @@ snap_gen: u64 = 0,
 snap_progress: u64 = 0,
 snap_end: u64 = data_start,
 
-scope_names: std.ArrayList(u8) = .empty,
-scope_offs: std.ArrayList(u32) = .empty,
-scope_hashes: std.ArrayList(u64) = .empty,
-scope_map: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-scope_count: std.ArrayList(u32) = .empty,
-/// Memories older than this stamp were settled (summarised).
-scope_settled: std.ArrayList(u64) = .empty,
-/// Memories older than this stamp were forgotten.
-scope_forgot: std.ArrayList(u64) = .empty,
+scopes: tables.Scopes = .{},
+/// Scope name hash -> scope id.
+scope_map: tables.Map = .{},
 /// (scope id << 8 | lane) -> newest record of the scope in that lane.
-scope_heads: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+scope_heads: tables.Map = .{},
 rules: std.ArrayList(Rule) = .empty,
 /// (scope, subject) -> newest record with that subject.
-subjects: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+subjects: tables.Map = .{},
 /// Stratum root -> its newest version, for strata with two or more.
-strata: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-/// Single memories forgotten by id.
-forgotten: std.AutoHashMapUnmanaged(u64, void) = .empty,
+strata: tables.Map = .{},
+/// Single memories forgotten by id (value unused).
+forgotten: tables.Map = .{},
 
 fn laneName(buf: *[32]u8, i: usize) []const u8 {
     return std.fmt.bufPrint(buf, "lane-{d:0>3}.sdm", .{i}) catch unreachable;
@@ -246,12 +257,13 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     var i: usize = 0;
     while (i < max_lanes) : (i += 1) {
         if (i == w.me) {
-            try w.addLane(own);
+            try w.addLane(own, true);
             continue;
         }
         if (!try w.openLane(i)) break;
     }
     if (w.nlanes <= w.me) return error.Corrupt;
+    w.alloc = try own.length(io);
     try w.loadTables();
     return w;
 }
@@ -265,14 +277,14 @@ fn loadTables(w: *Stratum) !void {
     };
     // Our own lane first, so markers from other lanes can erase in it.
     try w.replayLane(w.me, if (from) |f| f[w.me] else data_start, true);
-    for (0..w.nlanes) |l| if (l != w.me) try w.replayLane(l, if (from) |f| f[l] else data_start, false);
+    for (0..w.laneCount()) |l| if (l != w.me) try w.replayLane(l, if (from) |f| f[l] else data_start, false);
     if (from != null) {
         // Markers inside the snapshot were never replayed here. Their
         // erasures in this lane may not have happened (its writer was
         // gone), so redo them; erasing is idempotent.
         for (w.rules.items) |r| if (r.kind == .forget_scope) try w.eraseScopeInOwnLane(r.name, r.cutoff);
-        var it = w.forgotten.keyIterator();
-        while (it.next()) |id| if (laneOf(id.*) == w.me) try w.eraseOwn(offOf(id.*));
+        var it = w.forgotten.iterator();
+        while (it.next()) |e| if (laneOf(e.key) == w.me) try w.eraseOwn(offOf(e.key));
     }
     w.end.store(w.lanes[w.me].end, .release);
     w.synced.store(w.lanes[w.me].end, .release);
@@ -283,16 +295,14 @@ fn loadTables(w: *Stratum) !void {
 /// never reached the file: drop what was written of the batch and rebuild
 /// the tables from disk. If that fails too, the handle refuses writes.
 /// Caller holds the write lock.
-fn recoverFailedWrite(w: *Stratum, start: u64) void {
-    w.pend_start = std.math.maxInt(usize);
-    w.pend_buf = &.{};
-    w.lanes[w.me].file.setLength(w.io, start) catch {
-        w.broken = true;
-        return;
-    };
+fn recoverFailedWrite(w: *Stratum, start: u64, len: u64) void {
+    @memset(w.ownBytes()[start..][0..len], 0);
     // Bytes before `start` that were never flushed must still be flushed
     // by the next sync.
     const synced = w.synced.load(.acquire);
+    // Rebuilding changes the tables in place: keep readers out meanwhile.
+    w.readers.close(w.io);
+    defer w.readers.open(w.io);
     w.resetTables();
     w.loadTables() catch {
         w.broken = true;
@@ -300,13 +310,13 @@ fn recoverFailedWrite(w: *Stratum, start: u64) void {
     w.synced.store(@min(synced, w.end.load(.acquire)), .release);
 }
 
-fn addLane(w: *Stratum, file: Io.File) !void {
-    const map = try std.posix.mmap(null, map_reserve, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+fn addLane(w: *Stratum, file: Io.File, writable: bool) !void {
+    const map = try std.posix.mmap(null, map_reserve, .{ .READ = true, .WRITE = writable }, .{ .TYPE = .SHARED }, file.handle, 0);
     errdefer std.posix.munmap(map);
     const heads = try w.gpa.alloc(u32, nbuckets);
     @memset(heads, 0);
     w.lanes[w.nlanes] = .{ .file = file, .map = map, .heads = heads };
-    w.nlanes += 1;
+    @atomicStore(usize, &w.nlanes, w.nlanes + 1, .release);
 }
 
 /// Opens lane `i` for reading. False when it does not exist.
@@ -317,7 +327,7 @@ fn openLane(w: *Stratum, i: usize) !bool {
         else => |e| return e,
     };
     errdefer f.close(w.io);
-    try w.addLane(f);
+    try w.addLane(f, false);
     return true;
 }
 
@@ -332,19 +342,14 @@ fn resetTables(w: *Stratum) void {
     w.total_terms = 0;
     w.last_stamp = 0;
     w.merges = 0;
-    w.scope_names.clearRetainingCapacity();
-    w.scope_offs.clearRetainingCapacity();
-    w.scope_hashes.clearRetainingCapacity();
-    w.scope_map.clearRetainingCapacity();
-    w.scope_count.clearRetainingCapacity();
-    w.scope_settled.clearRetainingCapacity();
-    w.scope_forgot.clearRetainingCapacity();
-    w.scope_heads.clearRetainingCapacity();
+    w.scopes.clear(gpa);
+    w.scope_map.clearRetainingCapacity(gpa);
+    w.scope_heads.clearRetainingCapacity(gpa);
     for (w.rules.items) |r| gpa.free(r.name);
     w.rules.clearRetainingCapacity();
-    w.subjects.clearRetainingCapacity();
-    w.strata.clearRetainingCapacity();
-    w.forgotten.clearRetainingCapacity();
+    w.subjects.clearRetainingCapacity(gpa);
+    w.strata.clearRetainingCapacity(gpa);
+    w.forgotten.clearRetainingCapacity(gpa);
 }
 
 fn freeAll(w: *Stratum) void {
@@ -355,13 +360,8 @@ fn freeAll(w: *Stratum) void {
         l.file.close(w.io);
     }
     w.nlanes = 0;
-    w.scope_names.deinit(gpa);
-    w.scope_offs.deinit(gpa);
-    w.scope_hashes.deinit(gpa);
+    w.scopes.deinit(gpa);
     w.scope_map.deinit(gpa);
-    w.scope_count.deinit(gpa);
-    w.scope_settled.deinit(gpa);
-    w.scope_forgot.deinit(gpa);
     w.scope_heads.deinit(gpa);
     for (w.rules.items) |r| gpa.free(r.name);
     w.rules.deinit(gpa);
@@ -374,6 +374,9 @@ pub fn close(w: *Stratum) void {
     // A snapshot holds every lane's chain heads (4 MB a lane): only worth
     // writing when this writer added a lot that reopening would replay.
     w.snapshotIfGrew(close_snapshot_after) catch {};
+    // Give back the space reserved ahead. Readers never look past the
+    // published end, which is at or before this.
+    if (w.nlanes > w.me and !w.broken) w.lanes[w.me].file.setLength(w.io, w.lanes[w.me].end) catch {};
     const gpa = w.gpa;
     const cms = w.cms;
     w.freeAll();
@@ -409,7 +412,6 @@ fn nowMs(w: *const Stratum) u64 {
 /// batch being written, from that batch's buffer.
 fn bytesAt(w: *const Stratum, id: u64) []const u8 {
     const off = @as(usize, offOf(id)) << 3;
-    if (laneOf(id) == w.me and off >= w.pend_start) return w.pend_buf[off - w.pend_start ..];
     return w.lanes[laneOf(id)].map[off..];
 }
 fn hdrAt(w: *const Stratum, id: u64) *const Hdr {
@@ -454,13 +456,28 @@ fn rootOf(h: *const Hdr, id: u64) u64 {
 // ------------------------------------------------------------------ scopes
 
 pub fn scopeName(w: *const Stratum, id: u32) []const u8 {
-    const s = w.scope_offs.items[id];
-    const e: u32 = if (id + 1 < w.scope_offs.items.len) w.scope_offs.items[id + 1] else @intCast(w.scope_names.items.len);
-    return w.scope_names.items[s..e];
+    return w.scopes.name(id);
 }
 
 fn findScope(w: *const Stratum, name: []const u8) ?u32 {
-    return w.scope_map.get(scopeHash(name));
+    return if (w.scope_map.get(scopeHash(name))) |v| @intCast(v) else null;
+}
+
+fn laneCount(w: *const Stratum) usize {
+    return @atomicLoad(usize, &w.nlanes, .acquire);
+}
+
+fn sidOf(w: *const Stratum, hash: u64) ?u32 {
+    return if (w.scope_map.get(hash)) |v| @intCast(v) else null;
+}
+
+fn scopeHead(w: *const Stratum, sid: usize, lane: usize) u32 {
+    return @intCast(w.scope_heads.get((@as(u64, sid) << 8) | lane) orelse 0);
+}
+
+/// Writer only: a table update that may free memory readers held.
+fn mput(w: *Stratum, m: *tables.Map, k: u64, v: u64) !void {
+    try m.put(w.gpa, &w.readers, w.io, k, v);
 }
 
 /// "a" covers "a" and everything under "a/".
@@ -471,16 +488,10 @@ fn inScope(name: []const u8, filter: []const u8) bool {
 }
 
 fn intern(w: *Stratum, name: []const u8, hash: u64) !u32 {
-    if (w.scope_map.get(hash)) |id| return id;
-    const gpa = w.gpa;
-    const id: u32 = @intCast(w.scope_offs.items.len);
-    try w.scope_map.put(gpa, hash, id);
-    try w.scope_offs.append(gpa, @intCast(w.scope_names.items.len));
-    try w.scope_names.appendSlice(gpa, name);
-    try w.scope_hashes.append(gpa, hash);
-    try w.scope_count.append(gpa, 0);
-    try w.scope_settled.append(gpa, 0);
-    try w.scope_forgot.append(gpa, 0);
+    if (w.sidOf(hash)) |id| return id;
+    // The scope first, then the map entry that leads readers to it.
+    const id = try w.scopes.append(w.gpa, name, hash);
+    try w.mput(&w.scope_map, hash, id);
     // Rules written before this scope was first seen still apply to it.
     for (w.rules.items) |r| if (inScope(name, r.name)) w.applyRule(id, r.kind, r.cutoff);
     return id;
@@ -488,8 +499,8 @@ fn intern(w: *Stratum, name: []const u8, hash: u64) !u32 {
 
 fn applyRule(w: *Stratum, sid: u32, kind: Kind, cutoff: u64) void {
     switch (kind) {
-        .forget_scope => w.scope_forgot.items[sid] = @max(w.scope_forgot.items[sid], cutoff),
-        .settle => w.scope_settled.items[sid] = @max(w.scope_settled.items[sid], cutoff),
+        .forget_scope => w.scopes.raiseForgot(sid, cutoff),
+        .settle => w.scopes.raiseSettled(sid, cutoff),
         else => {},
     }
 }
@@ -498,7 +509,7 @@ fn addRule(w: *Stratum, kind: Kind, cutoff: u64, name: []const u8) !void {
     const copy = try w.gpa.dupe(u8, name);
     errdefer w.gpa.free(copy);
     try w.rules.append(w.gpa, .{ .kind = kind, .cutoff = cutoff, .name = copy });
-    for (0..w.scope_offs.items.len) |i| {
+    for (0..w.scopes.len()) |i| {
         const sid: u32 = @intCast(i);
         if (inScope(w.scopeName(sid), name)) w.applyRule(sid, kind, cutoff);
     }
@@ -520,13 +531,14 @@ const ScopeSet = struct {
 
 fn scopeSet(w: *const Stratum, gpa: Allocator, filter: []const u8) !ScopeSet {
     if (filter.len == 0) return .{ .all = true, .total = w.count };
-    var s: ScopeSet = .{ .bits = try .initEmpty(gpa, w.scope_offs.items.len) };
-    for (0..w.scope_offs.items.len) |i| {
+    const ns = w.scopes.len();
+    var s: ScopeSet = .{ .bits = try .initEmpty(gpa, ns) };
+    for (0..ns) |i| {
         const id: u32 = @intCast(i);
         if (inScope(w.scopeName(id), filter)) {
             s.bits.set(i);
             s.n += 1;
-            s.total += w.scope_count.items[i];
+            s.total += w.scopes.countOf(i);
         }
     }
     return s;
@@ -541,16 +553,20 @@ fn cmsSlots(x: u64) [cms_rows]usize {
 }
 
 fn df(w: *const Stratum, x: u64) u32 {
+    // (Counts change without the write lock: see `bumpDf`.)
     var m: u32 = std.math.maxInt(u32);
-    for (cmsSlots(x)) |s| m = @min(m, w.cms[s]);
+    for (cmsSlots(x)) |s| m = @min(m, @atomicLoad(u32, &w.cms[s], .monotonic));
     return m;
 }
 
+/// Counts one more memory with this word. Safe without the write lock: a
+/// count that moved meanwhile is left alone (counts are estimates).
 fn bumpDf(w: *Stratum, x: u64) void {
     const slots = cmsSlots(x);
     const m = w.df(x);
+    if (m == std.math.maxInt(u32)) return;
     for (slots) |s| {
-        if (w.cms[s] == m) w.cms[s] +|= 1;
+        _ = @cmpxchgStrong(u32, &w.cms[s], m, m + 1, .monotonic, .monotonic);
     }
 }
 
@@ -566,15 +582,15 @@ fn idf(w: *const Stratum, x: u64) f32 {
 fn alive(w: *const Stratum, id: u64, h: *const Hdr) bool {
     if (h.kind != .memory) return false;
     if (w.forgotten.contains(id)) return false;
-    const sid = w.scope_map.get(h.scope_hash) orelse return false;
-    if (h.stamp < w.scope_forgot.items[sid]) return false;
+    const sid = w.sidOf(h.scope_hash) orelse return false;
+    if (h.stamp < w.scopes.forgot(sid)) return false;
     return Crc.hash(w.textOf(id, h)) == h.text_crc;
 }
 
 /// Replaced by a newer version of its fact, or settled.
 fn isBuried(w: *const Stratum, id: u64, h: *const Hdr) bool {
-    const sid = w.scope_map.get(h.scope_hash) orelse return false;
-    if (h.stamp < w.scope_settled.items[sid]) return true;
+    const sid = w.sidOf(h.scope_hash) orelse return false;
+    if (h.stamp < w.scopes.settled(sid)) return true;
     const head = w.headOf(id, h);
     return head != id;
 }
@@ -604,19 +620,10 @@ fn apply(w: *Stratum, lane: usize, off8: u32, h: *const Hdr, hashes: ?[]const u6
     switch (h.kind) {
         .memory, .erased => {
             const sid = try w.intern(w.scopeOf(id, h), h.scope_hash);
-            for (w.threadsOf(id, h)) |t| w.lanes[lane].heads[bucketOf(threadKey(t))] = off8;
-            try w.scope_heads.put(w.gpa, (@as(u64, sid) << 8) | lane, off8);
-            w.scope_count.items[sid] += 1;
-            const subject = w.subjectOf(id, h);
-            if (subject.len > 0) {
-                const gop = try w.subjects.getOrPut(w.gpa, subjectKey(h.scope_hash, subject));
-                if (!gop.found_existing or w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
-            }
-            if (h.root != 0) {
-                const gop = try w.strata.getOrPut(w.gpa, h.root);
-                if (!gop.found_existing) gop.value_ptr.* = h.root;
-                if (w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
-            }
+            for (w.threadsOf(id, h)) |t| @atomicStore(u32, &w.lanes[lane].heads[bucketOf(threadKey(t))], off8, .release);
+            try w.mput(&w.scope_heads, (@as(u64, sid) << 8) | lane, off8);
+            w.scopes.bump(sid);
+            try w.linkVersions(id, h, w.subjectOf(id, h));
             if (h.kind == .memory) {
                 if (hashes) |hs| {
                     for (hs) |x| w.bumpDf(x);
@@ -637,7 +644,7 @@ fn apply(w: *Stratum, lane: usize, off8: u32, h: *const Hdr, hashes: ?[]const u6
             if (h.kind == .forget_scope) try w.eraseScopeInOwnLane(name, h.target);
         },
         .forget_one => {
-            try w.forgotten.put(w.gpa, h.target, {});
+            try w.mput(&w.forgotten, h.target, 1);
             if (laneOf(h.target) == w.me) try w.eraseOwn(offOf(h.target));
         },
         .snapshot => {},
@@ -660,22 +667,39 @@ fn validAt(w: *const Stratum, lane: usize, pos: u64, len: u64) ?*const Hdr {
 /// first bad record (a write torn by a crash); another writer's lane is
 /// read up to there and picked up again later.
 fn replayLane(w: *Stratum, lane: usize, from: u64, own: bool) !void {
-    const len = try w.lanes[lane].file.length(w.io);
+    const size = try w.lanes[lane].file.length(w.io);
+    // Another writer's lane: only what it published (it may be writing
+    // past that). A lane that never published is read by its records.
+    const published = if (own) 0 else w.lanes[lane].published();
+    const len = if (published >= data_start) @min(published, size) else size;
     var pos = @max(from, data_start);
     while (w.validAt(lane, pos, len)) |h| {
         try w.apply(lane, @intCast(pos >> 3), h, null);
         pos += h.len;
-        w.lanes[lane].end = pos;
+        @atomicStore(u64, &w.lanes[lane].end, pos, .release);
     }
-    w.lanes[lane].end = pos;
-    if (own and pos < len) try w.lanes[lane].file.setLength(w.io, pos);
+    @atomicStore(u64, &w.lanes[lane].end, pos, .release);
+    if (own) {
+        // A crash can leave a torn record: zero it, up to the reserved
+        // space that was never written.
+        const m = w.ownBytes();
+        var p = pos;
+        while (p < size) {
+            const n = @min(size - p, 64 << 10);
+            const chunk = m[p..][0..n];
+            if (std.mem.allEqual(u8, chunk, 0)) break;
+            @memset(chunk, 0);
+            p += n;
+        }
+        w.publish();
+    }
 }
 
 /// Picks up what other writers appended since we last looked, and lanes
 /// that appeared since. Cheap when nothing changed.
 pub fn refresh(w: *Stratum) !void {
-    w.lock.lockUncancelable(w.io);
-    defer w.lock.unlock(w.io);
+    w.wlock.lockUncancelable(w.io);
+    defer w.wlock.unlock(w.io);
     try w.refreshLocked();
 }
 
@@ -683,12 +707,18 @@ fn refreshLocked(w: *Stratum) !void {
     while (w.nlanes < max_lanes) {
         if (!try w.openLane(w.nlanes)) break;
     }
-    for (0..w.nlanes) |l| if (l != w.me) try w.replayLane(l, w.lanes[l].end, false);
+    for (0..w.laneCount()) |l| if (l != w.me) try w.replayLane(l, w.lanes[l].end, false);
 }
 
-/// Refreshes at most every 20 ms, so readers see other writers' memories
-/// quickly without a check on every call.
+/// Picks up other writers' new records as soon as they are published, and
+/// looks for new writers at most every 20 ms.
 fn maybeRefresh(w: *Stratum) !void {
+    // Another writer published more: pick it up now (a few loads).
+    const n = @atomicLoad(usize, &w.nlanes, .acquire);
+    for (0..n) |l| {
+        if (l != w.me and w.lanes[l].published() > @atomicLoad(u64, &w.lanes[l].end, .acquire)) return w.refresh();
+    }
+    // New lanes need a look at the directory: at most every 20 ms.
     const now = w.nowMsReal();
     const last = w.last_refresh.load(.monotonic);
     if (now -% last < 20 and now >= last) return;
@@ -774,7 +804,7 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
         if (walked == 2) break;
         walked += 1;
         const b = bucketOf(key);
-        for (0..w.nlanes) |lane| {
+        for (0..w.laneCount()) |lane| {
             var p = w.lanes[lane].heads[b];
             var steps: usize = 0;
             while (p != 0 and steps < 64) : (steps += 1) {
@@ -810,7 +840,11 @@ fn findLineage(w: *const Stratum, scope_hash: u64, keys: []const u32, dfs: []con
 
 /// Encodes one memory at `off` of our lane into `buf`, picks its stratum
 /// and applies it. Caller holds the write lock, then writes `buf` at `off`.
-fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const u64, total: u32, keys: []const u32, dfs: []const u32) !void {
+/// `lineage`: the version this memory continues, when the caller already
+/// looked it up (null: look it up now).
+/// `hashes`: the memory's words, counted here unless null (counted by the
+/// caller outside the lock).
+fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: ?[]const u64, total: u32, keys: []const u32, dfs: []const u32, lineage: ??u64) !void {
     const subject = it.subject orelse "";
     const sh = scopeHash(it.scope);
     const nk = keys.len;
@@ -818,7 +852,7 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
     var root: u64 = 0;
     if (subject.len > 0) {
         if (w.subjects.get(subjectKey(sh, subject))) |prev| root = rootOf(w.hdrAt(prev), prev);
-    } else if (w.findLineage(sh, keys, dfs)) |prev| {
+    } else if (lineage orelse w.findLineage(sh, keys, dfs)) |prev| {
         root = rootOf(w.hdrAt(prev), prev);
         w.merges += 1;
     }
@@ -842,7 +876,7 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
         .scope_hash = sh,
         .root = root,
         .target = 0,
-        .prev_scope = w.scope_heads.get((@as(u64, sid) << 8) | w.me) orelse 0,
+        .prev_scope = w.scopeHead(sid, w.me),
         .text_crc = Crc.hash(it.text),
     };
     const ts = std.mem.bytesAsSlice(u64, buf[hdr_len..][0 .. nk * 8]);
@@ -850,15 +884,12 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
     for (keys, 0..) |k, i| {
         const b = bucketOf(k);
         var prev = heads[b];
-        if (prev == off8) {
-            // An earlier thread of this record took the bucket: share its link.
-            for (0..i) |j| if (bucketOf(keys[j]) == b) {
-                prev = threadPrev(ts[j]);
-                break;
-            };
-        }
+        // An earlier thread of this record in the same bucket: share its link.
+        for (0..i) |j| if (bucketOf(keys[j]) == b) {
+            prev = threadPrev(ts[j]);
+            break;
+        };
         ts[i] = (@as(u64, prev) << 24) | k;
-        heads[b] = off8;
     }
     var p: usize = hdr_len + nk * 8;
     @memcpy(buf[p..][0..it.scope.len], it.scope);
@@ -869,34 +900,40 @@ fn encode(w: *Stratum, buf: []u8, off: u64, it: Item, now: u64, hashes: []const 
     p += it.text.len;
     @memset(buf[p..], 0);
     h.crc = metaCrc(buf, h);
-    // Heads are already linked; apply the rest.
-    try w.applyWritten(off8, h, hashes);
+    // Only now, with the record complete, may readers reach it.
+    for (keys) |k| @atomicStore(u32, &heads[bucketOf(k)], off8, .release);
+    try w.applyWritten(off8, h);
+    if (hashes) |hs| for (hs) |x| w.bumpDf(x);
 }
 
 /// `apply` for a record we just encoded (its threads are already linked).
-fn applyWritten(w: *Stratum, off8: u32, h: *const Hdr, hashes: []const u64) !void {
+fn applyWritten(w: *Stratum, off8: u32, h: *const Hdr) !void {
     const id = idOf(w.me, off8);
     w.last_stamp = @max(w.last_stamp, h.stamp);
     const buf: []const u8 = @as([*]const u8, @ptrCast(h))[0..h.len];
     const scope = buf[hdr_len + @as(usize, h.nthreads) * 8 ..][0..h.scope_len];
     const subject = buf[hdr_len + @as(usize, h.nthreads) * 8 + h.scope_len ..][0..h.subject_len];
     const sid = try w.intern(scope, h.scope_hash);
-    try w.scope_heads.put(w.gpa, (@as(u64, sid) << 8) | w.me, off8);
-    w.scope_count.items[sid] += 1;
-    // Same rule as replay: the newest by `newer` wins, so importing an
-    // older version never changes the current answer.
-    if (subject.len > 0) {
-        const gop = try w.subjects.getOrPut(w.gpa, subjectKey(h.scope_hash, subject));
-        if (!gop.found_existing or w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
-    }
-    if (h.root != 0) {
-        const gop = try w.strata.getOrPut(w.gpa, h.root);
-        if (!gop.found_existing) gop.value_ptr.* = h.root;
-        if (w.newer(id, gop.value_ptr.*)) gop.value_ptr.* = id;
-    }
-    for (hashes) |x| w.bumpDf(x);
+    try w.mput(&w.scope_heads, (@as(u64, sid) << 8) | w.me, off8);
+    w.scopes.bump(sid);
+    try w.linkVersions(id, h, subject);
     w.count += 1;
     w.total_terms += h.nterms;
+}
+
+/// Points the subject and the stratum at this version if it is the newest
+/// (live writes and replay use the same rule, so importing an older
+/// version never changes the current answer). Writer only.
+fn linkVersions(w: *Stratum, id: u64, h: *const Hdr, subject: []const u8) !void {
+    if (subject.len > 0) {
+        const k = subjectKey(h.scope_hash, subject);
+        const cur = w.subjects.get(k);
+        if (cur == null or w.newer(id, cur.?)) try w.mput(&w.subjects, k, id);
+    }
+    if (h.root != 0) {
+        const cur = w.strata.get(h.root) orelse h.root;
+        if (w.newer(id, cur)) try w.mput(&w.strata, h.root, id) else if (w.strata.get(h.root) == null) try w.mput(&w.strata, h.root, cur);
+    }
 }
 
 /// Saves a memory and returns its id.
@@ -914,7 +951,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
     for (items) |it| try validate(it.scope, it.subject orelse "", it.text);
     const gpa = w.gpa;
     const now = w.nowMs();
-    const nw: usize = @min(max_workers, @max(1, std.Thread.getCpuCount() catch 1), (items.len + 255) / 256);
+    const nw: usize = if (items.len <= 256) 1 else @min(max_workers, @max(1, std.Thread.getCpuCount() catch 1), (items.len + 255) / 256);
 
     const Span = struct { start: u32, len: u32, total: u32 };
     const spans = try gpa.alloc(Span, items.len);
@@ -953,55 +990,119 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
 
     var total: usize = 0;
     for (items) |it| total += recordLen(term_threads, it.scope.len, if (it.subject) |s| s.len else 0, it.text.len);
-    var stack: [8192]u8 align(8) = undefined;
-    const heap = if (total > stack.len) try gpa.alignedAlloc(u8, .@"8", total) else null;
-    defer if (heap) |b| gpa.free(b);
-    const buf: []u8 = if (heap) |b| b else stack[0..total];
+    // One memory (an agent's turn): pick its threads and find the fact it
+    // continues before taking the write lock, as a reader. A batch does
+    // this under the lock, so its memories can continue each other.
+    const Pre = struct { keys: [term_threads]u32, dfs: [term_threads]u32, nk: usize, lineage: ?u64 };
+    var pre: ?Pre = null;
+    if (items.len == 1) {
+        w.readers.enter(w.io);
+        defer w.readers.leave(w.io);
+        var x: Pre = undefined;
+        const hashes = pools[0].items[spans[0].start..][0..spans[0].len];
+        x.nk = w.chooseThreads(hashes, &x.keys, &x.dfs);
+        x.lineage = if (items[0].subject == null) w.findLineage(scopeHash(items[0].scope), x.keys[0..x.nk], x.dfs[0..x.nk]) else null;
+        pre = x;
+    }
 
     const first = blk: {
-        w.lock.lockUncancelable(w.io);
-        defer w.lock.unlock(w.io);
+        w.wlock.lockUncancelable(w.io);
+        defer w.wlock.unlock(w.io);
         if (w.broken) return error.Broken;
-        const start = w.end.load(.acquire);
-        if (start + total >= map_reserve) return error.LaneFull;
-        errdefer w.recoverFailedWrite(start);
-        w.pend_start = start;
-        w.pend_buf = buf;
-        defer {
-            w.pend_start = std.math.maxInt(usize);
-            w.pend_buf = &.{};
-        }
+        // Records are encoded in place, in the map: no copy, no system call.
+        const start = try w.reserve(total);
+        errdefer w.recoverFailedWrite(start, total);
+        const buf = w.ownBytes()[start..][0..total];
         var pos: usize = 0;
         for (items, spans, 0..) |it, sp, i| {
             const hashes = pools[i / per].items[sp.start..][0..sp.len];
             var keys: [term_threads]u32 = undefined;
             var dfs: [term_threads]u32 = undefined;
-            const nk = w.chooseThreads(hashes, &keys, &dfs);
+            var nk: usize = undefined;
+            var lineage: ??u64 = null;
+            if (pre) |x| {
+                keys = x.keys;
+                dfs = x.dfs;
+                nk = x.nk;
+                lineage = x.lineage;
+            } else nk = w.chooseThreads(hashes, &keys, &dfs);
             const len = recordLen(nk, it.scope.len, if (it.subject) |s| s.len else 0, it.text.len);
-            try w.encode(buf[pos..][0..len], start + pos, it, now, hashes, sp.total, keys[0..nk], dfs[0..nk]);
+            // A batch counts words as it goes, so its later memories see
+            // its earlier ones; a single memory counts after the lock.
+            try w.encode(buf[pos..][0..len], start + pos, it, now, if (pre == null) hashes else null, sp.total, keys[0..nk], dfs[0..nk], lineage);
             pos += len;
         }
-        try w.lanes[w.me].file.writePositionalAll(w.io, buf[0..pos], start);
-        w.end.store(start + pos, .release);
-        w.lanes[w.me].end = start + pos;
+        w.commitAppend(start + pos);
         break :blk idOf(w.me, @intCast(start >> 3));
     };
+    // Word counts last, outside the lock.
+    if (pre != null) for (pools[0].items[spans[0].start..][0..spans[0].len]) |x| w.bumpDf(x);
     if (w.options.sync_writes) try w.sync();
     try w.maybeSnapshot();
     return first;
 }
 
-/// Makes every write so far durable. Concurrent callers share one flush.
+/// Makes every write so far durable. Each caller flushes the range from
+/// the last durable byte to its own last write, so callers flush side by
+/// side (the disk runs several flushes at once) and none is acknowledged
+/// before everything written ahead of it is on disk.
 pub fn sync(w: *Stratum) !void {
     const target = w.end.load(.acquire);
-    if (w.synced.load(.acquire) >= target) return;
-    w.sync_mutex.lockUncancelable(w.io);
-    defer w.sync_mutex.unlock(w.io);
-    if (w.synced.load(.acquire) >= target) return;
-    const upto = w.end.load(.acquire);
-    try w.lanes[w.me].file.sync(w.io);
+    const floor = w.synced.load(.acquire);
+    if (floor >= target) return;
+    try w.flushOwn(floor, target);
     _ = w.syncs.fetchAdd(1, .monotonic);
-    w.synced.store(upto, .release);
+    _ = w.synced.fetchMax(target, .release);
+}
+
+/// Our lane's bytes, writable.
+fn ownBytes(w: *const Stratum) []u8 {
+    return @constCast(w.lanes[w.me].map);
+}
+
+/// Space for `len` bytes at the end of our lane. Grows the file ahead when
+/// needed. Caller holds the write lock.
+fn reserve(w: *Stratum, len: u64) !u64 {
+    const off = w.end.load(.acquire);
+    if (off + len >= map_reserve) return error.LaneFull;
+    if (off + len > w.alloc) {
+        const step = std.math.clamp(w.alloc / 4, grow_min, grow_max);
+        const want = std.mem.alignForward(u64, @max(off + len, w.alloc + step), 4096);
+        const size = @min(want, map_reserve);
+        try w.lanes[w.me].file.setLength(w.io, size);
+        {
+            var z: [1 << 16]u8 = @splat(0);
+            var o = w.alloc;
+            while (o < size) : (o += z.len) try w.lanes[w.me].file.writePositionalAll(w.io, z[0..@min(z.len, size - o)], o);
+            try w.lanes[w.me].file.sync(w.io);
+        }
+        w.alloc = size;
+    }
+    return off;
+}
+
+/// Makes appended bytes up to `new_end` part of our lane and visible to
+/// other writers. Caller holds the write lock.
+fn commitAppend(w: *Stratum, new_end: u64) void {
+    w.end.store(new_end, .release);
+    @atomicStore(u64, &w.lanes[w.me].end, new_end, .release);
+    w.publish();
+}
+
+fn publish(w: *Stratum) void {
+    const p: *u64 = @ptrCast(@alignCast(w.ownBytes()[pub_end_at..][0..8]));
+    @atomicStore(u64, p, w.lanes[w.me].end, .release);
+}
+
+/// Flushes our lane's bytes in [from, to) to disk. The file's size only
+/// changes when the lane grows, which syncs it then, so this is a range
+/// flush of data alone.
+fn flushOwn(w: *Stratum, from: u64, to: u64) !void {
+    const page = std.heap.pageSize();
+    const lo = std.mem.alignBackward(u64, @min(from, to), page);
+    const m = w.ownBytes();
+    if (to > lo) try std.posix.msync(@alignCast(m[lo..to]), std.posix.MSF.SYNC);
+    if (builtin.os.tag != .linux) try w.lanes[w.me].file.sync(w.io);
 }
 
 pub fn syncCount(w: *const Stratum) u64 {
@@ -1021,20 +1122,13 @@ fn appendMarker(w: *Stratum, kind: Kind, scope: []const u8, target: u64) !void {
     @memset(buf[hdr_len + scope.len ..], 0);
     h.crc = metaCrc(buf, h);
     if (w.broken) return error.Broken;
-    const off = w.end.load(.acquire);
-    if (off + len >= map_reserve) return error.LaneFull;
-    w.lanes[w.me].file.writePositionalAll(w.io, buf, off) catch |e| {
-        w.lanes[w.me].file.setLength(w.io, off) catch {
-            w.broken = true;
-        };
-        return e;
-    };
-    w.end.store(off + len, .release);
-    w.lanes[w.me].end = off + len;
+    const off = try w.reserve(len);
+    @memcpy(w.ownBytes()[off..][0..len], buf);
+    w.commitAppend(off + len);
     w.last_stamp = stamp;
     switch (kind) {
         .forget_scope, .settle => try w.addRule(kind, target, scope),
-        .forget_one => try w.forgotten.put(w.gpa, target, {}),
+        .forget_one => try w.mput(&w.forgotten, target, 1),
         else => {},
     }
 }
@@ -1063,10 +1157,10 @@ fn eraseOwn(w: *Stratum, off8: u32) !void {
 
 /// Erases our lane's memories in a scope (and below) older than `cutoff`.
 fn eraseScopeInOwnLane(w: *Stratum, name: []const u8, cutoff: u64) !void {
-    for (0..w.scope_offs.items.len) |i| {
+    for (0..w.scopes.len()) |i| {
         const sid: u32 = @intCast(i);
         if (!inScope(w.scopeName(sid), name)) continue;
-        var p = w.scope_heads.get((@as(u64, sid) << 8) | w.me) orelse 0;
+        var p = w.scopeHead(sid, w.me);
         while (p != 0) {
             const h = w.hdrAt(idOf(w.me, p));
             const prev = h.prev_scope;
@@ -1082,16 +1176,16 @@ fn eraseScopeInOwnLane(w: *Stratum, name: []const u8, cutoff: u64) !void {
 pub fn forgetScope(w: *Stratum, scope: []const u8) !usize {
     if (scope.len == 0 or scope.len > 1024) return error.InvalidScope;
     const n = blk: {
-        w.lock.lockUncancelable(w.io);
-        defer w.lock.unlock(w.io);
+        w.wlock.lockUncancelable(w.io);
+        defer w.wlock.unlock(w.io);
         try w.refreshLocked();
         const cutoff = w.last_stamp + 1;
         var n: usize = 0;
-        for (0..w.scope_offs.items.len) |i| {
+        for (0..w.scopes.len()) |i| {
             const sid: u32 = @intCast(i);
             if (!inScope(w.scopeName(sid), scope)) continue;
-            for (0..w.nlanes) |lane| {
-                var p = w.scope_heads.get((@as(u64, sid) << 8) | lane) orelse 0;
+            for (0..w.laneCount()) |lane| {
+                var p = w.scopeHead(sid, lane);
                 while (p != 0) {
                     const id = idOf(lane, p);
                     const h = w.hdrAt(id);
@@ -1111,8 +1205,8 @@ pub fn forgetScope(w: *Stratum, scope: []const u8) !usize {
 /// Forgets one memory.
 pub fn forget(w: *Stratum, id: u64) !void {
     {
-        w.lock.lockUncancelable(w.io);
-        defer w.lock.unlock(w.io);
+        w.wlock.lockUncancelable(w.io);
+        defer w.wlock.unlock(w.io);
         if (laneOf(id) >= w.nlanes) return error.NotFound;
         if ((@as(u64, offOf(id)) << 3) + hdr_len > w.lanes[laneOf(id)].end or offOf(id) < data_start >> 3) return error.NotFound;
         try w.appendMarker(.forget_one, "", id);
@@ -1126,8 +1220,8 @@ pub fn forget(w: *Stratum, id: u64) !void {
 pub fn settle(w: *Stratum, scope: []const u8, summary: []const u8) !u64 {
     const id = try w.remember(scope, summary, .{ .subject = "summary" });
     {
-        w.lock.lockUncancelable(w.io);
-        defer w.lock.unlock(w.io);
+        w.wlock.lockUncancelable(w.io);
+        defer w.wlock.unlock(w.io);
         try w.appendMarker(.settle, scope, w.hdrAt(id).stamp);
     }
     if (w.options.sync_writes) try w.sync();
@@ -1179,8 +1273,8 @@ fn validId(w: *const Stratum, id: u64) bool {
 
 pub fn get(w: *Stratum, gpa: Allocator, id: u64) !?Memory {
     try w.maybeRefresh();
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
     if (!w.validId(id)) return null;
     return w.load(gpa, id);
 }
@@ -1198,15 +1292,15 @@ fn recentFiltered(w: *Stratum, gpa: Allocator, scope: []const u8, n: usize, skip
         for (out.items) |m| m.deinit(gpa);
         out.deinit(gpa);
     }
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
     const sid = w.findScope(scope) orelse return out.toOwnedSlice(gpa);
     var cur: [max_lanes]u32 = undefined;
-    for (0..w.nlanes) |l| cur[l] = w.scope_heads.get((@as(u64, sid) << 8) | l) orelse 0;
+    for (0..w.laneCount()) |l| cur[l] = w.scopeHead(sid, l);
     while (out.items.len < n) {
         // Most recently written across lanes.
         var bl: ?usize = null;
-        for (0..w.nlanes) |l| {
+        for (0..w.laneCount()) |l| {
             if (cur[l] == 0) continue;
             if (bl == null or w.laterWrite(idOf(l, cur[l]), idOf(bl.?, cur[bl.?]))) bl = l;
         }
@@ -1226,8 +1320,8 @@ fn recentFiltered(w: *Stratum, gpa: Allocator, scope: []const u8, n: usize, skip
 /// The current memory for a subject in a scope.
 pub fn current(w: *Stratum, gpa: Allocator, scope: []const u8, subject: []const u8) !?Memory {
     try w.maybeRefresh();
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
     const id = w.subjects.get(subjectKey(scopeHash(scope), subject)) orelse return null;
     return w.load(gpa, w.headOf(id, w.hdrAt(id)));
 }
@@ -1323,12 +1417,12 @@ const Search = struct {
     fn consider(c: *Search, id: u64, h: *const Hdr) !void {
         const w = c.w;
         if (h.kind != .memory) return;
-        const sid = w.scope_map.get(h.scope_hash) orelse return;
+        const sid = w.sidOf(h.scope_hash) orelse return;
         if (!c.set.has(sid)) return;
-        if (w.forgotten.contains(id) or h.stamp < w.scope_forgot.items[sid]) return;
+        if (w.forgotten.contains(id) or h.stamp < w.scopes.forgot(sid)) return;
         const base = threadScore(c.qt, w.threadsOf(id, h));
         if (base == 0) return;
-        if (!c.q.deep and h.stamp < w.scope_settled.items[sid]) return;
+        if (!c.q.deep and h.stamp < w.scopes.settled(sid)) return;
         // `since` applies to the version the answer will be.
         if (c.q.since > 0) {
             const shown = if (c.q.deep) id else w.headOf(id, h);
@@ -1357,8 +1451,8 @@ const Search = struct {
     fn walk(c: *Search, key: u32, budget: usize) !void {
         const w = c.w;
         const b = bucketOf(key);
-        for (0..w.nlanes) |lane| {
-            var p = w.lanes[lane].heads[b];
+        for (0..w.laneCount()) |lane| {
+            var p = @atomicLoad(u32, &w.lanes[lane].heads[b], .acquire);
             var steps: usize = 0;
             while (p != 0 and steps < budget) : (steps += 1) {
                 const id = idOf(lane, p);
@@ -1397,8 +1491,8 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     }
     const now = w.nowMs();
 
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
     if (w.count == 0) return hits.toOwnedSlice(gpa);
     var set = try w.scopeSet(gpa, q.scope);
     defer set.deinit(gpa);
@@ -1454,10 +1548,10 @@ pub fn recall(w: *Stratum, gpa: Allocator, q: Query) ![]Hit {
     // be (with slack), else follow chains and filter by scope.
     const est_chain: u64 = @as(u64, w.df(qt[0].hash)) + 1;
     if (!set.all and set.total <= 65536 and set.total <= @max(est_chain * 4, 4096)) {
-        for (0..w.scope_offs.items.len) |i| {
+        for (0..w.scopes.len()) |i| {
             if (!set.bits.isSet(i)) continue;
-            for (0..w.nlanes) |lane| {
-                var p = w.scope_heads.get((@as(u64, i) << 8) | lane) orelse 0;
+            for (0..w.laneCount()) |lane| {
+                var p = w.scopeHead(i, lane);
                 while (p != 0) {
                     const id = idOf(lane, p);
                     const h = w.hdrAt(id);
@@ -1655,10 +1749,10 @@ fn newestInto(w: *const Stratum, gpa: Allocator, set: *const ScopeSet, q: Query,
     const Cur = struct { lane: usize, off8: u32 };
     var cursors: std.ArrayList(Cur) = .empty;
     defer cursors.deinit(gpa);
-    for (0..w.scope_offs.items.len) |i| {
+    for (0..w.scopes.len()) |i| {
         if (!set.has(@intCast(i))) continue;
-        for (0..w.nlanes) |lane| {
-            const p = w.scope_heads.get((@as(u64, i) << 8) | lane) orelse 0;
+        for (0..w.laneCount()) |lane| {
+            const p = w.scopeHead(i, lane);
             if (p != 0) try cursors.append(gpa, .{ .lane = lane, .off8 = p });
         }
     }
@@ -1703,8 +1797,8 @@ pub fn brief(w: *Stratum, gpa: Allocator, situation: []const u8, scope: []const 
     const hits = try w.recall(gpa, .{ .about = situation, .scope = scope, .limit = 16 });
     defer freeHits(gpa, hits);
     const exact = blk: {
-        w.lock.lockSharedUncancelable(w.io);
-        defer w.lock.unlockShared(w.io);
+        w.readers.enter(w.io);
+        defer w.readers.leave(w.io);
         break :blk scope.len > 0 and w.findScope(scope) != null;
     };
     const rec_ms = if (exact) try w.recentFiltered(gpa, scope, 6, true) else try gpa.alloc(Memory, 0);
@@ -1778,9 +1872,9 @@ pub const Info = struct {
 };
 
 pub fn info(w: *Stratum) Info {
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
-    const scopes = w.scope_offs.items.len;
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
+    const scopes = w.scopes.len();
     var bytes: u64 = 0;
     for (w.lanes[0..w.nlanes]) |l| bytes += l.end;
     return .{
@@ -1791,16 +1885,16 @@ pub fn info(w: *Stratum) Info {
         .auto_merges = w.merges,
         .lanes = w.nlanes,
         .file_bytes = bytes,
-        .index_bytes = w.nlanes * nbuckets * 4 + w.cms.len * 4 + w.scope_names.items.len + scopes * 44 + w.scope_heads.capacity() * 16 + w.subjects.capacity() * 20 + w.strata.capacity() * 20 + w.forgotten.capacity() * 12,
+        .index_bytes = w.nlanes * nbuckets * 4 + w.cms.len * 4 + w.scopes.name_bytes + scopes * 48 + (w.scope_map.capacity() + w.scope_heads.capacity() + w.subjects.capacity() + w.strata.capacity() + w.forgotten.capacity()) * 16,
     };
 }
 
 /// Calls `f(ctx, record_bytes, time)` for every live memory: the cost of
 /// answering without an index.
 pub fn scanAll(w: *Stratum, ctx: anytype, comptime f: anytype) !void {
-    w.lock.lockSharedUncancelable(w.io);
-    defer w.lock.unlockShared(w.io);
-    for (0..w.nlanes) |lane| {
+    w.readers.enter(w.io);
+    defer w.readers.leave(w.io);
+    for (0..w.laneCount()) |lane| {
         var pos: u64 = data_start;
         const end = w.lanes[lane].end;
         while (pos + hdr_len <= end) {
@@ -1826,8 +1920,8 @@ const Super = extern struct {
 /// Writes a snapshot when our lane grew by `every` bytes since the last
 /// one. Both ends are read under the write lock.
 fn snapshotIfGrew(w: *Stratum, every: u64) !void {
-    w.lock.lockUncancelable(w.io);
-    defer w.lock.unlock(w.io);
+    w.wlock.lockUncancelable(w.io);
+    defer w.wlock.unlock(w.io);
     if (w.end.load(.acquire) -| w.snap_end < every) return;
     try w.snapshotLocked();
 }
@@ -1847,8 +1941,8 @@ fn putInt(gpa: Allocator, b: *std.ArrayList(u8), comptime T: type, v: T) !void {
 /// superblock at it. Reopening (by any writer) loads it and replays only
 /// the records after it, lane by lane.
 pub fn snapshot(w: *Stratum) !void {
-    w.lock.lockUncancelable(w.io);
-    defer w.lock.unlock(w.io);
+    w.wlock.lockUncancelable(w.io);
+    defer w.wlock.unlock(w.io);
     try w.snapshotLocked();
 }
 
@@ -1869,15 +1963,15 @@ fn snapshotLocked(w: *Stratum) !void {
     try putInt(gpa, &b, u64, w.total_terms);
     try putInt(gpa, &b, u64, w.last_stamp);
     try putInt(gpa, &b, u64, w.merges);
-    const ns: u32 = @intCast(w.scope_offs.items.len);
+    const ns: u32 = @intCast(w.scopes.len());
     try putInt(gpa, &b, u32, ns);
     for (0..ns) |i| {
         const name = w.scopeName(@intCast(i));
         try putInt(gpa, &b, u16, @intCast(name.len));
         try b.appendSlice(gpa, name);
-        try putInt(gpa, &b, u32, w.scope_count.items[i]);
-        try putInt(gpa, &b, u64, w.scope_settled.items[i]);
-        try putInt(gpa, &b, u64, w.scope_forgot.items[i]);
+        try putInt(gpa, &b, u32, w.scopes.countOf(i));
+        try putInt(gpa, &b, u64, w.scopes.settled(i));
+        try putInt(gpa, &b, u64, w.scopes.forgot(i));
     }
     try putInt(gpa, &b, u32, @intCast(w.rules.items.len));
     for (w.rules.items) |r| {
@@ -1886,24 +1980,24 @@ fn snapshotLocked(w: *Stratum) !void {
         try putInt(gpa, &b, u16, @intCast(r.name.len));
         try b.appendSlice(gpa, r.name);
     }
-    const maps = [_]*const std.AutoHashMapUnmanaged(u64, u64){ &w.subjects, &w.strata };
-    try putInt(gpa, &b, u32, w.scope_heads.count());
+    const maps = [_]*const tables.Map{ &w.subjects, &w.strata };
+    try putInt(gpa, &b, u32, @intCast(w.scope_heads.count()));
     var hit = w.scope_heads.iterator();
     while (hit.next()) |e| {
-        try putInt(gpa, &b, u64, e.key_ptr.*);
-        try putInt(gpa, &b, u32, e.value_ptr.*);
+        try putInt(gpa, &b, u64, e.key);
+        try putInt(gpa, &b, u32, @intCast(e.value));
     }
     for (maps) |m| {
-        try putInt(gpa, &b, u32, m.count());
+        try putInt(gpa, &b, u32, @intCast(m.count()));
         var it = m.iterator();
         while (it.next()) |e| {
-            try putInt(gpa, &b, u64, e.key_ptr.*);
-            try putInt(gpa, &b, u64, e.value_ptr.*);
+            try putInt(gpa, &b, u64, e.key);
+            try putInt(gpa, &b, u64, e.value);
         }
     }
-    try putInt(gpa, &b, u32, w.forgotten.count());
-    var fit = w.forgotten.keyIterator();
-    while (fit.next()) |k| try putInt(gpa, &b, u64, k.*);
+    try putInt(gpa, &b, u32, @intCast(w.forgotten.count()));
+    var fit = w.forgotten.iterator();
+    while (fit.next()) |e| try putInt(gpa, &b, u64, e.key);
     const payload = b.items.len - body_start;
     const len = std.mem.alignForward(usize, b.items.len, 8);
     try b.appendNTimes(gpa, 0, len - b.items.len);
@@ -1912,14 +2006,12 @@ fn snapshotLocked(w: *Stratum) !void {
     h.* = .{ .len = @intCast(len), .crc = 0, .kind = .snapshot, .nthreads = 0, .scope_len = 0, .subject_len = 0, .flags = 0, .text_len = @intCast(payload), .nterms = 0, .stamp = stamp, .time = w.nowMs(), .scope_hash = 0, .root = 0, .target = 0, .prev_scope = 0, .text_crc = Crc.hash(b.items[body_start..][0..payload]) };
     var hcopy = h.*;
     h.crc = metaCrc(b.items, &hcopy);
-    const off = w.end.load(.acquire);
-    if (off + len >= map_reserve) return error.LaneFull;
-    try w.lanes[w.me].file.writePositionalAll(w.io, b.items, off);
-    try w.lanes[w.me].file.sync(w.io);
+    const off = try w.reserve(len);
+    @memcpy(w.ownBytes()[off..][0..len], b.items);
     const new_end = off + len;
-    w.end.store(new_end, .release);
-    w.synced.store(new_end, .release);
-    w.lanes[w.me].end = new_end;
+    w.commitAppend(new_end);
+    try w.flushOwn(w.synced.load(.acquire), new_end);
+    _ = w.synced.fetchMax(new_end, .release);
 
     const prog = w.progress() - len; // the snapshot itself is not progress
     w.snap_gen += 1;
@@ -1936,7 +2028,7 @@ fn snapshotLocked(w: *Stratum) !void {
 fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
     const Pick = struct { lane: usize, sb: Super };
     var best: ?Pick = null;
-    for (0..w.nlanes) |lane| {
+    for (0..w.laneCount()) |lane| {
         const len = try w.lanes[lane].file.length(w.io);
         if (len < data_start) continue;
         for (0..2) |i| {
@@ -1990,9 +2082,10 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
         const nlen = try rd.int(data, &p, u16);
         const name = try rd.bytes(data, &p, nlen);
         const id = try w.intern(name, scopeHash(name));
-        w.scope_count.items[id] = try rd.int(data, &p, u32);
-        w.scope_settled.items[id] = try rd.int(data, &p, u64);
-        w.scope_forgot.items[id] = try rd.int(data, &p, u64);
+        const sc = w.scopes.at(id);
+        sc.count = try rd.int(data, &p, u32);
+        sc.settled = try rd.int(data, &p, u64);
+        sc.forgot = try rd.int(data, &p, u64);
     }
     const nr = try rd.int(data, &p, u32);
     for (0..nr) |_| {
@@ -2004,24 +2097,24 @@ fn loadSnapshot(w: *Stratum) !?[max_lanes]u64 {
         try w.rules.append(gpa, .{ .kind = kind, .cutoff = cutoff, .name = copy });
     }
     const nh = try rd.int(data, &p, u32);
-    try w.scope_heads.ensureTotalCapacity(gpa, nh);
+    try w.scope_heads.ensureTotalCapacity(gpa, &w.readers, w.io, nh);
     for (0..nh) |_| {
         const k = try rd.int(data, &p, u64);
-        w.scope_heads.putAssumeCapacity(k, try rd.int(data, &p, u32));
+        try w.mput(&w.scope_heads, k, try rd.int(data, &p, u32));
     }
-    const maps = [_]*std.AutoHashMapUnmanaged(u64, u64){ &w.subjects, &w.strata };
+    const maps = [_]*tables.Map{ &w.subjects, &w.strata };
     for (maps) |m| {
         const n = try rd.int(data, &p, u32);
-        try m.ensureTotalCapacity(gpa, n);
+        try m.ensureTotalCapacity(gpa, &w.readers, w.io, n);
         for (0..n) |_| {
             const k = try rd.int(data, &p, u64);
-            m.putAssumeCapacity(k, try rd.int(data, &p, u64));
+            try w.mput(m, k, try rd.int(data, &p, u64));
         }
     }
     const nf = try rd.int(data, &p, u32);
-    try w.forgotten.ensureTotalCapacity(gpa, nf);
-    for (0..nf) |_| w.forgotten.putAssumeCapacity(try rd.int(data, &p, u64), {});
-    for (0..w.nlanes) |l| w.lanes[l].end = from[l];
+    try w.forgotten.ensureTotalCapacity(gpa, &w.readers, w.io, nf);
+    for (0..nf) |_| try w.mput(&w.forgotten, try rd.int(data, &p, u64), 1);
+    for (0..w.laneCount()) |l| w.lanes[l].end = from[l];
     w.snap_progress = pick.sb.progress;
     return from;
 }
@@ -2163,10 +2256,17 @@ test "reopen from snapshot, and after a crash with a torn tail" {
             _ = try w.remember("s", try std.fmt.bufPrint(&b, "late {d} zebra3", .{i}), .{});
         }
         try w.sync();
-        // As a crash would: no closing snapshot, and a torn record at the end.
+        // As a crash would: no closing snapshot.
         w.snap_progress = w.progress();
+    }
+    {
+        // And a torn record at the end.
+        var sub = try tmp.dir.openDir(testing.io, "s", .{});
+        defer sub.close(testing.io);
+        var f = try sub.openFile(testing.io, "lane-000.sdm", .{ .mode = .read_write });
+        defer f.close(testing.io);
         const garbage: [40]u8 = @splat(0xab);
-        try w.lanes[w.me].file.writePositionalAll(w.io, &garbage, w.end.load(.acquire));
+        try f.writePositionalAll(testing.io, &garbage, try f.length(testing.io));
     }
     const w = try tmpStore(&tmp, null);
     defer w.close();
@@ -2330,4 +2430,8 @@ test "brief fits the budget and holds one version per fact" {
     try testing.expect(b.tokens <= 120);
     try testing.expect(std.mem.indexOf(u8, b.text, "production") != null);
     try testing.expect(std.mem.indexOf(u8, b.text, "staging") == null);
+}
+
+test {
+    _ = tables;
 }
