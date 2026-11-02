@@ -173,15 +173,32 @@ current value.
   short chains on disk. At 10M memories, RAM after reopen is about 16 MB.
 - **Crash safe.** Every record has a checksum, a torn tail is cut off on
   open, and erased text is overwritten with zeros.
+- **Small on disk.** Each lane learns its writers' words: a word seen twice
+  gets a 1 or 2 byte code, written down once in the lane so every reader
+  decodes the same text. Records have a 56-byte header, and word links are
+  3-byte keys plus short distances.
+- **No read locks.** Readers never wait for the writer; each turn's write is
+  flushed on its own range of the file, so durable turns don't queue behind
+  one flusher.
 
 Benchmarks: `zig-out/bin/sedimentum-stratum-bench` takes the same modes as
 the Holo bench, plus `jargon` (project words that change value over time) and
 `lanes` (1 to 32 writer processes, plus a `kill -9` crash test).
 `.holo-report/stratum.html` has the results.
 
-Limits: it uses about twice Holo's disk space, versions with no subject and
-too few rare words in common stay separate (no better than Holo there), and
-agent turns are about 16% slower than Holo's.
+Agent workload (1M messages, 8 threads, every turn durable), same machine:
+
+| Engine  | Turns/s | p99    | RAM after reopen | Disk   |
+|---------|--------:|-------:|-----------------:|-------:|
+| Stratum |   9,309 | 2.7 ms |            12 MB | 308 MB |
+| Holo    |   5,713 | 6.8 ms |            32 MB | 408 MB |
+| v3      |   7,214 | 3.2 ms |            88 MB | 391 MB |
+| v1      |   7,750 | 2.8 ms |           229 MB | 587 MB |
+
+Limits: turns are bound by the disk's flush rate, so they top out near 2x
+v3 on this machine. Versions with no subject and too few rare words in
+common stay separate, and questions in other words need the meaning table:
+there Stratum matches Holo, it doesn't beat it.
 
 ## Features
 
