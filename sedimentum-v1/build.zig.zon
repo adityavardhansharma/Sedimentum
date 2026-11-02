@@ -1,0 +1,8 @@
+.{
+    .name = .sedimentum,
+    .version = "0.0.1",
+    .fingerprint = 0xae7d01229e753bab,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "include", "README.md", "LICENSE" },
+}
