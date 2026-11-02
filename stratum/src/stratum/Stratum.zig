@@ -30,6 +30,7 @@ const Io = std.Io;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Crc = std.hash.crc.@"CRC-32/ISCSI";
+const ErrInt = @Int(.unsigned, @bitSizeOf(anyerror));
 const text = @import("../holo/text.zig");
 pub const Meaning = @import("../holo/Meaning.zig");
 const tables = @import("tables.zig");
@@ -264,7 +265,15 @@ flusher_waiting: std.atomic.Value(bool) = .init(false),
 /// Bumped after every flush; `waitDurable` sleeps on it.
 dseq: std.atomic.Value(u32) = .init(0),
 flusher_stop: std.atomic.Value(bool) = .init(false),
-flusher_err: ?anyerror = null,
+/// The flusher's last error (0: none), cleared when a flush succeeds.
+flusher_err: std.atomic.Value(ErrInt) = .init(0),
+/// Replaying the records after a snapshot.
+replay_after_snap: bool = false,
+/// Where our lane's replay started (the snapshot point).
+replay_from_me: u64 = 0,
+/// A memory inside the snapshot was erased after it: the snapshot's word
+/// use counts are too high, so they are counted again.
+refs_stale: bool = false,
 flusher_thread: ?std.Thread = null,
 last_refresh: std.atomic.Value(u64) = .init(0),
 /// A failed write could not be undone: further writes are refused.
@@ -389,8 +398,13 @@ fn loadTables(w: *Stratum) !void {
         break :blk null;
     };
     // Our own lane first, so markers from other lanes can erase in it.
-    try w.replayLane(w.me, if (from) |f| f[w.me] else data_start, true);
+    w.replay_after_snap = from != null;
+    w.replay_from_me = if (from) |f| f[w.me] else data_start;
+    w.refs_stale = false;
+    try w.replayLane(w.me, w.replay_from_me, true);
     for (0..w.laneCount()) |l| if (l != w.me) try w.replayLane(l, if (from) |f| f[l] else data_start, false);
+    w.replay_after_snap = false;
+    if (w.refs_stale) w.recountOwnRefs();
     if (from != null) {
         // Markers inside the snapshot were never replayed here. Their
         // erasures in this lane may not have happened (its writer was
@@ -1502,7 +1516,7 @@ fn rememberOne(w: *Stratum, it: Item) !u64 {
         defer w.readers.leave(w.io);
         if (w.rebuilds.load(.acquire) == rebuilds) for (req.hashes) |hh| w.bumpDf(hh);
     }
-    if (w.options.sync_writes) try w.sync();
+    if (w.syncEach()) try w.sync();
     try w.maybeSnapshot();
     return id;
 }
@@ -1592,7 +1606,7 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
     w.wakeFlusher();
     // Word counts last, outside the lock.
     if (pre != null) for (pools[0].items[spans[0].start..][0..spans[0].len]) |x| w.bumpDf(x);
-    if (w.options.sync_writes) try w.sync();
+    if (w.syncEach()) try w.sync();
     try w.maybeSnapshot();
     return first;
 }
@@ -1678,11 +1692,22 @@ pub fn isDurable(w: *const Stratum, p: u64) bool {
 }
 
 /// Waits until a promise is durable. Without the flusher, flushes itself.
+/// Each write is durable before it returns, unless promised turns are on.
+fn syncEach(w: *const Stratum) bool {
+    return w.options.sync_writes and !w.options.flusher;
+}
+
 pub fn waitDurable(w: *Stratum, p: u64) !void {
     if (w.flusher_thread == null) return w.sync();
+    // Only a flush that ran while we wait can fail us: an older error may
+    // be gone by the next flush.
+    const d0 = w.dseq.load(.acquire);
     while (w.synced.load(.acquire) < p) {
-        if (w.flusher_err) |e| return e;
         const d = w.dseq.load(.acquire);
+        if (d != d0) {
+            const ec = w.flusher_err.load(.acquire);
+            if (ec != 0) return @errorFromInt(ec);
+        }
         if (w.synced.load(.acquire) >= p) break;
         w.io.futexWaitTimeout(u32, &w.dseq.raw, d, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch {};
     }
@@ -1694,10 +1719,12 @@ fn flusherLoop(w: *Stratum) void {
         const pending = w.end.load(.acquire) > w.synced.load(.acquire) or @atomicLoad(bool, &w.erase_pending, .acquire);
         if (pending) {
             var failed = false;
-            w.sync() catch |e| {
-                w.flusher_err = e;
+            if (w.sync()) |_| {
+                w.flusher_err.store(0, .release);
+            } else |e| {
+                w.flusher_err.store(@intFromError(e), .release);
                 failed = true;
-            };
+            }
             _ = w.dseq.fetchAdd(1, .release);
             w.io.futexWake(u32, &w.dseq.raw, std.math.maxInt(u32));
             if (!failed) continue;
@@ -1764,10 +1791,22 @@ fn appendMarker(w: *Stratum, kind: Kind, scope: []const u8, target: u64) !void {
 /// erased. The metadata checksum does not cover either, so a crash halfway
 /// leaves a readable record whose text no longer checks out, which reads
 /// as erased. Caller holds the write lock.
+/// Counts our lane's word uses again from its live memories.
+fn recountOwnRefs(w: *Stratum) void {
+    @memset(w.word_refs.items, 0);
+    var pos: u64 = data_start;
+    while (w.validAt(w.me, pos, w.lanes[w.me].end)) |mh| : (pos += mh.len) {
+        const id = idOf(w.me, @intCast(pos >> 3));
+        if (mh.kind == .memory and mh.flags & flag_coded != 0 and w.textIntact(id, mh)) w.countCodes(w.storedText(id, mh), 1);
+    }
+}
+
 fn eraseOwn(w: *Stratum, off8: u32) !void {
     const id = idOf(w.me, off8);
     if ((@as(u64, off8) << 3) + hdr_len > w.lanes[w.me].end) return;
     const h = w.hdrAt(id);
+    // Erased after the snapshot we loaded: its counts are in it still.
+    if (h.kind == .erased and w.replay_after_snap and (@as(u64, off8) << 3) < w.replay_from_me) w.refs_stale = true;
     if (h.kind != .memory) return;
     const n = h.text_len;
     const at = (@as(u64, off8) << 3) + textStart(h);
@@ -1836,7 +1875,7 @@ pub fn forgetScope(w: *Stratum, scope: []const u8) !usize {
         try w.eraseScopeInOwnLane(scope, cutoff);
         break :blk n;
     };
-    if (w.options.sync_writes) try w.sync();
+    if (w.syncEach()) try w.sync();
     return n;
 }
 
@@ -1850,7 +1889,7 @@ pub fn forget(w: *Stratum, id: u64) !void {
         try w.appendMarker(.forget_one, "", id);
         if (laneOf(id) == w.me) try w.eraseOwn(offOf(id));
     }
-    if (w.options.sync_writes) try w.sync();
+    if (w.syncEach()) try w.sync();
 }
 
 /// Adds a summary of a scope and settles everything before it: older
@@ -1862,7 +1901,7 @@ pub fn settle(w: *Stratum, scope: []const u8, summary: []const u8) !u64 {
         defer w.wlock.unlock(w.io);
         try w.appendMarker(.settle, scope, w.hdrAt(id).stamp);
     }
-    if (w.options.sync_writes) try w.sync();
+    if (w.syncEach()) try w.sync();
     return id;
 }
 
@@ -2730,6 +2769,9 @@ fn snapshotLocked(w: *Stratum) !void {
     try putInt(gpa, &b, u32, @intCast(w.me));
     try putInt(gpa, &b, u32, @intCast(w.word_refs.items.len));
     for (w.word_refs.items) |r| try putInt(gpa, &b, u32, r);
+    // The snapshot vouches for other writers' records up to the ends it
+    // saved: make them durable first.
+    for (w.lanes[0..w.nlanes], 0..) |l, i| if (i != w.me) try l.file.sync(w.io);
     const payload = b.items.len - body_start;
     const len = std.mem.alignForward(usize, b.items.len, 8);
     try b.appendNTimes(gpa, 0, len - b.items.len);
@@ -3300,6 +3342,44 @@ test "a word learned from the memory being forgotten is erased with it" {
     const bytes = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "custsecretx") == null);
+}
+
+test "words of memories forgotten after a snapshot are erased once all are gone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ids: [2]u64 = undefined;
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        // Both memories use the code for "custsecretx".
+        _ = try w.remember("t", "custsecretx custsecretx ", .{});
+        for (&ids) |*id| id.* = try w.remember("s", "the custsecretx here ", .{});
+        try w.snapshot();
+        try w.forget(ids[0]);
+    }
+    {
+        // Reopen without a newer snapshot, then forget the rest.
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        try w.forget(ids[1]);
+        _ = try w.forgetScope("t");
+        try w.sync();
+    }
+    var sub = try tmp.dir.openDir(testing.io, "s", .{});
+    defer sub.close(testing.io);
+    const bytes = try sub.readFileAlloc(testing.io, "lane-000.sdm", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "custsecretx") == null);
+}
+
+test "a flush error clears once a flush succeeds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try Stratum.open(testing.allocator, testing.io, tmp.dir, "s", .{ .flusher = true });
+    defer w.close();
+    w.flusher_err.store(@intFromError(error.InputOutput), .release);
+    _ = try w.remember("s", "after the error", .{});
+    try w.waitDurable(w.promise());
 }
 
 test "a lane from an older layout is refused, not repaired" {

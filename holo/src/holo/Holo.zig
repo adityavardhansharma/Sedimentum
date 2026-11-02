@@ -166,6 +166,9 @@ const Bits = struct {
     fn set(b: *Bits, i: usize) void {
         b.words.items[i / 64] |= @as(u64, 1) << @intCast(i % 64);
     }
+    fn unset(b: *Bits, i: usize) void {
+        b.words.items[i / 64] &= ~(@as(u64, 1) << @intCast(i % 64));
+    }
     fn get(b: *const Bits, i: usize) bool {
         if (i / 64 >= b.words.items.len) return false;
         return b.words.items[i / 64] & (@as(u64, 1) << @intCast(i % 64)) != 0;
@@ -443,7 +446,36 @@ fn simhash(hashes: []const u64, order: []const u16) u32 {
 
 /// Adds one memory's row. Caller holds the write lock. Same code for new
 /// writes and for replay, so a rebuilt index matches the original.
+/// What adding a row changed besides the row itself, so a write whose
+/// text could not be stored can be taken back.
+const Undo = struct {
+    id: u32 = none,
+    buried: u32 = none,
+    subj_key: ?u64 = null,
+    subj_prev: u32 = none,
+};
+
+/// Takes back a row whose text was never stored: it is forgotten, and the
+/// version it buried comes back if nothing newer replaced it meanwhile.
+/// Caller holds the write lock.
+fn undoRow(h: *Holo, u: Undo) void {
+    if (u.id == none) return;
+    h.forgotten.set(u.id);
+    if (u.subj_key) |k| {
+        const cur = h.subjects.getPtr(k) orelse return;
+        if (cur.* != u.id) return;
+        if (u.subj_prev != none) {
+            cur.* = u.subj_prev;
+            h.buried.unset(u.subj_prev);
+        } else _ = h.subjects.remove(k);
+    } else if (u.buried != none and h.count == u.id + 1) h.buried.unset(u.buried);
+}
+
 fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, body_len: usize, terms: text.Terms) !u32 {
+    return h.applyRowUndo(scope_name, subject, time, body_len, terms, null);
+}
+
+fn applyRowUndo(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, body_len: usize, terms: text.Terms, undo: ?*Undo) !u32 {
     const gpa = h.gpa;
     const id = h.count;
     if (id == none) return error.Full;
@@ -490,6 +522,10 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     if (subject.len > 0) {
         const k = subjectKey(scope, subject);
         const gop = try h.subjects.getOrPut(gpa, k);
+        if (undo) |u| {
+            u.subj_key = k;
+            u.subj_prev = if (gop.found_existing) gop.value_ptr.* else none;
+        }
         if (gop.found_existing) h.buried.set(gop.value_ptr.*);
         gop.value_ptr.* = id;
     } else if (nt >= 3) {
@@ -499,6 +535,7 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
             const pr = h.row(p);
             if (pr.subj == 0 and pr.nterms >= 3 and @popCount(pr.sim ^ r.sim) <= 1 and !h.buried.get(p)) {
                 h.buried.set(p);
+                if (undo) |u| u.buried = p;
                 break;
             }
             p = pr.prev;
@@ -525,6 +562,7 @@ fn applyRow(h: *Holo, scope_name: []const u8, subject: []const u8, time: u64, bo
     pg.tmax = @max(pg.tmax, time);
     pg.smask |= @as(u64, 1) << @intCast(scope % 64);
     h.count = id + 1;
+    if (undo) |u| u.id = id;
     if (slot + 1 == page_rows) try h.sealPage();
     return id;
 }
@@ -626,7 +664,9 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     encodeInto(value, scope, subject, time, body);
 
     h.lock.lockUncancelable(h.io);
-    const id = h.applyRow(scope, subject, time, body.len, ts.terms()) catch |e| {
+    var undo: Undo = .{};
+    const id = h.applyRowUndo(scope, subject, time, body.len, ts.terms(), &undo) catch |e| {
+        h.undoRow(undo);
         h.lock.unlock(h.io);
         return e;
     };
@@ -638,6 +678,13 @@ pub fn remember(h: *Holo, scope: []const u8, body: []const u8, opts: RememberOpt
     // Text goes to the store outside the lock, so writers run in parallel.
     // A reader that finds a row before its text simply skips it.
     const put_result = h.kv.put(key, value);
+    if (put_result) |_| {} else |_| {
+        // The text was not stored: take the row back, so the version it
+        // replaced stays current.
+        h.lock.lockUncancelable(h.io);
+        h.undoRow(undo);
+        h.lock.unlock(h.io);
+    }
     _ = h.inflight.fetchSub(1, .acq_rel);
     try put_result;
     try h.dropIfForgotten(id);
@@ -717,15 +764,19 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
     // 2. Add rows, in order, under the lock.
     const lanes_of = try gpa.alloc(u8, items.len);
     defer gpa.free(lanes_of);
+    const undos = try gpa.alloc(Undo, items.len);
+    defer gpa.free(undos);
+    @memset(undos, .{});
     var first: u32 = 0;
     {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
         first = h.count;
+        errdefer h.undoAll(undos);
         for (items, spans, 0..) |it, sp, i| {
             const w = i / per;
             const terms: text.Terms = .{ .hashes = pools[w].items[sp.start..][0..sp.len], .total = sp.total };
-            const id = try h.applyRow(it.scope, it.subject orelse "", it.time orelse now, it.text.len, terms);
+            const id = try h.applyRowUndo(it.scope, it.subject orelse "", it.time orelse now, it.text.len, terms, &undos[i]);
             lanes_of[i] = @intCast(h.laneOf(h.row(id).scope));
         }
         _ = h.inflight.fetchAdd(1, .acq_rel);
@@ -761,8 +812,19 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
         if (threads[w] == null) Put.run(h, items, lanes_of, first, now, w, nw, &errs[w]);
     }
     for (threads[0..nw]) |t| if (t) |x| x.join();
+    for (errs) |e| if (e) |x| {
+        // Some texts were not stored: take the whole batch back, and
+        // delete the texts that were.
+        {
+            h.lock.lockUncancelable(h.io);
+            defer h.lock.unlock(h.io);
+            h.undoAll(undos);
+        }
+        _ = h.inflight.fetchSub(1, .acq_rel);
+        for (0..items.len) |i| h.dropIfForgotten(first + @as(u32, @intCast(i))) catch {};
+        return x;
+    };
     _ = h.inflight.fetchSub(1, .acq_rel);
-    for (errs) |e| if (e) |x| return x;
     for (0..items.len) |i| try h.dropIfForgotten(first + @as(u32, @intCast(i)));
     if (h.options.sync_writes) try h.kv.syncAll() else _ = h.batch_gen.fetchAdd(1, .acq_rel);
     const want_ckpt = blk: {
@@ -775,6 +837,15 @@ pub fn rememberMany(h: *Holo, items: []const Item) !u32 {
 }
 
 const max_workers = 8;
+
+/// Takes back a batch's rows, newest first. Caller holds the write lock.
+fn undoAll(h: *Holo, undos: []const Undo) void {
+    var i = undos.len;
+    while (i > 0) {
+        i -= 1;
+        h.undoRow(undos[i]);
+    }
+}
 
 /// Makes every write so far durable.
 pub fn sync(h: *Holo) !void {
@@ -1531,7 +1602,8 @@ pub fn checkpoint(h: *Holo) !void {
         const bytes = std.mem.sliceAsBytes(h.cur[0 .. h.count - h.sealed]);
         try h.rows_file.writePositionalAll(h.io, bytes, @as(u64, h.sealed) * @sizeOf(Row));
     }
-    const first_dirty = @min(h.pages_on_disk, @as(u32, @intCast(h.pages.items.len)) -| 1);
+    // The last page saved before may have been open then: save it again.
+    const first_dirty = @min(h.pages_on_disk -| 1, @as(u32, @intCast(h.pages.items.len)) -| 1);
     if (h.pages.items.len > 0) {
         const bytes = std.mem.sliceAsBytes(h.pages.items[first_dirty..]);
         try h.pages_file.writePositionalAll(h.io, bytes, @as(u64, first_dirty) * @sizeOf(Page));
@@ -1944,6 +2016,45 @@ test "reopen after clean close and after losing the checkpoint" {
         defer cur.deinit(testing.allocator);
         try testing.expectEqual(@as(u32, 250), cur.id);
     }
+}
+
+test "a page saved while open is saved again once it fills" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const h = try tmpHolo(&tmp);
+        defer h.close();
+        _ = try h.remember("s", "first okapi", .{});
+        try h.checkpoint();
+        // Fill the rest of that page and start another.
+        for (0..200) |i| {
+            var b: [64]u8 = undefined;
+            _ = try h.remember("s", if (i == 50) "the lastword marker" else try std.fmt.bufPrint(&b, "memory {d}", .{i}), .{});
+        }
+        try h.checkpoint();
+    }
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    const hits = try h.recall(testing.allocator, .{ .about = "lastword", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+}
+
+test "a write whose text is not stored leaves the old version current" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try tmpHolo(&tmp);
+    defer h.close();
+    const old = try h.remember("s", "budget is 10", .{ .subject = "budget" });
+    // As if the text write failed after the row was added.
+    h.lock.lockUncancelable(h.io);
+    var undo: Undo = .{};
+    _ = try h.applyRowUndo("s", "budget", h.nowMs(), 12, (text.TermSet{}).terms(), &undo);
+    h.undoRow(undo);
+    h.lock.unlock(h.io);
+    const cur = (try h.current(testing.allocator, "s", "budget")).?;
+    defer cur.deinit(testing.allocator);
+    try testing.expectEqual(old, cur.id);
 }
 
 test "meaning finds a memory that uses other words" {

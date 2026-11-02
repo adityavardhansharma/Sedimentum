@@ -30,7 +30,8 @@ current value.
   flushed on its own range of the file, so durable turns don't queue behind
   one flusher.
 - **Promised turns.** Open with `.flusher = true` and a write returns as soon
-  as it is in the lane; a background thread makes it durable. `promise()`
+  as it is in the lane, whatever `sync_writes` says; a background thread
+  makes it durable. `promise()`
   names everything written so far, `isDurable(p)` checks it and
   `waitDurable(p)` waits for it, so an agent waits for the disk only before
   it acts outside (sends a message, calls a tool). Threads that write at the

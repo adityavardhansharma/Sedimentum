@@ -99,13 +99,21 @@ Requires Zig 0.17.0. No other dependencies.
 
 ```sh
 zig build test                  # run the tests
-zig build                       # library, CLI and C shared library in zig-out/
+```
+
+This folder is the v1 Zig module (`sedimentum`) and its tests. The
+`sedimentum` CLI, the C shared library and the benchmark open every
+key-value format, so they are built from [`../v3/`](../v3/):
+
+```sh
+cd ../v3
+zig build                       # CLI and C shared library in zig-out/
 zig build -Doptimize=ReleaseFast
 ```
 
 ## Benchmarks
 
-`src/bench.zig` and `bench/kiban-bench` run the same agent-memory workload
+From [`../v3/`](../v3/): `src/bench.zig` and `bench/kiban-bench` run the same agent-memory workload
 (64 agents, 200-byte values, same seeds and key layout) against Sedimentum
 and kiban v0.2.0:
 

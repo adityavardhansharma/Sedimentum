@@ -88,8 +88,16 @@ export fn sdm_open(path: ?[*]const u8, path_len: usize, sync_writes: c_int, out:
 export fn sdm_open_capped(path: ?[*]const u8, path_len: usize, sync_writes: c_int, memory_budget: usize, out: ?*?*anyopaque) Status {
     if (path == null or path_len == 0 or out == null) return fail(error.InvalidArgument);
     ensureIo();
+    // A v2 or v3 directory is refused, never opened as an empty v1
+    // database beside the real one.
+    const found = streams.detect(io_state.io(), std.Io.Dir.cwd(), path.?[0..path_len]) catch |err| return fail(err);
+    if (found != null) return fail(error.WrongEngine);
+    return openV1(path.?[0..path_len], sync_writes, memory_budget, out);
+}
+
+fn openV1(p: []const u8, sync_writes: c_int, memory_budget: usize, out: ?*?*anyopaque) Status {
     const hd = gpa.create(Handle) catch |err| return fail(err);
-    const s = Shared.open(gpa, io_state.io(), std.Io.Dir.cwd(), path.?[0..path_len], .{
+    const s = Shared.open(gpa, io_state.io(), std.Io.Dir.cwd(), p, .{
         .sync_writes = sync_writes != 0,
         .memory_budget = memory_budget,
     }) catch |err| {
@@ -118,7 +126,7 @@ export fn sdm_open_engine(path: ?[*]const u8, path_len: usize, engine: c_int, sy
     // directory themselves.)
     if (engine != 0 and existing != 0 and engine != existing) return fail(error.WrongEngine);
     const which: c_int = if (engine != 0) engine else if (existing != 0) existing else 1;
-    if (which == 1) return sdm_open(path, path_len, sync_writes, out);
+    if (which == 1) return openV1(p, sync_writes, 0, out);
     const hd = gpa.create(Handle) catch |err| return fail(err);
     const opts: streams.Options = .{ .sync_writes = sync_writes != 0 };
     hd.* = switch (which) {
