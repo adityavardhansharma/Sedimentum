@@ -1616,8 +1616,12 @@ pub fn rememberMany(w: *Stratum, items: []const Item) !u64 {
 /// side (the disk runs several flushes at once) and none is acknowledged
 /// before everything written ahead of it is on disk.
 pub fn sync(w: *Stratum) !void {
+    // The end first: a forget flags its erasures before it publishes its
+    // marker, so if this end covers a marker, its erasures are seen below
+    // (waiting on the write lock until they are all noted).
+    const target = w.end.load(.seq_cst);
     // Erasures overwrite bytes below the synced end: flush those too.
-    if (@atomicLoad(bool, &w.erase_pending, .acquire)) {
+    if (@atomicLoad(bool, &w.erase_pending, .seq_cst)) {
         w.wlock.lockUncancelable(w.io);
         const lo = w.erase_lo;
         const hi = w.erase_hi;
@@ -1632,7 +1636,6 @@ pub fn sync(w: *Stratum) !void {
             return e;
         };
     }
-    const target = w.end.load(.acquire);
     const floor = w.synced.load(.acquire);
     if (floor >= target) return;
     try w.flushOwn(floor, target);
@@ -1871,6 +1874,8 @@ pub fn forgetScope(w: *Stratum, scope: []const u8) !usize {
                 }
             }
         }
+        // Flagged before the marker is published: see `sync`.
+        @atomicStore(bool, &w.erase_pending, true, .seq_cst);
         try w.appendMarker(.forget_scope, scope, cutoff);
         try w.eraseScopeInOwnLane(scope, cutoff);
         break :blk n;
@@ -1886,6 +1891,8 @@ pub fn forget(w: *Stratum, id: u64) !void {
         defer w.wlock.unlock(w.io);
         if (laneOf(id) >= w.nlanes) return error.NotFound;
         if ((@as(u64, offOf(id)) << 3) + hdr_len > w.lanes[laneOf(id)].end or offOf(id) < data_start >> 3) return error.NotFound;
+        // Flagged before the marker is published: see `sync`.
+        @atomicStore(bool, &w.erase_pending, true, .seq_cst);
         try w.appendMarker(.forget_one, "", id);
         if (laneOf(id) == w.me) try w.eraseOwn(offOf(id));
     }
