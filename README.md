@@ -153,6 +153,36 @@ Benchmarks: `zig-out/bin/sedimentum-holo-bench <agent|recall|hard> <new-dir> [me
 `hard` stores 20 facts per name in English chat filler and asks each in the
 fact's words and in other words, with and without meaning.
 
+## Stratum: one fact over its whole life
+
+`Stratum` (in `src/stratum/`) has the same API as Holo (`remember`,
+`rememberMany`, `recall`, `brief`, `current`, `recent`, `forget`,
+`forgetScope`, `settle`, `info`, `scanAll`), but it indexes facts instead of
+records. Every version of a fact joins one *stratum*, either through a shared
+`subject` or automatically, when a new memory shares at least three rare words
+with an older one in the same scope. A question that matches any version of a
+fact gets the newest version back, so an old wording still finds the
+current value.
+
+- **Several writers at once.** Each process that opens the store claims its
+  own lane file (`lane-NNN.sdm`) with a file lock, and only ever appends to it.
+  Readers pick up the other lanes every 20 ms. Writers never wait for each
+  other, and a crashed writer's lane is taken over by the next one to open.
+- **Small in RAM.** Each word keeps a head pointer per lane, and every record
+  links back to the previous record with the same word, so a question walks
+  short chains on disk. At 10M memories, RAM after reopen is about 16 MB.
+- **Crash safe.** Every record has a checksum, a torn tail is cut off on
+  open, and erased text is overwritten with zeros.
+
+Benchmarks: `zig-out/bin/sedimentum-stratum-bench` takes the same modes as
+the Holo bench, plus `jargon` (project words that change value over time) and
+`lanes` (1 to 32 writer processes, plus a `kill -9` crash test).
+`.holo-report/stratum.html` has the results.
+
+Limits: it uses about twice Holo's disk space, versions with no subject and
+too few rare words in common stay separate (no better than Holo there), and
+agent turns are about 16% slower than Holo's.
+
 ## Features
 
 - `put`, `get`, `delete`, durable or buffered
