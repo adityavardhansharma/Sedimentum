@@ -190,7 +190,7 @@ Agent workload (1M messages, 8 threads, every turn durable), same machine:
 
 | Engine  | Turns/s | p99    | RAM after reopen | Disk   |
 |---------|--------:|-------:|-----------------:|-------:|
-| Stratum |   9,309 | 2.7 ms |            12 MB | 308 MB |
+| Stratum |   8,312 | 5.6 ms |            12 MB | 308 MB |
 | Holo    |   5,713 | 6.8 ms |            32 MB | 408 MB |
 | v3      |   7,214 | 3.2 ms |            88 MB | 391 MB |
 | v1      |   7,750 | 2.8 ms |           229 MB | 587 MB |
