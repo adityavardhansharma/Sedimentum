@@ -9,17 +9,17 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: sedimentum-v1
-
 jobs:
   test:
-    name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
+    name: Test ${{ matrix.engine }} (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.engine }}
     strategy:
       fail-fast: false
       matrix:
+        engine: [v1, v2, v3, holo, stratum]
         os: [ubuntu-latest, macos-latest]
         optimize: [Debug, ReleaseSafe]
     steps:
