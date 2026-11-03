@@ -2794,3 +2794,252 @@ fn readMap(w: *Crystal, f: Io.File, ts: SnapSection, ls: SnapSection, m: *Map) !
     m.len = @intCast(std.mem.readInt(u64, &lb, .little));
     @atomicStore(?*Map.Table, &m.table, t, .seq_cst);
 }
+
+// ------------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+fn tmpStore(tmp: *testing.TmpDir, meaning: ?*const Meaning) !*Crystal {
+    return Crystal.open(testing.allocator, testing.io, tmp.dir, "s", .{ .sync_writes = false, .meaning = meaning });
+}
+
+test "remember, recent, current" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    _ = try w.remember("chat/1", "hello there", .{});
+    _ = try w.remember("chat/1", "deploy is on friday", .{});
+    _ = try w.remember("mem", "plan A", .{ .subject = "plan" });
+    _ = try w.remember("mem", "plan B", .{ .subject = "plan" });
+    const r = try w.recent(testing.allocator, "chat/1", 10);
+    defer freeMemories(testing.allocator, r);
+    try testing.expectEqual(@as(usize, 2), r.len);
+    try testing.expectEqualStrings("deploy is on friday", r[0].text);
+    try testing.expectEqualStrings("chat/1", r[0].scope);
+    const c = (try w.current(testing.allocator, "mem", "plan")).?;
+    defer c.deinit(testing.allocator);
+    try testing.expectEqualStrings("plan B", c.text);
+}
+
+test "text is coded with the lane's model and reads back exactly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    var ids: [3000]u64 = undefined;
+    for (&ids, 0..) |*id, i| {
+        var b: [128]u8 = undefined;
+        id.* = try w.remember("chat/2", try std.fmt.bufPrint(&b, "the user wants to deploy the service on friday number {d}", .{i}), .{});
+    }
+    try testing.expect(w.lanes[w.me].nmodels >= 2);
+    for ([_]usize{ 0, 63, 64, 1500, 2999 }) |i| {
+        const m = (try w.get(testing.allocator, ids[i])).?;
+        defer m.deinit(testing.allocator);
+        var b: [128]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&b, "the user wants to deploy the service on friday number {d}", .{i}), m.text);
+    }
+    // About 58 bytes of text each: stored in well under that, header included.
+    try testing.expect(w.info().file_bytes < 3000 * 40);
+}
+
+test "an old wording reaches the newest version of its fact" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    w.setClockForTest(10_000_000);
+    for (0..2000) |i| {
+        var b: [64]u8 = undefined;
+        _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "filler {d} about lunch and coffee", .{i}), .{});
+    }
+    _ = try w.remember("p", "billing runs on postgres fifteen", .{ .subject = "billing-db" });
+    for (0..300) |i| {
+        var b: [64]u8 = undefined;
+        _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "more filler {d}", .{i}), .{});
+    }
+    _ = try w.remember("p", "payments service moved to cockroach", .{ .subject = "billing-db" });
+    const hits = try w.recall(testing.allocator, .{ .about = "what does billing run on, postgres?", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(hits.len >= 1);
+    try testing.expectEqualStrings("payments service moved to cockroach", hits[0].memory.text);
+    for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, "fifteen") == null);
+    const deep = try w.recall(testing.allocator, .{ .about = "billing postgres cockroach payments", .limit = 5, .deep = true });
+    defer freeHits(testing.allocator, deep);
+    try testing.expectEqual(@as(usize, 2), deep.len);
+}
+
+test "a new value for the same name and slot is a new version; another slot is not" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    for (0..5000) |i| {
+        var b: [80]u8 = undefined;
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i}), .{});
+    }
+    _ = try w.remember("p", "zorblat cache ttl is ninety seconds", .{});
+    _ = try w.remember("p", "zorblat owner is mallory", .{});
+    _ = try w.remember("p", "update: zorblat cache ttl raised to hundredtwenty", .{});
+    const hits = try w.recall(testing.allocator, .{ .about = "zorblat cache ttl", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(std.mem.indexOf(u8, hits[0].memory.text, "hundredtwenty") != null);
+    for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, "ninety") == null);
+    const own = try w.recall(testing.allocator, .{ .about = "who owns zorblat", .limit = 5 });
+    defer freeHits(testing.allocator, own);
+    var saw_owner = false;
+    for (own) |x| {
+        if (std.mem.indexOf(u8, x.memory.text, "mallory") != null) saw_owner = true;
+    }
+    try testing.expect(saw_owner);
+}
+
+test "forget and forgetScope erase text, and survive reopening" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        const a = try w.remember("chat/9", "secret token alpha", .{});
+        _ = try w.remember("chat/9", "secret token beta", .{});
+        _ = try w.remember("chat/10", "keep this one", .{});
+        try w.forget(a);
+        try testing.expectEqual(@as(usize, 1), try w.forgetScope("chat/9"));
+        const r = try w.recent(testing.allocator, "chat/9", 10);
+        defer freeMemories(testing.allocator, r);
+        try testing.expectEqual(@as(usize, 0), r.len);
+        try w.sync();
+    }
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const r = try w.recent(testing.allocator, "chat/9", 10);
+    defer freeMemories(testing.allocator, r);
+    try testing.expectEqual(@as(usize, 0), r.len);
+    const k = try w.recent(testing.allocator, "chat/10", 10);
+    defer freeMemories(testing.allocator, k);
+    try testing.expectEqual(@as(usize, 1), k.len);
+    // The text is gone from the file, not just hidden.
+    const Scan = struct {
+        found: bool = false,
+        fn each(c: *@This(), body: []const u8, _: u64) void {
+            if (std.mem.indexOf(u8, body, "secret") != null) c.found = true;
+        }
+    };
+    var sc: Scan = .{};
+    try w.scanAll(&sc, Scan.each);
+    try testing.expect(!sc.found);
+    const lane = w.lanes[w.me].map[0..@intCast(w.end.load(.acquire))];
+    try testing.expect(std.mem.indexOf(u8, lane, "secret") == null);
+}
+
+test "reopening maps the snapshot and reads only what came after" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        for (0..3000) |i| {
+            var b: [80]u8 = undefined;
+            _ = try w.remember("proj/1/chat", try std.fmt.bufPrint(&b, "message {d} about the quarterly roadmap", .{i}), .{});
+        }
+        _ = try w.remember("proj/1", "the vendor for kestrelpay is stripe", .{ .subject = "vendor" });
+    }
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        try testing.expectEqual(@as(u64, 3001), w.info().memories);
+        _ = try w.remember("proj/1", "the vendor for kestrelpay is adyen now", .{ .subject = "vendor" });
+    }
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const hits = try w.recall(testing.allocator, .{ .about = "kestrelpay vendor", .scope = "proj/1" });
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqualStrings("the vendor for kestrelpay is adyen now", hits[0].memory.text);
+    const r = try w.recent(testing.allocator, "proj/1/chat", 2);
+    defer freeMemories(testing.allocator, r);
+    try testing.expectEqualStrings("message 2999 about the quarterly roadmap", r[0].text);
+}
+
+test "a torn write at the end of the lane is cut off" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const w = try tmpStore(&tmp, null);
+        defer w.close();
+        _ = try w.remember("a", "first", .{});
+        _ = try w.remember("a", "second", .{});
+        try w.sync();
+        w.dirty = false;
+    }
+    {
+        var sub = try tmp.dir.openDir(testing.io, "s", .{});
+        defer sub.close(testing.io);
+        var f = try sub.openFile(testing.io, "lane-000.cx", .{ .mode = .read_write });
+        defer f.close(testing.io);
+        const garbage = [_]u8{ 200, 0, 0, 0, 1, 2, 3, 4, 1, 9, 9 };
+        try f.writePositionalAll(testing.io, &garbage, try f.length(testing.io));
+    }
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    _ = try w.remember("a", "third", .{});
+    const r = try w.recent(testing.allocator, "a", 10);
+    defer freeMemories(testing.allocator, r);
+    try testing.expectEqual(@as(usize, 3), r.len);
+    try testing.expectEqualStrings("third", r[0].text);
+}
+
+test "two writers share a store through their own lanes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = try tmpStore(&tmp, null);
+    defer a.close();
+    const b = try tmpStore(&tmp, null);
+    defer b.close();
+    try testing.expect(a.me != b.me);
+    _ = try a.remember("team", "alpha wrote the release notes", .{});
+    _ = try b.remember("team", "beta reviewed the release notes", .{});
+    try a.sync();
+    try b.sync();
+    try a.refresh();
+    try b.refresh();
+    const ra = try a.recent(testing.allocator, "team", 10);
+    defer freeMemories(testing.allocator, ra);
+    const rb = try b.recent(testing.allocator, "team", 10);
+    defer freeMemories(testing.allocator, rb);
+    try testing.expectEqual(@as(usize, 2), ra.len);
+    try testing.expectEqual(@as(usize, 2), rb.len);
+    _ = try b.forgetScope("team");
+    try a.refresh();
+    const ra2 = try a.recent(testing.allocator, "team", 10);
+    defer freeMemories(testing.allocator, ra2);
+    try testing.expectEqual(@as(usize, 0), ra2.len);
+}
+
+test "promised writes become durable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try Crystal.open(testing.allocator, testing.io, tmp.dir, "s", .{ .sync_writes = false, .flusher = true });
+    defer w.close();
+    _ = try w.remember("a", "promised", .{});
+    const p = w.promise();
+    try w.waitDurable(p);
+    try testing.expect(w.isDurable(p));
+}
+
+test "brief holds the newest version only and fits its budget" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    _ = try w.remember("proj/7/decisions", "decision: the cache ttl for glimmer is fiftysec", .{ .subject = "glimmer/ttl" });
+    for (0..50) |i| {
+        var b: [64]u8 = undefined;
+        _ = try w.remember("proj/7/chat/1", try std.fmt.bufPrint(&b, "chatter line {d} about lunch", .{i}), .{});
+    }
+    _ = try w.remember("proj/7/decisions", "update: the cache ttl for glimmer is ninetysec", .{ .subject = "glimmer/ttl" });
+    const b = try w.brief(testing.allocator, "what is the cache ttl for glimmer?", "proj/7", 300);
+    defer b.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, b.text, "ninetysec") != null);
+    try testing.expect(std.mem.indexOf(u8, b.text, "fiftysec") == null);
+    try testing.expect(b.tokens <= 300);
+}
