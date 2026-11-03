@@ -46,44 +46,12 @@ pub fn build(b: *std.Build) void {
     b.installFile("include/sedimentum.h", "include/sedimentum.h");
 
     // Command-line tool: zig-out/bin/sedimentum
-    const cli = b.addExecutable(.{
-        .name = "sedimentum",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .omit_frame_pointer = lean.omit_frame_pointer,
-            .unwind_tables = lean.unwind_tables,
-            .stack_check = lean.stack_check,
-            .stack_protector = lean.stack_protector,
-            .error_tracing = lean.error_tracing,
-            .strip = lean.strip,
-            .imports = &.{.{ .name = "sedimentum", .module = mod }},
-        }),
-    });
-    b.installArtifact(cli);
+    b.installArtifact(exe(b, "sedimentum", "src/cli.zig", target, optimize, lean, false, &.{.{ .name = "sedimentum", .module = mod }}));
 
-    // Head-to-head benchmark with kiban:
+    // Head-to-head benchmark with kiban (glibc malloc, so RSS tracks what
+    // the engine holds):
     //   zig build -Doptimize=ReleaseFast && zig-out/bin/sedimentum-bench <dir> [records]
-    const bench = b.addExecutable(.{
-        .name = "sedimentum-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .omit_frame_pointer = lean.omit_frame_pointer,
-            .unwind_tables = lean.unwind_tables,
-            .stack_check = lean.stack_check,
-            .stack_protector = lean.stack_protector,
-            .error_tracing = lean.error_tracing,
-            .strip = lean.strip,
-            // glibc malloc hands freed memory back to the OS, so RSS tracks
-            // what the engine holds rather than allocator caches.
-            .link_libc = true,
-            .imports = &.{.{ .name = "sedimentum", .module = mod }},
-        }),
-    });
-    b.installArtifact(bench);
+    b.installArtifact(exe(b, "sedimentum-bench", "src/bench.zig", target, optimize, lean, true, &.{.{ .name = "sedimentum", .module = mod }}));
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
@@ -99,3 +67,22 @@ const Lean = struct {
     error_tracing: ?bool,
     strip: ?bool,
 };
+
+fn exe(b: *std.Build, name: []const u8, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, lean: Lean, libc: bool, imports: []const std.Build.Module.Import) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = lean.omit_frame_pointer,
+            .unwind_tables = lean.unwind_tables,
+            .stack_check = lean.stack_check,
+            .stack_protector = lean.stack_protector,
+            .error_tracing = lean.error_tracing,
+            .strip = lean.strip,
+            .link_libc = libc,
+            .imports = imports,
+        }),
+    });
+}

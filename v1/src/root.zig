@@ -1,4 +1,4 @@
-//! Sedimentum: a small embedded key-value store for agent memory.
+//! Sedimentum v1: a small embedded key-value store for agent memory.
 //!
 //! Values live in append-only segment files; an ordered index in memory
 //! maps each live key to its newest record. Start with `Db`.
@@ -10,8 +10,6 @@ pub const record = @import("record.zig");
 pub const segment = @import("segment.zig");
 pub const index = @import("index.zig");
 pub const cold = @import("cold.zig");
-/// The stream stores: `streams.V2` and `streams.V3` (Lean).
-pub const streams = @import("streams/Store.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

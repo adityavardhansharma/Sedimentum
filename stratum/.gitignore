@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+.holo-report/
+__pycache__/
