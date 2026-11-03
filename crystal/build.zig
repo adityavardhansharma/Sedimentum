@@ -37,6 +37,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench);
 
+    // zig-out/bin/crystal-flushbench <each|leader|fdatasync> <file>: the
+    // durable turn rate of the disk alone (Linux).
+    if (target.result.os.tag == .linux) b.installArtifact(b.addExecutable(.{
+        .name = "crystal-flushbench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/flushbench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    }));
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
