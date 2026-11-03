@@ -1,0 +1,22 @@
+[package]
+name = "crystal"
+version = "0.1.0"
+edition = "2021"
+description = "Crystal agent memory, in Rust"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "crystal-bench"
+path = "src/bin/crystal-bench.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.test]
+opt-level = 1
