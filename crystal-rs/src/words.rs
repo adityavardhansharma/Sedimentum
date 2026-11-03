@@ -53,17 +53,35 @@ pub fn is_word_byte(c: u8) -> bool {
     CODE[c as usize] != 0
 }
 
-/// A lowercase word as a number. Never 0.
+static POW37: [u64; MAX_PACKED + 1] = {
+    let mut t = [1u64; MAX_PACKED + 1];
+    let mut i = 1;
+    while i <= MAX_PACKED {
+        t[i] = t[i - 1] * 37;
+        i += 1;
+    }
+    t
+};
+
+/// A short word as a number, at compile time or run time.
+const fn pack_short(w: &[u8]) -> u64 {
+    let mut v: u64 = 0;
+    let mut i = 0;
+    while i < w.len() {
+        v = v * 37 + CODE[w[i] as usize] as u64;
+        i += 1;
+    }
+    v * POW37[MAX_PACKED - w.len()]
+}
+
+/// A lowercase word as a number. Never 0. (Base 37, padded with zero
+/// digits to 12: the padding is one multiply.)
 #[inline]
 pub fn pack(w: &[u8]) -> u64 {
     if w.len() > MAX_PACKED {
         return crate::hash::hash(0xc4157a1, w) | HASHED_BIT;
     }
-    let mut v: u64 = 0;
-    for i in 0..MAX_PACKED {
-        v = v * 37 + if i < w.len() { CODE[w[i] as usize] as u64 } else { 0 };
-    }
-    v
+    pack_short(w)
 }
 
 /// The word a packed number stands for (not for hashed words).
@@ -83,15 +101,59 @@ const STOPWORDS: [&str; 70] = [
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "she", "so", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to", "too", "us", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your", "should", "could", "about", "please", "just",
 ];
 
-static STOP_KEYS: LazyLock<Vec<u64>> = LazyLock::new(|| {
-    let mut ks: Vec<u64> = STOPWORDS.iter().map(|w| pack(w.as_bytes())).collect();
-    ks.sort_unstable();
+/// Packed stopwords, sorted at compile time.
+static STOP_KEYS: [u64; STOPWORDS.len()] = {
+    let mut ks = [0u64; STOPWORDS.len()];
+    let mut i = 0;
+    while i < ks.len() {
+        ks[i] = pack_short(STOPWORDS[i].as_bytes());
+        i += 1;
+    }
+    // Insertion sort (const).
+    let mut i = 1;
+    while i < ks.len() {
+        let mut j = i;
+        while j > 0 && ks[j - 1] > ks[j] {
+            let t = ks[j];
+            ks[j] = ks[j - 1];
+            ks[j - 1] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
     ks
-});
+};
+
+/// The stopwords again, in a 256-slot open-addressing table built at
+/// compile time: one or two probes instead of a binary search.
+static STOP_TABLE: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut i = 0;
+    while i < STOP_KEYS.len() {
+        let k = STOP_KEYS[i];
+        let mut s = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+        while t[s] != 0 {
+            s = (s + 1) & 255;
+        }
+        t[s] = k;
+        i += 1;
+    }
+    t
+};
 
 #[inline]
 pub fn is_stop(key: u64) -> bool {
-    STOP_KEYS.binary_search(&key).is_ok()
+    let mut s = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+    loop {
+        let k = STOP_TABLE[s];
+        if k == key {
+            return true;
+        }
+        if k == 0 {
+            return false;
+        }
+        s = (s + 1) & 255;
+    }
 }
 
 const CUE_WORDS: [&str; 56] = [

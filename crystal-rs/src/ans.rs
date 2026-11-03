@@ -56,7 +56,9 @@ impl Model {
             if e == 0 {
                 return None;
             }
-            if self.token(e - 1) == b {
+            let t = self.token(e - 1);
+            // Short tokens: a byte loop beats a call to memcmp.
+            if t.len() == b.len() && t.iter().zip(b).all(|(x, y)| x == y) {
                 return Some(e - 1);
             }
             i = (i + 1) & mask;
@@ -90,7 +92,7 @@ pub fn build(toks: &[&[u8]], counts: &[u64], byte_counts: &[u64; 256]) -> Box<Mo
         slot: vec![0; M as usize],
         tok_off: vec![0; ntok],
         tok_len: vec![0; ntok],
-        tok_bytes: Vec::with_capacity(tok_bytes_len),
+        tok_bytes: Vec::with_capacity(tok_bytes_len + 32),
         enc: vec![0; if ntok == 0 { 0 } else { cap }],
     });
     quantize(&raw, &mut m.freq);
@@ -101,6 +103,8 @@ pub fn build(toks: &[&[u8]], counts: &[u64], byte_counts: &[u64; 256]) -> Box<Mo
         m.tok_bytes.extend_from_slice(t);
         o += t.len() as u32;
     }
+    // Padding, so decode can copy a whole 32 bytes for any token.
+    m.tok_bytes.extend_from_slice(&[0u8; 32]);
     finish(&mut m);
     m
 }
@@ -320,27 +324,41 @@ pub fn decode(m: &Model, enc: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
     let mut o = 0usize;
     let mask = M - 1;
     let n = out.len();
+    let nsym = m.nsym as usize;
+    debug_assert!(m.slot.len() == M as usize && m.freq.len() == nsym && m.cum.len() == nsym);
     while o < n {
         let sl = x & mask;
-        let s = m.slot[sl as usize] as u32;
-        x = m.freq[s as usize] * (x >> SCALE_BITS) + sl - m.cum[s as usize];
+        // SAFETY: sl < M = slot.len(), and every slot holds a symbol < nsym
+        // (built by `finish`).
+        let s = unsafe { *m.slot.get_unchecked(sl as usize) } as usize;
+        let (f, c) = unsafe { (*m.freq.get_unchecked(s), *m.cum.get_unchecked(s)) };
+        x = f * (x >> SCALE_BITS) + sl - c;
         while x < L {
             if p >= enc.len() {
                 return Err(Corrupt);
             }
-            x = (x << 8) | enc[p] as u32;
+            x = (x << 8) | unsafe { *enc.get_unchecked(p) } as u32;
             p += 1;
         }
         if s < 256 {
-            out[o] = s as u8;
+            unsafe { *out.get_unchecked_mut(o) = s as u8 };
             o += 1;
         } else {
-            let t = m.token(s);
-            if o + t.len() > n {
+            let i = s - 256;
+            let to = m.tok_off[i] as usize;
+            let tl = m.tok_len[i] as usize;
+            if o + tl > n {
                 return Err(Corrupt);
             }
-            out[o..o + t.len()].copy_from_slice(t);
-            o += t.len();
+            if o + 32 <= n {
+                // SAFETY: tok_bytes has 32 bytes of padding after every token,
+                // and out has 32 bytes from o; the extra bytes are overwritten
+                // by what follows (or were never part of the text).
+                unsafe { std::ptr::copy_nonoverlapping(m.tok_bytes.as_ptr().add(to), out.as_mut_ptr().add(o), 32) };
+            } else {
+                out[o..o + tl].copy_from_slice(&m.tok_bytes[to..to + tl]);
+            }
+            o += tl;
         }
     }
     Ok(())

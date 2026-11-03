@@ -65,6 +65,10 @@ const GROW_MIN: u64 = 4 << 20;
 const GROW_MAX: u64 = 32 << 20;
 const MAX_MODELS: usize = 255;
 const MAX_TEXT: u32 = 64 << 20;
+/// Zero-fill writes are page sized: a larger write makes the page cache
+/// hold the lane in large folios, and then every flush writes a whole
+/// folio for a few changed bytes (3x slower durable writes, measured).
+const ZERO_CHUNK: usize = 4096;
 
 const K_MEMORY: u8 = 1;
 const K_SCOPE: u8 = 2;
@@ -769,6 +773,10 @@ pub struct Crystal {
     erase_pending: AtomicBool,
     last_refresh: AtomicI64,
     merges: AtomicU64,
+    /// Newest memory time indexed, and whether times never went backwards
+    /// in index order (then a memory's time bounds every older one's).
+    last_time: AtomicU64,
+    times_sorted: AtomicBool,
 
     // Lexicon.
     lex: Map,
@@ -880,6 +888,8 @@ impl Crystal {
         self.push_scope(b"", 0)?;
         self.ws().total_terms = 0;
         self.merges.store(0, Relaxed);
+        self.last_time.store(0, Relaxed);
+        self.times_sorted.store(true, Relaxed);
         Ok(())
     }
 
@@ -920,6 +930,8 @@ impl Crystal {
             erase_pending: AtomicBool::new(false),
             last_refresh: AtomicI64::new(i64::MIN / 2),
             merges: AtomicU64::new(0),
+            last_time: AtomicU64::new(0),
+            times_sorted: AtomicBool::new(true),
             lex: Map::new(),
             t_key: FlatVec::new(1 << 28)?,
             t_df: FlatVec::new(1 << 28)?,
@@ -1452,7 +1464,9 @@ impl Crystal {
         raw.extend_from_slice(scope);
         raw.extend_from_slice(r.subject);
         let at = raw.len();
-        raw.resize(at + r.raw_len as usize, 0);
+        // SAFETY: u8 has no invalid values; decode_text fills every byte or
+        // fails, and on failure the buffer is dropped unread.
+        unsafe { raw.set_len(at + r.raw_len as usize) };
         if let Err(e) = self.decode_text(lane_of(id), &r, &mut raw[at..]) {
             if !Self::text_intact(&r) {
                 return Ok(None);
@@ -1535,6 +1549,11 @@ impl Crystal {
         }
         if f.erased || self.forgotten_by_vc(f.sid, lane, off) {
             sf |= FLAG_FORGOTTEN;
+        }
+        if f.time < self.last_time.load(Relaxed) {
+            self.times_sorted.store(false, Release);
+        } else {
+            self.last_time.store(f.time, Relaxed);
         }
         self.tl_sf.push(sf)?;
         self.tl_loc.push(id_of(lane, off))?;
@@ -1664,7 +1683,7 @@ impl Crystal {
                     }
                 }
                 dec.terms.fill(if erased { &[] } else { &dec.buf[..] });
-                self.index_memory(lane, off, MemFields { sid, subject: r.subject, link: r.link, erased }, &dec.terms, None)?;
+                self.index_memory(lane, off, MemFields { time: r.time, sid, subject: r.subject, link: r.link, erased }, &dec.terms, None)?;
             }
             K_SCOPE => {
                 let mut p = 0;
@@ -1747,7 +1766,7 @@ impl Crystal {
         let e = own.end.load(Acquire);
         let alloc = self.grower.alloc.load(Acquire);
         let mut o = e;
-        let z = vec![0u8; 1 << 16];
+        let z = vec![0u8; ZERO_CHUNK];
         while o < alloc {
             let n = (z.len() as u64).min(alloc - o) as usize;
             let cur = unsafe { std::slice::from_raw_parts(own.map.add(o as usize), n) };
@@ -1814,7 +1833,7 @@ impl Crystal {
     fn grower_loop(&self) {
         let g = &self.grower;
         let file = &self.lane(self.me).file;
-        let z = vec![0u8; 1 << 20];
+        let z = vec![0u8; ZERO_CHUNK];
         loop {
             let seen = g.seq.load(Acquire);
             if g.stop.load(Acquire) {
@@ -1831,7 +1850,7 @@ impl Crystal {
                         file.write_all_at(&z[..n], o)?;
                         o += n as u64;
                     }
-                    file.sync_data()
+                    file.sync_all()
                 })();
                 match res {
                     Ok(()) => g.alloc.store(want, Release),
@@ -2002,7 +2021,7 @@ impl Crystal {
         let off = self.append_record(&b);
         self.ws().rec_buf = b;
         let off = off?;
-        self.index_memory(self.me, off, MemFields { sid, subject, link, erased: false }, terms, Some(tids))?;
+        self.index_memory(self.me, off, MemFields { time, sid, subject, link, erased: false }, terms, Some(tids))?;
 
         let ws = self.ws();
         ws.written += 1;
@@ -2685,7 +2704,7 @@ impl Crystal {
             self.newest_ords(set, 64, &mut cands);
             self.rank(s, q, set, &cands, extra, false, limit, &mut facts, &mut decoded, &scored)?;
             done = true;
-        } else if meaning.is_none() && !rare.is_empty() && !common.is_empty() {
+        } else if posts_only && !rare.is_empty() && !common.is_empty() {
             // Rare words first: their few memories are read whole. If they
             // fill the top results so well that a memory with only the
             // common words could not enter, the long lists are never read.
@@ -2850,21 +2869,46 @@ impl Crystal {
     /// top `limit` facts.
     #[allow(clippy::too_many_arguments)]
     fn rank(&self, s: &mut Search, q: &Query, set: ScopeSet, cands: &[Cand], extra: f32, posts_only: bool, limit: usize, facts: &mut Vec<FactHit>, decoded: &mut usize, skip: &[u32]) -> Result<()> {
+        // Candidates with equal s1 come newest first. When times never went
+        // backwards, the last time read in such a run bounds the time (so
+        // the recency) of every candidate after it in the run, and a
+        // candidate whose bound cannot reach the top results is skipped
+        // without reading its record (its subject flag is in memory).
+        let sorted = self.times_sorted.load(Acquire);
+        let mut run_s1 = f32::NAN;
+        let mut t_ub = u64::MAX;
         for c in cands {
             if *decoded >= MAX_DECODE {
                 break;
             }
-            if facts.len() >= limit && s.bound(c.s1 + extra) < kth_score(facts, limit) {
+            let full = facts.len() >= limit;
+            let kth = if full { kth_score(facts, limit) } else { 0.0 };
+            let b = s.bound(c.s1 + extra);
+            if full && b < kth {
                 break;
             }
-            if !self.alive(c.ord) || !set.has(self, self.sid_of(c.ord)) {
+            if c.s1 != run_s1 {
+                run_s1 = c.s1;
+                t_ub = u64::MAX;
+            }
+            let sf = ld32(self.tl_sf.at(c.ord as usize));
+            if c.ord as usize >= self.mem_count() || sf & FLAG_FORGOTTEN != 0 || !set.has(self, sf & SCOPE_MASK) {
                 continue;
+            }
+            if full && sorted && t_ub != u64::MAX {
+                let subj = if sf & FLAG_SUBJECT != 0 { 1.1 } else { 1.0 };
+                if b / 1.1 * subj * s.recency(t_ub) < kth {
+                    continue;
+                }
             }
             if !skip.is_empty() && skip.binary_search(&c.ord).is_ok() {
                 continue;
             }
             let sc = if posts_only { self.score_from_posts(s, c.ord, c.s1, c.mask) } else { self.score(s, c.ord) };
             let Some(sc) = sc else { continue };
+            if sorted {
+                t_ub = sc.2;
+            }
             if !posts_only {
                 *decoded += 1;
             }
@@ -2886,7 +2930,7 @@ impl Crystal {
     /// Score of a whole memory: question bits it holds, by words or by
     /// meaning, times the share of the question covered (squared), times
     /// recency.
-    fn score(&self, s: &mut Search, ord: u32) -> Option<(f32, u8)> {
+    fn score(&self, s: &mut Search, ord: u32) -> Option<(f32, u8, u64)> {
         let (time, subject) = self.text_of(ord, &mut s.text)?;
         if time < s.since {
             return None;
@@ -2946,19 +2990,19 @@ impl Crystal {
         }
         let cov = base / s.wsum;
         let subj = if subject { 1.1 } else { 1.0 };
-        Some((base * cov * cov * s.recency(time) * subj, mask))
+        Some((base * cov * cov * s.recency(time) * subj, mask, time))
     }
 
     /// Score from the postings alone, when every question word was
     /// findable and meaning is off: only the record's time is read.
-    fn score_from_posts(&self, s: &Search, ord: u32, s1: f32, mask: u8) -> Option<(f32, u8)> {
+    fn score_from_posts(&self, s: &Search, ord: u32, s1: f32, mask: u8) -> Option<(f32, u8, u64)> {
         let r = self.rec_of(self.tl_loc.get(ord as usize))?;
         if r.erased || r.time < s.since || s1 <= 0.0 {
             return None;
         }
         let cov = s1 / s.wsum;
         let subj = if !r.subject.is_empty() { 1.1 } else { 1.0 };
-        Some((s1 * cov * cov * s.recency(r.time) * subj, mask))
+        Some((s1 * cov * cov * s.recency(r.time) * subj, mask, r.time))
     }
 
     /// The newest live ordinals in a scope set.
@@ -3198,6 +3242,8 @@ impl Crystal {
                 let e = if l == self.me { self.end.load(Acquire) } else { self.lane(l).end.load(Acquire) };
                 hb[32 + l * 8..40 + l * 8].copy_from_slice(&e.to_le_bytes());
             }
+            hb[SH_TIME..SH_TIME + 8].copy_from_slice(&self.last_time.load(Relaxed).to_le_bytes());
+            hb[SH_TIME + 8..SH_TIME + 16].copy_from_slice(&(self.times_sorted.load(Relaxed) as u64).to_le_bytes());
             hb[SH_NSEC..SH_NSEC + 4].copy_from_slice(&(sw.secs.len() as u32).to_le_bytes());
             for (i, s) in sw.secs.iter().enumerate() {
                 let o = SH_SIZE + i * 24;
@@ -3309,6 +3355,8 @@ impl Crystal {
             }
             self.ws().total_terms = u64at(16);
             self.merges.store(u64at(24), Relaxed);
+            self.last_time.store(u64at(SH_TIME), Relaxed);
+            self.times_sorted.store(u64at(SH_TIME + 8) != 0, Relaxed);
             Ok(())
         })();
         if let Err(e) = r {
@@ -3331,8 +3379,10 @@ const SNAP_VERSION: u32 = 1;
 const MAX_SECTIONS: usize = 256;
 const HEAD_BYTES: usize = 4 * PAGE;
 // Header: magic 8, version 4, nlanes 4, total_terms 8, merges 8,
-// ends 64 x 8, nsections 4, crc 4; then the section table.
-const SH_NSEC: usize = 32 + MAX_LANES * 8;
+// ends 64 x 8, last time 8, times sorted 8, nsections 4, crc 4; then the
+// section table.
+const SH_TIME: usize = 32 + MAX_LANES * 8;
+const SH_NSEC: usize = SH_TIME + 16;
 const SH_CRC: usize = SH_NSEC + 4;
 const SH_SIZE: usize = SH_CRC + 4;
 
@@ -3483,6 +3533,7 @@ impl ScopeSet {
 }
 
 struct MemFields<'a> {
+    time: u64,
     sid: u32,
     subject: &'a [u8],
     link: u64,
