@@ -293,73 +293,107 @@ fn symbols(m: &Model, text: &[u8], out: &mut [u16]) -> usize {
 /// Codes `text`; `scratch` holds at least text.len() symbols and `out` at
 /// least `bound(text.len())` bytes. Returns the coded length (at the front
 /// of `out`).
+/// Symbols from which a text is coded with two interleaved states.
+const TWO_STATES_MIN: usize = 24;
+const TWO_BIT: u32 = 1 << 31;
+
 pub fn encode(m: &Model, text: &[u8], scratch: &mut [u16], out: &mut [u8]) -> usize {
     let ns = symbols(m, text, scratch);
     let mut p = out.len();
-    let mut x: u32 = L;
+    // Long texts use two states taking turns (symbol k uses state k & 1),
+    // so the decoder runs two independent chains at once. Short ones keep
+    // one state and save its 4 bytes. A state is below 2^31, so the top bit
+    // of the first one says which.
+    let two = ns >= TWO_STATES_MIN;
+    let mut xs: [u32; 2] = [L, L];
     for k in (0..ns).rev() {
         let s = scratch[k] as usize;
         let f = m.freq[s];
         let x_max = ((L >> SCALE_BITS) << 8) * f;
-        while x >= x_max {
+        let x = &mut xs[if two { k & 1 } else { 0 }];
+        while *x >= x_max {
             p -= 1;
-            out[p] = x as u8;
-            x >>= 8;
+            out[p] = *x as u8;
+            *x >>= 8;
         }
-        x = ((x / f) << SCALE_BITS) + (x % f) + m.cum[s];
+        *x = ((*x / f) << SCALE_BITS) + (*x % f) + m.cum[s];
+    }
+    if two {
+        p -= 4;
+        out[p..p + 4].copy_from_slice(&xs[1].to_le_bytes());
     }
     p -= 4;
-    out[p..p + 4].copy_from_slice(&x.to_le_bytes());
+    out[p..p + 4].copy_from_slice(&(xs[0] | if two { TWO_BIT } else { 0 }).to_le_bytes());
     let len = out.len() - p;
     out.copy_within(p.., 0);
     len
+}
+
+/// One decode step for state `x`: writes its symbol at `o`, returns the new `o`.
+#[inline(always)]
+fn step(m: &Model, x: &mut u32, enc: &[u8], p: &mut usize, out: &mut [u8], o: usize) -> Result<usize, Corrupt> {
+    let n = out.len();
+    let sl = *x & (M - 1);
+    // SAFETY: sl < M = slot.len(), and every slot holds a symbol < nsym
+    // (built by `finish`).
+    let s = unsafe { *m.slot.get_unchecked(sl as usize) } as usize;
+    let (f, c) = unsafe { (*m.freq.get_unchecked(s), *m.cum.get_unchecked(s)) };
+    *x = f * (*x >> SCALE_BITS) + sl - c;
+    while *x < L {
+        if *p >= enc.len() {
+            return Err(Corrupt);
+        }
+        *x = (*x << 8) | unsafe { *enc.get_unchecked(*p) } as u32;
+        *p += 1;
+    }
+    if s < 256 {
+        unsafe { *out.get_unchecked_mut(o) = s as u8 };
+        return Ok(o + 1);
+    }
+    let i = s - 256;
+    // SAFETY: symbols >= 256 are tokens, i < tok_off.len() = tok_len.len().
+    let (to, tl) = unsafe { (*m.tok_off.get_unchecked(i) as usize, *m.tok_len.get_unchecked(i) as usize) };
+    if o + tl > n {
+        return Err(Corrupt);
+    }
+    if o + 32 <= n {
+        // SAFETY: tok_bytes has 32 bytes of padding after every token, and
+        // out has 32 bytes from o; the extra bytes are overwritten by what
+        // follows (or were never part of the text).
+        unsafe { std::ptr::copy_nonoverlapping(m.tok_bytes.as_ptr().add(to), out.as_mut_ptr().add(o), 32) };
+    } else {
+        out[o..o + tl].copy_from_slice(&m.tok_bytes[to..to + tl]);
+    }
+    Ok(o + tl)
 }
 
 pub fn decode(m: &Model, enc: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
     if enc.len() < 4 {
         return Err(Corrupt);
     }
-    let mut x = u32::from_le_bytes(enc[0..4].try_into().unwrap());
-    let mut p = 4usize;
+    let first = u32::from_le_bytes(enc[0..4].try_into().unwrap());
+    let mut x0 = first & !TWO_BIT;
     let mut o = 0usize;
-    let mask = M - 1;
     let n = out.len();
-    let nsym = m.nsym as usize;
-    debug_assert!(m.slot.len() == M as usize && m.freq.len() == nsym && m.cum.len() == nsym);
+    debug_assert!(m.slot.len() == M as usize && m.freq.len() == m.nsym as usize && m.cum.len() == m.nsym as usize);
+    if first & TWO_BIT == 0 {
+        let mut p = 4usize;
+        while o < n {
+            o = step(m, &mut x0, enc, &mut p, out, o)?;
+        }
+        return Ok(());
+    }
+    if enc.len() < 8 {
+        return Err(Corrupt);
+    }
+    let mut x1 = u32::from_le_bytes(enc[4..8].try_into().unwrap());
+    let mut p = 8usize;
     while o < n {
-        let sl = x & mask;
-        // SAFETY: sl < M = slot.len(), and every slot holds a symbol < nsym
-        // (built by `finish`).
-        let s = unsafe { *m.slot.get_unchecked(sl as usize) } as usize;
-        let (f, c) = unsafe { (*m.freq.get_unchecked(s), *m.cum.get_unchecked(s)) };
-        x = f * (x >> SCALE_BITS) + sl - c;
-        while x < L {
-            if p >= enc.len() {
-                return Err(Corrupt);
-            }
-            x = (x << 8) | unsafe { *enc.get_unchecked(p) } as u32;
-            p += 1;
+        o = step(m, &mut x0, enc, &mut p, out, o)?;
+        if o >= n {
+            break;
         }
-        if s < 256 {
-            unsafe { *out.get_unchecked_mut(o) = s as u8 };
-            o += 1;
-        } else {
-            let i = s - 256;
-            let to = m.tok_off[i] as usize;
-            let tl = m.tok_len[i] as usize;
-            if o + tl > n {
-                return Err(Corrupt);
-            }
-            if o + 32 <= n {
-                // SAFETY: tok_bytes has 32 bytes of padding after every token,
-                // and out has 32 bytes from o; the extra bytes are overwritten
-                // by what follows (or were never part of the text).
-                unsafe { std::ptr::copy_nonoverlapping(m.tok_bytes.as_ptr().add(to), out.as_mut_ptr().add(o), 32) };
-            } else {
-                out[o..o + tl].copy_from_slice(&m.tok_bytes[to..to + tl]);
-            }
-            o += tl;
-        }
+        o = step(m, &mut x1, enc, &mut p, out, o)?;
     }
     Ok(())
 }
@@ -474,7 +508,11 @@ mod tests {
             c.add(sample);
         }
         let m = c.model();
-        let texts: [&[u8]; 4] = [sample, b"Totally new words: zebra, quokka! 42 times.", b"", b"\x00\xff binary \x01 bytes"];
+        // Short texts code with one state, long ones with two (odd and even
+        // symbol counts).
+        let long: Vec<u8> = sample.repeat(4);
+        let odd: Vec<u8> = [&long[..], b"x"].concat();
+        let texts: [&[u8]; 6] = [sample, b"Totally new words: zebra, quokka! 42 times.", b"", b"\x00\xff binary \x01 bytes", &long, &odd];
         for t in texts {
             let mut sym = vec![0u16; t.len()];
             let mut out = vec![0u8; bound(t.len())];

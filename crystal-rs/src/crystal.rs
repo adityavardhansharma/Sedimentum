@@ -3019,28 +3019,35 @@ impl Crystal {
         }
         let mut ids = Vec::new();
         self.subtree(set.root, &mut ids);
-        let mut lists: Vec<(Posts, Option<u32>)> = ids
-            .iter()
-            .map(|&sid| {
-                let mut p = self.scope_posts(sid);
-                let h = self.posts_next(&mut p);
-                (p, h)
-            })
-            .collect();
-        while out.len() < max {
-            let mut bi: Option<usize> = None;
-            for (i, l) in lists.iter().enumerate() {
-                if let Some(v) = l.1 {
-                    if bi.is_none_or(|b| v > lists[b].1.unwrap()) {
-                        bi = Some(i);
-                    }
+        // Heads kept apart from the cursors, as ord + 1 (0 = list done), so
+        // picking the newest is a tight max over a small u32 array.
+        let mut cur: Vec<Posts> = Vec::with_capacity(ids.len());
+        let mut heads: Vec<u32> = Vec::with_capacity(ids.len());
+        for &sid in &ids {
+            let mut p = self.scope_posts(sid);
+            let h = self.posts_next(&mut p).map_or(0, |o| o + 1);
+            if h != 0 {
+                cur.push(p);
+                heads.push(h);
+            }
+        }
+        while out.len() < max && !heads.is_empty() {
+            let mut bi = 0;
+            let mut bv = heads[0];
+            for (i, &v) in heads.iter().enumerate().skip(1) {
+                if v > bv {
+                    bv = v;
+                    bi = i;
                 }
             }
-            let Some(i) = bi else { break };
-            let o = lists[i].1.unwrap();
-            let mut p = lists[i].0;
-            lists[i].1 = self.posts_next(&mut p);
-            lists[i].0 = p;
+            match self.posts_next(&mut cur[bi]) {
+                Some(o) => heads[bi] = o + 1,
+                None => {
+                    heads.swap_remove(bi);
+                    cur.swap_remove(bi);
+                }
+            }
+            let o = bv - 1;
             if self.alive(o) {
                 out.push(Cand { ord: o, s1: 0.0, mask: 0 });
             }
