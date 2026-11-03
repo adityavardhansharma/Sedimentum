@@ -1,0 +1,3 @@
+{"mode":"each","turns":24000,"seconds":11.972,"turns_per_sec":2005,"flushes":24000}
+{"mode":"leader","turns":24000,"seconds":9.714,"turns_per_sec":2471,"flushes":7017}
+{"mode":"fdatasync","turns":24000,"seconds":11.713,"turns_per_sec":2049,"flushes":24000}
