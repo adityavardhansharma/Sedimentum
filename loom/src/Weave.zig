@@ -431,6 +431,7 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
             }
         }.gt);
         for (evs.items) |e| {
+            if (debug) std.debug.print("subject join {d} {d}: {d} for, {d} against\n", .{ e.k >> 32, @as(u32, @truncate(e.k)), e.n, conflict.get(e.k) orelse 0 });
             if (uf.join(@intCast(e.k >> 32), @truncate(e.k))) wv.joined_by_subject += 1;
         }
     }
@@ -502,15 +503,17 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
         }
     }
 
-    // 3. One-off claims: a claim no frame explains continues the earlier
-    //    claim that shares the most of its words, when it is the only one
-    //    that close: two words (the name and one more) when it says
-    //    something changed, three when it does not.
+    // 3. One-off claims: a claim no frame explains, and no subject placed,
+    //    continues the earlier claim that shares the most of its words,
+    //    when it is the only one that close: two words (the name and one
+    //    more) when it says something changed, three when it does not.
     {
         var shared: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         var by_root: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         for (cs.items, 0..) |c, ci| {
-            if (c.frame < nf0) continue;
+            // A claim its writer's subject already placed in a slot stays
+            // there: joining it again would join two slots through it.
+            if (c.frame < nf0 or uf.find(c.frame) < nf0) continue;
             shared.clearRetainingCapacity();
             for (mw.items[c.w0..][0..c.wn]) |x| {
                 const list = by_name.get(x) orelse continue;
