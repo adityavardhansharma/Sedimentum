@@ -1470,31 +1470,23 @@ pub fn rememberMany(w: *Loom, items: []const Item) !u64 {
     const terms = &tl_terms;
     var first: u64 = 0;
     var tids: [words.Terms.cap]u32 = undefined;
-    var dfs: [words.Terms.cap]u32 = undefined;
     for (items, 0..) |it, k| {
         // Everything that only reads the index is done before the lock:
-        // the words, their counts, which fact this continues, the coding.
+        // the words and the coding. Nothing is linked when written: which
+        // fact a claim continues is the weave's business (Weave.zig).
         terms.fill(it.text);
         var coded = try w.codeText(it.text, gpa, &heap, &syms);
-        var link: u64 = 0;
         {
             w.readers.enter();
             defer w.readers.leave();
-            for (terms.items(), 0..) |word, i| {
-                tids[i] = w.termId(word.key);
-                dfs[i] = if (tids[i] != 0) w.df(tids[i]) else w.dfOf(word.key);
-            }
-            if (it.subject == null) {
-                const sid = w.scopeId(it.scope);
-                if (sid) |s| link = if (try w.findLineage(s, terms, dfs[0..terms.len])) |t| t + 1 else 0;
-            }
+            for (terms.items(), 0..) |word, i| tids[i] = w.termId(word.key);
         }
         w.wlock.lock(w.io);
         defer w.wlock.unlock(w.io);
         if (w.broken) return error.Broken;
         // A new model came meanwhile: code again with it.
         if (coded.gen != w.lanes[w.me].nmodels) coded = try w.codeText(it.text, gpa, &heap, &syms);
-        const id = try w.appendMemory(it, terms, coded, tids[0..terms.len], link);
+        const id = try w.appendMemory(it, terms, coded, tids[0..terms.len]);
         if (k == 0) first = id;
     }
     if (w.options.sync_writes and !w.options.flusher) try w.sync();
@@ -1503,7 +1495,7 @@ pub fn rememberMany(w: *Loom, items: []const Item) !u64 {
 }
 
 /// Writer only (lock held).
-fn appendMemory(w: *Loom, it: Item, terms: *const words.Terms, coded: Coded, tids: []const u32, link: u64) !u64 {
+fn appendMemory(w: *Loom, it: Item, terms: *const words.Terms, coded: Coded, tids: []const u32) !u64 {
     const gpa = w.gpa;
     const sid = try w.ensureScope(it.scope);
     const ref = try w.ownRef(sid);
@@ -1519,7 +1511,7 @@ fn appendMemory(w: *Loom, it: Item, terms: *const words.Terms, coded: Coded, tid
     try ans.putVarint(gpa, b, subject.len);
     try ans.putVarint(gpa, b, coded.model);
     try ans.putVarint(gpa, b, it.text.len);
-    try ans.putVarint(gpa, b, link);
+    try ans.putVarint(gpa, b, 0); // link: unused, the weave links
     var c4: [4]u8 = undefined;
     std.mem.writeInt(u32, &c4, coded.crc, .little);
     try b.appendSlice(gpa, &c4);
@@ -1528,7 +1520,7 @@ fn appendMemory(w: *Loom, it: Item, terms: *const words.Terms, coded: Coded, tid
     try b.appendSlice(gpa, coded.stored);
     seal(b.items, meta_end);
     const off = try w.appendRecord(b.items);
-    _ = try w.indexMemory(w.me, off, .{ .time = time, .sid = sid, .subject = subject, .link = link, .erased = false }, terms, tids);
+    _ = try w.indexMemory(w.me, off, .{ .time = time, .sid = sid, .subject = subject, .link = 0, .erased = false }, terms, tids);
 
     w.written += 1;
     if (w.written & 255 == 0) w.reclaim();
@@ -1556,21 +1548,8 @@ fn newModel(w: *Loom) !void {
     w.counter.reset(gpa);
 }
 
-// ---------------------------------------------------------------- lineage
+// --------------------------------------------------------------- claim span
 
-/// Up to this many earlier memories with a name make the name an anchor.
-fn anchorLimit(n: usize) u32 {
-    return @intCast(std.math.clamp(n / 256, 1, 64));
-}
-
-const Claim = struct {
-    keys: [64]u64 = undefined,
-    wts: [64]f32 = undefined,
-    mi: [64]?u32 = undefined,
-    n: usize = 0,
-};
-
-/// The words around a name: the claim a memory makes about it.
 fn absDiff(a: u16, b: u16) u16 {
     return if (a > b) a - b else b - a;
 }
@@ -1604,164 +1583,6 @@ fn valueOf(w: *const Loom, terms: *const words.Terms, name: words.Word, new_dfs:
         if (best == null or absDiff(word.pos, name.pos) < absDiff(best.?.pos, name.pos)) best = word;
     }
     return best;
-}
-
-/// The words of a memory's claim about `anchor`, with how much each
-/// belongs to it.
-fn claimOf(w: *const Loom, terms: *const words.Terms, anchor: u64, new_dfs: ?[]const u32) Claim {
-    var c: Claim = .{};
-    const ai = terms.find(anchor) orelse return c;
-    const name = terms.words[ai];
-    const value = w.valueOf(terms, name, new_dfs);
-    const meaning = w.options.meaning;
-    for (terms.items()) |word| {
-        if (c.n == c.keys.len) break;
-        if (word.key == anchor or word.number or words.isCue(word.key)) continue;
-        if (value) |v| if (v.key == word.key) continue;
-        const wt = spanWeight(word, name, value);
-        if (wt == 0) continue;
-        c.keys[c.n] = word.key;
-        c.wts[c.n] = wt;
-        c.mi[c.n] = if (meaning) |m| m.index(word.key) else null;
-        c.n += 1;
-    }
-    return c;
-}
-
-fn wordSim(meaning: ?*const Meaning, ka: u64, ma: ?u32, kb: u64, mb: ?u32) f32 {
-    if (ka == kb) return 1;
-    const m = meaning orelse return 0;
-    const a = ma orelse return 0;
-    const b = mb orelse return 0;
-    return @max(0, m.similarity(a, b));
-}
-
-/// How much of claim `a` claim `b` covers, by words and meaning.
-fn coverOf(meaning: ?*const Meaning, a: *const Claim, b: *const Claim) f32 {
-    var num: f32 = 0;
-    var den: f32 = 0;
-    for (0..a.n) |i| {
-        var best: f32 = 0;
-        for (0..b.n) |j| best = @max(best, wordSim(meaning, a.keys[i], a.mi[i], b.keys[j], b.mi[j]));
-        num += a.wts[i] * best;
-        den += a.wts[i];
-    }
-    return if (den > 0) num / den else 0;
-}
-
-/// The memory a new one updates, if it is a new version of a known fact:
-/// the same name (a rare word seen before), a new value (a word never
-/// seen), and the same slot (the words around the name, by spelling or
-/// meaning), or a change word ("now", "moved", "became") when the name
-/// has only one fact. Only reads the index (runs before the write lock).
-fn findLineage(w: *Loom, sid: u32, terms: *const words.Terms, dfs: []const u32) !?u64 {
-    const n = w.memCount();
-    if (n == 0) return null;
-    const alim = anchorLimit(n);
-    const rare_lim: u32 = @intCast(@max(4, n / 1024));
-    var anchors: [3]usize = undefined;
-    var na: usize = 0;
-    var nnew: usize = 0;
-    var cue = false;
-    for (terms.items(), 0..) |word, i| {
-        if (words.isCue(word.key)) {
-            cue = true;
-            continue;
-        }
-        if (dfs[i] == 0) nnew += 1;
-        if (dfs[i] == 0 or dfs[i] > alim or word.number) continue;
-        // Keep the three rarest.
-        if (na < anchors.len) {
-            anchors[na] = i;
-            na += 1;
-        } else {
-            var worst: usize = 0;
-            for (1..na) |k| if (dfs[anchors[k]] > dfs[anchors[worst]]) {
-                worst = k;
-            };
-            if (dfs[i] < dfs[anchors[worst]]) anchors[worst] = i;
-        }
-    }
-    if (na == 0 or nnew == 0) return null;
-    // A new version brings one new value. Two or more never-seen words (a
-    // new name and its value) make a new fact, unless the memory says it
-    // changes something and names it by a word seen only a few times (a
-    // restatement in new words: a new term for the setting, and its value).
-    if (nnew > 1) {
-        var rarest: u32 = std.math.maxInt(u32);
-        for (anchors[0..na]) |ai| rarest = @min(rarest, dfs[ai]);
-        if (!cue or rarest > 4) return null;
-    }
-    const parent = w.sc_parent.get(sid);
-
-    // Earlier facts that share an anchor, in the same scope or a sibling.
-    const Fact = struct { head: u32, anchor: u64 };
-    var facts: [32]Fact = undefined;
-    var nf: usize = 0;
-    for (anchors[0..na]) |ai| {
-        var p = w.postsOf(terms.words[ai].key);
-        var steps: usize = 0;
-        while (p.next()) |ord| : (steps += 1) {
-            if (steps >= 64) break;
-            if (!w.alive(ord)) continue;
-            const s = w.sidOf(ord);
-            if (s != sid and (parent == 0 or w.sc_parent.get(s) != parent)) continue;
-            const h = w.headOf(ord);
-            var dup = false;
-            for (facts[0..nf]) |f| if (f.head == h) {
-                dup = true;
-            };
-            if (dup) continue;
-            if (nf == facts.len) break;
-            facts[nf] = .{ .head = h, .anchor = terms.words[ai].key };
-            nf += 1;
-        }
-    }
-    if (nf == 0) return null;
-
-    const meaning = w.options.meaning;
-    const gpa = w.gpa;
-    const ft = try gpa.create(words.Terms);
-    defer gpa.destroy(ft);
-    var heap: std.ArrayList(u8) = .empty;
-    defer heap.deinit(gpa);
-    var best: ?usize = null;
-    var best_s: f32 = -1;
-    var second_s: f32 = 0;
-    var best_shared: usize = 0;
-    var strong: ?usize = null;
-    var strong_shared: usize = 0;
-    for (facts[0..nf], 0..) |f, k| {
-        const t = (try w.textOf(f.head, &heap, gpa)) orelse continue;
-        ft.fill(t.text);
-        // Rare words in common, the name included.
-        var shared: usize = 0;
-        for (terms.items(), 0..) |word, i| {
-            if (dfs[i] == 0 or dfs[i] > rare_lim) continue;
-            if (ft.find(word.key) != null) shared += 1;
-        }
-        const mine = w.claimOf(terms, f.anchor, dfs);
-        const theirs = w.claimOf(ft, f.anchor, null);
-        const s = (coverOf(meaning, &mine, &theirs) + coverOf(meaning, &theirs, &mine)) / 2;
-        if (shared >= 3 and shared > strong_shared) {
-            strong = k;
-            strong_shared = shared;
-        }
-        if (s > best_s) {
-            second_s = @max(second_s, best_s);
-            best_s = s;
-            best = k;
-            best_shared = shared;
-        } else second_s = @max(second_s, s);
-    }
-    if (strong) |k| return w.tl_loc.get(facts[k].head);
-    const k = best orelse return null;
-    const clear_win = best_s >= second_s * 1.3 + 0.02;
-    const link = (cue and nf == 1) or
-        (cue and best_s >= 0.25 and clear_win) or
-        (nf == 1 and best_shared >= 2) or
-        (best_s >= 0.6 and best_s >= second_s * 1.5);
-    return if (link) w.tl_loc.get(facts[k].head) else null;
 }
 
 // ------------------------------------------------------------- durability
@@ -2876,31 +2697,6 @@ test "an old wording reaches the newest version of its fact" {
     const deep = try w.recall(testing.allocator, .{ .about = "billing postgres cockroach payments", .limit = 5, .deep = true });
     defer freeHits(testing.allocator, deep);
     try testing.expectEqual(@as(usize, 2), deep.len);
-}
-
-test "a new value for the same name and slot is a new version; another slot is not" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const w = try tmpStore(&tmp, null);
-    defer w.close();
-    for (0..5000) |i| {
-        var b: [80]u8 = undefined;
-        _ = try w.remember("p", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i}), .{});
-    }
-    _ = try w.remember("p", "zorblat cache ttl is ninety seconds", .{});
-    _ = try w.remember("p", "zorblat owner is mallory", .{});
-    _ = try w.remember("p", "update: zorblat cache ttl raised to hundredtwenty", .{});
-    const hits = try w.recall(testing.allocator, .{ .about = "zorblat cache ttl", .limit = 5 });
-    defer freeHits(testing.allocator, hits);
-    try testing.expect(std.mem.indexOf(u8, hits[0].memory.text, "hundredtwenty") != null);
-    for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, "ninety") == null);
-    const own = try w.recall(testing.allocator, .{ .about = "who owns zorblat", .limit = 5 });
-    defer freeHits(testing.allocator, own);
-    var saw_owner = false;
-    for (own) |x| {
-        if (std.mem.indexOf(u8, x.memory.text, "mallory") != null) saw_owner = true;
-    }
-    try testing.expect(saw_owner);
 }
 
 test "forget and forgetScope erase text, and survive reopening" {
