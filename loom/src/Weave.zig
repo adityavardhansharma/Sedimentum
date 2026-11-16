@@ -183,14 +183,18 @@ const C = struct {
     /// Its wording features.
     f0: u32,
     fnn: u32,
+    /// Where its words are, and which of them is its value.
+    src: u32,
+    pv: u8,
     frame: u32 = 0,
 };
 
-/// Builds the weave. `ords[i]` is claim i's ordinal and `keys[i *
-/// max_words ..]` its words (0 padded). `ctx` answers `df(key) u32`
+/// Builds the weave over the claims `ords`. `ctx` answers `df(key) u32`
 /// (memories holding the word), `alive(ord) bool`, `group(ord) u64` (the
-/// claim's subject group, 0 for none) and `count() u64` (memories).
-pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype) !*Woven {
+/// claim's subject group, 0 for none), `count() u64` (memories) and
+/// `claimWords(ord, *[max_words]u64) !usize` (the claim's words near its
+/// rare ones, in text order).
+pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     const wv = try gpa.create(Woven);
     wv.* = .{ .arena = .init(gpa), .claims = ords.len };
     errdefer wv.deinit(gpa);
@@ -198,6 +202,14 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
     var tmp_arena: std.heap.ArenaAllocator = .init(gpa);
     defer tmp_arena.deinit();
     const t = tmp_arena.allocator();
+
+    // Each claim's words, read from the store now (so with today's counts).
+    const keys = try t.alloc(u64, ords.len * max_words);
+    @memset(keys, 0);
+    for (ords, 0..) |ord, i| {
+        if (!ctx.alive(ord)) continue;
+        _ = try ctx.claimWords(ord, keys[i * max_words ..][0..max_words]);
+    }
 
     // Distinct words of live claims, how many claims hold each, and each
     // claim's value: its rarest word (the later one on a tie).
@@ -304,7 +316,7 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
             fl.shrinkRetainingCapacity(f0);
             continue;
         }
-        try cs.append(t, .{ .ord = ords[i], .group = ctx.group(ords[i]), .cue = cue, .w0 = w0, .wn = wn, .f0 = f0, .fnn = fnn });
+        try cs.append(t, .{ .ord = ords[i], .group = ctx.group(ords[i]), .cue = cue, .w0 = w0, .wn = wn, .f0 = f0, .fnn = fnn, .src = i, .pv = pv });
     }
     wv.woven = cs.items.len;
     _ = nc;
@@ -618,20 +630,26 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
     const claim_cells = try t.alloc([4]u32, cs.items.len);
     for (cs.items, 0..) |c, ci| {
         const s = slot_of_frame[c.frame];
+        var k: usize = 0;
+        claim_cells[ci] = @splat(std.math.maxInt(u32));
         var top: u32 = 0;
         for (mw.items[c.w0..][0..c.wn]) |x| {
             if (!wl.items[x].wording) top = @max(top, wl.items[x].slots);
         }
-        var k: usize = 0;
-        claim_cells[ci] = @splat(std.math.maxInt(u32));
         if (top == 0) continue;
+        var picks: [4]u32 = undefined;
+        var np: usize = 0;
         for (mw.items[c.w0..][0..c.wn]) |x| {
             const w = wl.items[x];
-            if (w.wording or w.slots != top or k == 4) continue;
+            if (w.wording or w.slots != top or np == picks.len) continue;
+            picks[np] = x;
+            np += 1;
+        }
+        for (picks[0..np]) |x| {
             const gop = try cell_of.getOrPut(t, (@as(u64, s) << 32) | x);
             if (!gop.found_existing) {
                 gop.value_ptr.* = @intCast(cell_list.items.len);
-                try cell_list.append(t, .{ .slot = s, .name = w.key, .head = c.ord, .members = 0 });
+                try cell_list.append(t, .{ .slot = s, .name = wl.items[x].key, .head = c.ord, .members = 0 });
                 try members.append(t, .empty);
             }
             const cell = gop.value_ptr.*;
@@ -779,6 +797,11 @@ const TestStore = struct {
     pub fn count(s: *const TestStore) u64 {
         return s.n;
     }
+    pub fn claimWords(s: *const TestStore, ord: u32, out: *[max_words]u64) !usize {
+        const i = std.mem.indexOfScalar(u32, s.ords.items, ord).?;
+        @memcpy(out, s.keys.items[i * max_words ..][0..max_words]);
+        return max_words;
+    }
     fn add(s: *TestStore, text: []const u8, claim: bool, grp: u64) !u32 {
         const gpa = testing.allocator;
         var ts: words.Terms = .{};
@@ -843,7 +866,7 @@ test "frames, slots learned from subjects, and a grid that links untagged versio
         const t = try std.fmt.bufPrint(&tb, "{s} moved over to the {s} hosting", .{ nm, val });
         news[i] = try s.add(t, true, if (i < 4) 100 + i else 0);
     }
-    const wv = try build(testing.allocator, s.ords.items, s.keys.items, &s);
+    const wv = try build(testing.allocator, s.ords.items, &s);
     defer wv.deinit(testing.allocator);
     try testing.expect(wv.frames >= 3);
     try testing.expect(wv.joined_by_subject >= 1);
@@ -907,7 +930,7 @@ test "a change frame joins the slot its names were always stated in before" {
             _ = try s.add(try std.fmt.bufPrint(&tb, "{s} invoices customers in {s}", .{ nm, try std.fmt.bufPrint(&vb, "zv{d}q", .{v}) }), true, 0);
         }
     }
-    const wv = try build(testing.allocator, s.ords.items, s.keys.items, &s);
+    const wv = try build(testing.allocator, s.ords.items, &s);
     defer wv.deinit(testing.allocator);
     try testing.expect(wv.joined_by_precedence >= 1);
     for (names, 0..) |_, i| {
