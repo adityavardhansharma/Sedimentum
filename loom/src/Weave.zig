@@ -7,9 +7,13 @@
 //! model and no labels beyond what the writer already gives:
 //!
 //!   Frames  the ways claims are worded ("<name> is deployed in the <value>
-//!           region"). A word belongs to a frame's wording when it recurs
-//!           across the frame's claims; the names and values change from
-//!           claim to claim, so they fall out of the wording on their own.
+//!           region"). A claim's value is its rarest word; a word is
+//!           wording when it keeps its place next to values across claims
+//!           ("deployed" two places before, "region" one after). Chatter
+//!           around a claim lands anywhere and a name moves with the
+//!           wording around it, so neither keeps a place. Claims join the
+//!           frame whose wording they share (cosine of the words at their
+//!           places, at least 0.75).
 //!   Slots   frames that state the same attribute ("... moved over to the
 //!           <value> region" is a newer version of "... is deployed in the
 //!           <value> region"). Frames join a slot on evidence: versions the
@@ -38,15 +42,21 @@ const words = @import("words.zig");
 
 /// Words kept per claim (the claim's rare words and their neighbours).
 pub const max_words = 24;
+pub var debug = false;
 /// Wording words kept per slot for matching questions.
 pub const profile_len = 12;
 
-/// How much more often than chance a word must turn up in claims to count
-/// as part of a claim at all (as wording, name or value), on a log scale
-/// where 1 means "only ever in claims".
-const min_claimness: f32 = 0.35;
-/// Cosine a claim needs with a frame to join it.
-const join_sim: f32 = 0.5;
+/// Places before and after a claim's value that its wording may take.
+const max_before = 6;
+const max_after = 3;
+/// A word at one place needs this many claims to be wording, and more in a
+/// big store (one claim in 512), where chance alone puts a few chatter
+/// words at the same place now and then.
+const min_feature = 3;
+const max_feature = 16;
+/// Cosine a claim needs with a frame to join it. Wordings that share a
+/// word ("keeps its records in", "keeps logs for") stay apart.
+const join_sim: f32 = 0.75;
 /// A word is wording of a frame when at least this share of the frame's
 /// claims hold it.
 const wording_share: f32 = 0.25;
@@ -122,13 +132,9 @@ const Word = struct {
     key: u64,
     cdf: u32 = 0,
     df: u32 = 0,
-    claimness: f32 = 0,
-    /// Weight in clustering: recurring words weigh most, words seen in one
-    /// claim only (fresh values) weigh nothing.
-    wt: f32 = 0,
-    /// Frames the word turned up in (first pass).
-    spread: u32 = 1,
-    /// Wording of some frame with enough claims.
+    /// Times it was near a claim's value.
+    near: u32 = 0,
+    /// It keeps its place next to values: it is how claims are worded.
     wording: bool = false,
     /// Slots in which it is a name or value.
     slots: u32 = 0,
@@ -171,9 +177,12 @@ const C = struct {
     ord: u32,
     group: u64,
     cue: bool,
-    /// Word indexes of its marked words.
+    /// Word indexes of its words (names, values and wording).
     w0: u32,
     wn: u32,
+    /// Its wording features.
+    f0: u32,
+    fnn: u32,
     frame: u32 = 0,
 };
 
@@ -190,85 +199,146 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
     defer tmp_arena.deinit();
     const t = tmp_arena.allocator();
 
-    // Distinct words of live claims, and how many claims hold each.
+    // Distinct words of live claims, how many claims hold each, and each
+    // claim's value: its rarest word (the later one on a tie).
     var widx: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     var wl: std.ArrayList(Word) = .empty;
     var live: std.ArrayList(u32) = .empty;
+    var pivots: std.ArrayList(u8) = .empty;
     for (ords, 0..) |ord, i| {
         if (!ctx.alive(ord)) continue;
         try live.append(t, @intCast(i));
-        for (keys[i * max_words ..][0..max_words]) |k| {
+        var pv: u8 = 0;
+        var pv_df: u32 = std.math.maxInt(u32);
+        for (keys[i * max_words ..][0..max_words], 0..) |k, j| {
             if (k == 0) break;
             const gop = try widx.getOrPut(t, k);
             if (!gop.found_existing) {
                 gop.value_ptr.* = @intCast(wl.items.len);
                 try wl.append(t, .{ .key = k, .df = ctx.df(k) });
             }
-            wl.items[gop.value_ptr.*].cdf += 1;
+            const w = &wl.items[gop.value_ptr.*];
+            w.cdf += 1;
+            if (w.df <= pv_df) {
+                pv_df = w.df;
+                pv = @intCast(j);
+            }
         }
+        try pivots.append(t, pv);
     }
     const nc: f32 = @floatFromInt(@max(live.items.len, 1));
-    const n: f32 = @floatFromInt(@max(ctx.count(), 1));
-    // A store where nearly everything is a claim cannot tell wording from
-    // chatter; then every word counts.
-    const scale = @log(@max(n / nc, 1.0));
-    for (wl.items) |*w| {
-        const cdf: f32 = @floatFromInt(w.cdf);
-        const df: f32 = @floatFromInt(@max(w.df, w.cdf));
-        if (scale < 1.0) {
-            w.claimness = 1;
-        } else {
-            const lift = (cdf / nc) / ((df + 1) / n);
-            w.claimness = std.math.clamp(@log(@max(lift, 1e-9)) / scale, 0, 1);
+    const rare_lim: u32 = @intCast(@max(4, ctx.count() >> 12));
+
+    // Features: a word at its place relative to the value (stopwords do
+    // not count). Wording is a word that keeps its place: most of the
+    // claims that hold it near a value hold it there. Chatter around a
+    // claim lands anywhere; a name moves from claim to claim with the
+    // wording around it.
+    var fidx: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    var fcount: std.ArrayList(u32) = .empty;
+    var fword: std.ArrayList(u32) = .empty;
+    for (live.items, pivots.items) |i, pv| {
+        const ks = keys[i * max_words ..][0..max_words];
+        for (ks, 0..) |k, j| {
+            if (k == 0) break;
+            const off = @as(i32, @intCast(j)) - pv;
+            if (off == 0 or off < -max_before or off > max_after) continue;
+            const x = widx.get(k).?;
+            const fk = (@as(u64, x) << 8) | @as(u64, @intCast(off + 128));
+            const gop = try fidx.getOrPut(t, fk);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = @intCast(fcount.items.len);
+                try fcount.append(t, 0);
+                try fword.append(t, x);
+            }
+            fcount.items[gop.value_ptr.*] += 1;
+            wl.items[x].near += 1;
         }
-        w.wt = @log(cdf) * @log(1 + nc / cdf);
+    }
+    const min_cf: u32 = std.math.clamp(@as(u32, @intCast(live.items.len / 512)), min_feature, max_feature);
+    const fwt = try t.alloc(f32, fcount.items.len);
+    for (fcount.items, fword.items, fwt) |cf, x, *wt| {
+        const w = &wl.items[x];
+        const keep = @as(f32, @floatFromInt(cf)) / @as(f32, @floatFromInt(@max(w.near, 1)));
+        // A rare word must keep its place nearly always to be wording (a
+        // name keeps one place in a few of its claims at most).
+        const need: f32 = if (w.df <= rare_lim) 0.7 else 0.3;
+        wt.* = if (cf >= min_cf and keep >= need) @log(1 + @as(f32, @floatFromInt(cf))) else 0;
+        if (wt.* > 0) w.wording = true;
     }
 
-    // Each claim keeps its marked words.
+    // Each claim: its wording features, and its words (names, values and
+    // wording). A name or value is a rare word that is nobody's wording
+    // and turns up mostly in claims.
     var cs: std.ArrayList(C) = .empty;
     var mw: std.ArrayList(u32) = .empty;
-    for (live.items) |i| {
+    var fl: std.ArrayList(u32) = .empty;
+    for (live.items, pivots.items) |i, pv| {
         const w0: u32 = @intCast(mw.items.len);
+        const f0: u32 = @intCast(fl.items.len);
         var cue = false;
-        for (keys[i * max_words ..][0..max_words]) |k| {
+        var names: usize = 0;
+        for (keys[i * max_words ..][0..max_words], 0..) |k, j| {
             if (k == 0) break;
             const x = widx.get(k).?;
-            if (wl.items[x].claimness < min_claimness) continue;
-            try mw.append(t, x);
+            const w = wl.items[x];
             if (words.isCue(k)) cue = true;
+            const off = @as(i32, @intCast(j)) - pv;
+            if (off != 0 and off >= -max_before and off <= max_after) {
+                const fk = (@as(u64, x) << 8) | @as(u64, @intCast(off + 128));
+                const fi = fidx.get(fk).?;
+                if (fwt[fi] > 0) {
+                    try fl.append(t, fi);
+                    try mw.append(t, x);
+                    continue;
+                }
+            }
+            if (w.wording or w.df > rare_lim or w.cdf * 2 < w.df) continue;
+            try mw.append(t, x);
+            names += 1;
         }
         const wn: u32 = @as(u32, @intCast(mw.items.len)) - w0;
-        if (wn < 2) {
+        const fnn: u32 = @as(u32, @intCast(fl.items.len)) - f0;
+        if (names == 0 or (fnn == 0 and names < 2)) {
             mw.shrinkRetainingCapacity(w0);
+            fl.shrinkRetainingCapacity(f0);
             continue;
         }
-        try cs.append(t, .{ .ord = ords[i], .group = ctx.group(ords[i]), .cue = cue, .w0 = w0, .wn = wn });
+        try cs.append(t, .{ .ord = ords[i], .group = ctx.group(ords[i]), .cue = cue, .w0 = w0, .wn = wn, .f0 = f0, .fnn = fnn });
     }
     wv.woven = cs.items.len;
+    _ = nc;
     if (cs.items.len == 0) return wv;
 
-    // Frames, in two passes: the second weighs down words that turned up
-    // in many frames (names), so only the wording decides.
-    var fr = try cluster(t, cs.items, mw.items, wl.items);
-    for (wl.items) |*w| w.spread = 0;
-    {
-        var it = fr.word_frames.iterator();
-        while (it.next()) |e| wl.items[e.key_ptr.*].spread = @intCast(e.value_ptr.items.len);
-    }
-    for (wl.items) |*w| w.wt /= @floatFromInt(@max(w.spread, 1));
-    fr = try cluster(t, cs.items, mw.items, wl.items);
+    // Frames: claims worded alike, by leader clustering on their wording.
+    const fr = try cluster(t, cs.items, fl.items, fwt);
     const nf0 = fr.size.items.len;
-
-    // Wording: words most of a big enough frame's claims hold.
-    for (cs.items) |c| {
-        const sz = fr.size.items[c.frame];
-        if (sz < min_frame) continue;
-        for (mw.items[c.w0..][0..c.wn]) |x| {
-            const cnt = fr.count(c.frame, x);
-            if (@as(f32, @floatFromInt(cnt)) >= wording_share * @as(f32, @floatFromInt(sz))) wl.items[x].wording = true;
+    if (debug) {
+        var shown: usize = 0;
+        for (cs.items) |c| {
+            if (shown > 60) break;
+            shown += 1;
+            std.debug.print("claim {d} frame {d} (size {d}) cue {}:", .{ c.ord, c.frame, fr.size.items[c.frame], c.cue });
+            for (mw.items[c.w0..][0..c.wn]) |x| {
+                var b: [12]u8 = undefined;
+                const wd = wl.items[x];
+                std.debug.print(" {s}{s}[df {d}]", .{ if (wd.wording) "=" else "", if (wd.key & words.hashed_bit != 0) "#" else words.unpack(wd.key, &b), wd.df });
+            }
+            std.debug.print("\n", .{});
         }
     }
 
+    if (debug) {
+        var it = fr.counts.iterator();
+        while (it.next()) |e| {
+            const f: u32 = @intCast(e.key_ptr.* >> 32);
+            const fi: u32 = @truncate(e.key_ptr.*);
+            if (fr.size.items[f] < min_frame) continue;
+            var b: [12]u8 = undefined;
+            const wd = wl.items[fword.items[fi]];
+            std.debug.print("frame {d} size {d}: {s} x{d} (cf {d} wt {d:.2})\n", .{ f, fr.size.items[f], if (wd.key & words.hashed_bit != 0) "#" else words.unpack(wd.key, &b), e.value_ptr.*, fcount.items[fi], fwt[fi] });
+        }
+    }
     // A frame with fewer claims than that has learned nothing from other
     // names: what its claims have in common may be no more than a name.
     // Each of its claims is a frame of its own, until evidence joins it.
@@ -624,25 +694,24 @@ const Frames = struct {
     }
 };
 
-/// Leader clustering: each claim joins the frame whose word profile it is
-/// most like (cosine, at least `join_sim`), or starts a new frame.
-fn cluster(t: Allocator, cs: []C, mw: []const u32, wl: []const Word) !Frames {
+/// Leader clustering: each claim joins the frame whose wording profile it
+/// is most like (cosine, at least `join_sim`), or starts a new frame.
+/// Claims with no wording features each start their own.
+fn cluster(t: Allocator, cs: []C, fl: []const u32, wt: []const f32) !Frames {
     var fr: Frames = .{};
     var cand: std.AutoHashMapUnmanaged(u32, f32) = .empty;
     for (cs) |*c| {
-        const ws = mw[c.w0..][0..c.wn];
+        const fs = fl[c.f0..][0..c.fnn];
         var norm: f32 = 0;
-        for (ws) |x| norm += wl[x].wt * wl[x].wt;
+        for (fs) |x| norm += wt[x] * wt[x];
         cand.clearRetainingCapacity();
-        if (norm > 0) for (ws) |x| {
-            const w = wl[x];
-            if (w.wt <= 0) continue;
+        if (norm > 0) for (fs) |x| {
             const list = fr.word_frames.get(x) orelse continue;
             for (list.items) |f| {
                 const cnt: f32 = @floatFromInt(fr.count(f, x));
                 const gop = try cand.getOrPut(t, f);
                 if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += w.wt * w.wt * cnt;
+                gop.value_ptr.* += wt[x] * wt[x] * cnt;
             }
         };
         var best: u32 = std.math.maxInt(u32);
@@ -665,7 +734,7 @@ fn cluster(t: Allocator, cs: []C, mw: []const u32, wl: []const Word) !Frames {
         }
         c.frame = best;
         fr.size.items[best] += 1;
-        for (ws) |x| {
+        for (fs) |x| {
             const gop = try fr.counts.getOrPut(t, (@as(u64, best) << 32) | x);
             if (!gop.found_existing) {
                 gop.value_ptr.* = 0;
@@ -674,7 +743,7 @@ fn cluster(t: Allocator, cs: []C, mw: []const u32, wl: []const Word) !Frames {
                 try wf.value_ptr.append(t, best);
             }
             const cnt: f32 = @floatFromInt(gop.value_ptr.*);
-            fr.sq.items[best] += wl[x].wt * wl[x].wt * (2 * cnt + 1);
+            fr.sq.items[best] += wt[x] * wt[x] * (2 * cnt + 1);
             gop.value_ptr.* += 1;
         }
     }
