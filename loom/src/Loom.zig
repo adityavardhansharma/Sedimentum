@@ -1143,6 +1143,13 @@ fn forgottenByVc(w: *const Loom, sid: u32, lane: usize, off: u64) bool {
 /// Frees replaced tables no reader can hold any more. Writer only.
 fn reclaim(w: *Loom) void {
     for ([_]*Map{ &w.lex, &w.fact_of, &w.subjects, &w.sc_map }) |m| m.reclaim(w.gpa, &w.readers);
+    // Replaced weaves, once no reader can hold one (and nobody is weaving).
+    if (w.retired.items.len == 0) return;
+    if (w.weaving.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return;
+    defer w.weaving.store(false, .release);
+    if (!w.readers.quiet()) return;
+    for (w.retired.items) |wv| wv.deinit(w.gpa);
+    w.retired.clearRetainingCapacity();
 }
 
 fn newCell(w: *Loom, ord: u32) !u32 {
@@ -1292,7 +1299,8 @@ const WeaveCtx = struct {
 /// The current weave, rebuilt first when the claims have grown by an
 /// eighth since it was woven (or at all, while there are fewer than 1024).
 /// One thread weaves at a time; the others go on with the weave they have.
-/// Call with the readers entered.
+/// Call with the readers entered. The weave replaced is freed by the
+/// writer when no reader is in (see `reclaim`).
 fn weave(w: *Loom) ?*const Weave.Woven {
     const nc = w.cl_ord.count();
     const cur = w.woven.load(.acquire);
