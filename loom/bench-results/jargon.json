@@ -1,0 +1,5 @@
+{"engine":"loom","phase":"jargon_load","ops":1007006,"seconds":2.918952,"ops_per_sec":344988.9,"p50_ns":0,"p99_ns":0,"facts":2000,"versions":7006,"anon_kb":91308,"index_bytes":59492372,"heap_live_bytes":4768771,"heap_peak_bytes":31740215}
+{"engine":"loom","phase":"jargon_all","ops":2000,"seconds":0.016221,"ops_per_sec":123300.6,"p50_ns":7204,"p99_ns":21344,"hit_at_1":0.9965,"hit_at_k":0.9995,"stale":0.0030,"heap_live_bytes":4768771,"heap_peak_bytes":31740215}
+{"engine":"loom","phase":"jargon_with_subject","ops":2000,"seconds":0.013385,"ops_per_sec":149425.5,"p50_ns":6135,"p99_ns":14194,"hit_at_1":0.9980,"hit_at_k":0.9980,"stale":0.0000,"heap_live_bytes":4768771,"heap_peak_bytes":31740215}
+{"engine":"loom","phase":"jargon_no_subject","ops":2000,"seconds":0.013867,"ops_per_sec":144223.8,"p50_ns":6348,"p99_ns":12504,"hit_at_1":0.9895,"hit_at_k":0.9995,"stale":0.0100,"heap_live_bytes":4768771,"heap_peak_bytes":31740215}
+{"engine":"loom","phase":"jargon_brief_2000tok","ops":2000,"seconds":0.019318,"ops_per_sec":103527.9,"p50_ns":8863,"p99_ns":20192,"hit_at_1":0.0000,"hit_at_k":0.9995,"stale":0.0060,"heap_live_bytes":4768771,"heap_peak_bytes":31740215}
