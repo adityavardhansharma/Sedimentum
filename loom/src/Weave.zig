@@ -52,6 +52,10 @@ const join_sim: f32 = 0.5;
 const wording_share: f32 = 0.25;
 /// A frame needs this many claims before its wording counts.
 const min_frame: u32 = 4;
+/// Precedence: share of a change frame's claims whose name was stated in
+/// the chosen slot earlier, and its lead over the next slot.
+const prec_share: f32 = 0.8;
+const prec_lead: f32 = 0.2;
 
 pub const Slot = struct {
     keys: [profile_len]u64 = @splat(0),
@@ -93,6 +97,7 @@ pub const Woven = struct {
     linked: usize = 0,
     /// Frames joined into another frame's slot, by kind of evidence.
     joined_by_subject: usize = 0,
+    joined_by_precedence: usize = 0,
 
     pub fn deinit(wv: *Woven, gpa: Allocator) void {
         wv.arena.deinit();
@@ -335,6 +340,74 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
             if (uf.join(@intCast(e.k >> 32), @truncate(e.k))) wv.joined_by_subject += 1;
         }
     }
+    // 2. Precedence: a frame that says something changed ("moved", "now",
+    //    "slipped") is a newer version of the one slot every one of its
+    //    names was stated in before.
+    {
+        var cue_n = try t.alloc(u32, nf);
+        @memset(cue_n, 0);
+        var fclaims = try t.alloc(std.ArrayList(u32), nf);
+        for (fclaims) |*l| l.* = .empty;
+        for (cs.items, 0..) |c, ci| {
+            if (c.cue) cue_n[c.frame] += 1;
+            try fclaims[c.frame].append(t, @intCast(ci));
+        }
+        var tally: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (0..2) |_| {
+            for (0..nf) |f| {
+                const sz = fclaims[f].items.len;
+                if (sz < min_frame or cue_n[f] * 2 < sz) continue;
+                const root = uf.find(@intCast(f));
+                tally.clearRetainingCapacity();
+                for (fclaims[f].items) |ci| {
+                    const c = cs.items[ci];
+                    seen.clearRetainingCapacity();
+                    for (mw.items[c.w0..][0..c.wn]) |x| {
+                        if (wl.items[x].wording) continue;
+                        const list = by_name.get(x) orelse continue;
+                        for (list.items) |cj| {
+                            const o = cs.items[cj];
+                            if (o.ord >= c.ord or o.frame == f) continue;
+                            // The frame's own slot counts too: if its names
+                            // were stated there before (a subject already
+                            // joined them), nothing else is needed.
+                            try seen.put(t, uf.find(o.frame), {});
+                        }
+                    }
+                    var sit = seen.keyIterator();
+                    while (sit.next()) |r| {
+                        const gop = try tally.getOrPut(t, r.*);
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        gop.value_ptr.* += 1;
+                    }
+                }
+                var best: u32 = 0;
+                var best_n: u32 = 0;
+                var second_n: u32 = 0;
+                var tit = tally.iterator();
+                while (tit.next()) |e| {
+                    const v = e.value_ptr.*;
+                    const k = e.key_ptr.*;
+                    if (v > best_n) {
+                        second_n = best_n;
+                        best = k;
+                        best_n = v;
+                    } else if (v == best_n and k < best) {
+                        second_n = best_n;
+                        best = k;
+                    } else if (v > second_n) second_n = v;
+                }
+                const szf: f32 = @floatFromInt(sz);
+                if (@as(f32, @floatFromInt(best_n)) >= prec_share * szf and
+                    @as(f32, @floatFromInt(best_n - second_n)) >= prec_lead * szf)
+                {
+                    if (best != root and uf.join(root, best)) wv.joined_by_precedence += 1;
+                }
+            }
+        }
+    }
+
     // Number the slots.
     const slot_of_frame = try t.alloc(u32, nf);
     var nslots: u32 = 0;
@@ -671,4 +744,38 @@ test "frames, slots learned from subjects, and a grid that links untagged versio
         if (k == words.pack("mov")) has_moved = true;
     }
     try testing.expect(has_region and has_moved);
+}
+
+test "a change frame joins the slot its names were always stated in before" {
+    var s: TestStore = .{};
+    defer s.deinit();
+    const names = [_][]const u8{ "atlas", "borealis", "cygnus", "draco", "eridanus", "fornax" };
+    var vb: [32]u8 = undefined;
+    var tb: [128]u8 = undefined;
+    var olds: [names.len]u32 = undefined;
+    var news: [names.len]u32 = undefined;
+    var v: usize = 0;
+    for (0..400) |i| try chatter(&s, i);
+    for (names, 0..) |nm, i| {
+        v += 1;
+        olds[i] = try s.add(try std.fmt.bufPrint(&tb, "{s} ships on {s}", .{ nm, try std.fmt.bufPrint(&vb, "zv{d}q", .{v}) }), true, 0);
+        for (0..30) |j| try chatter(&s, j + i);
+    }
+    for (names, 0..) |nm, i| {
+        v += 1;
+        news[i] = try s.add(try std.fmt.bufPrint(&tb, "{s} launch slipped to {s}", .{ nm, try std.fmt.bufPrint(&vb, "zv{d}q", .{v}) }), true, 0);
+        for (0..30) |j| try chatter(&s, j * 3 + i);
+        // Another attribute, stated after some of the slips only.
+        if (i % 2 == 0) {
+            v += 1;
+            _ = try s.add(try std.fmt.bufPrint(&tb, "{s} invoices customers in {s}", .{ nm, try std.fmt.bufPrint(&vb, "zv{d}q", .{v}) }), true, 0);
+        }
+    }
+    const wv = try build(testing.allocator, s.ords.items, s.keys.items, &s);
+    defer wv.deinit(testing.allocator);
+    try testing.expect(wv.joined_by_precedence >= 1);
+    for (names, 0..) |_, i| {
+        const f = wv.factOf(olds[i]) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(news[i], f.head);
+    }
 }
