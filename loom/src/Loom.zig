@@ -2491,6 +2491,7 @@ pub const Info = struct {
     linked: usize = 0,
     joined_by_subject: usize = 0,
     joined_by_precedence: usize = 0,
+    joined_one_off: usize = 0,
 };
 
 pub fn info(w: *Loom) Info {
@@ -2524,6 +2525,7 @@ pub fn info(w: *Loom) Info {
         .linked = if (wv) |x| x.linked else 0,
         .joined_by_subject = if (wv) |x| x.joined_by_subject else 0,
         .joined_by_precedence = if (wv) |x| x.joined_by_precedence else 0,
+        .joined_one_off = if (wv) |x| x.joined_one_off else 0,
         .lanes = w.nlanes,
         .file_bytes = bytes,
         .index_bytes = idx,
@@ -2875,6 +2877,31 @@ test "what tagged facts teach links the untagged versions of other names" {
         const o = try std.fmt.bufPrint(&old, "zq{d}old", .{i});
         for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, o) == null);
     }
+}
+
+test "a one-off change continues the claim it shares the most words with; another attribute is left alone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    for (0..5000) |i| {
+        var b: [80]u8 = undefined;
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i}), .{});
+    }
+    _ = try w.remember("p", "zorblat cache ttl is ninety seconds", .{});
+    _ = try w.remember("p", "zorblat owner is mallory", .{});
+    _ = try w.remember("p", "update: zorblat cache ttl raised to hundredtwenty", .{});
+    const hits = try w.recall(testing.allocator, .{ .about = "zorblat cache ttl", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(std.mem.indexOf(u8, hits[0].memory.text, "hundredtwenty") != null);
+    for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, "ninety") == null);
+    const own = try w.recall(testing.allocator, .{ .about = "who owns zorblat", .limit = 5 });
+    defer freeHits(testing.allocator, own);
+    var saw_owner = false;
+    for (own) |x| {
+        if (std.mem.indexOf(u8, x.memory.text, "mallory") != null) saw_owner = true;
+    }
+    try testing.expect(saw_owner);
 }
 
 test "forget and forgetScope erase text, and survive reopening" {

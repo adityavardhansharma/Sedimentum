@@ -98,6 +98,7 @@ pub const Woven = struct {
     /// Frames joined into another frame's slot, by kind of evidence.
     joined_by_subject: usize = 0,
     joined_by_precedence: usize = 0,
+    joined_one_off: usize = 0,
 
     pub fn deinit(wv: *Woven, gpa: Allocator) void {
         wv.arena.deinit();
@@ -256,8 +257,7 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
     }
     for (wl.items) |*w| w.wt /= @floatFromInt(@max(w.spread, 1));
     fr = try cluster(t, cs.items, mw.items, wl.items);
-    const nf = fr.size.items.len;
-    wv.frames = nf;
+    const nf0 = fr.size.items.len;
 
     // Wording: words most of a big enough frame's claims hold.
     for (cs.items) |c| {
@@ -268,6 +268,18 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
             if (@as(f32, @floatFromInt(cnt)) >= wording_share * @as(f32, @floatFromInt(sz))) wl.items[x].wording = true;
         }
     }
+
+    // A frame with fewer claims than that has learned nothing from other
+    // names: what its claims have in common may be no more than a name.
+    // Each of its claims is a frame of its own, until evidence joins it.
+    var nf: usize = nf0;
+    for (fr.size.items) |sz| {
+        if (sz >= min_frame) wv.frames += 1;
+    }
+    for (cs.items) |*c| if (fr.size.items[c.frame] < min_frame) {
+        c.frame = @intCast(nf);
+        nf += 1;
+    };
 
     // Names: a claim's marked words that are nobody's wording. Index the
     // claims by name.
@@ -404,6 +416,61 @@ pub fn build(gpa: Allocator, ords: []const u32, keys: []const u64, ctx: anytype)
                 {
                     if (best != root and uf.join(root, best)) wv.joined_by_precedence += 1;
                 }
+            }
+        }
+    }
+
+    // 3. One-off claims: a claim no frame explains continues the earlier
+    //    claim that shares the most of its words, when it is the only one
+    //    that close: two words (the name and one more) when it says
+    //    something changed, three when it does not.
+    {
+        var shared: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        var by_root: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        for (cs.items, 0..) |c, ci| {
+            if (c.frame < nf0) continue;
+            shared.clearRetainingCapacity();
+            for (mw.items[c.w0..][0..c.wn]) |x| {
+                const list = by_name.get(x) orelse continue;
+                for (list.items[0..@min(list.items.len, 256)]) |cj| {
+                    if (cj >= ci) continue;
+                    const gop = try shared.getOrPut(t, cj);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                }
+            }
+            // Per slot so far, the closest claim in it.
+            by_root.clearRetainingCapacity();
+            var it = shared.iterator();
+            while (it.next()) |e| {
+                const o = cs.items[e.key_ptr.*];
+                if (c.group != 0 and o.group != 0 and c.group != o.group) continue;
+                // Wording counts too, once the name is shared.
+                var n_sh = e.value_ptr.*;
+                for (mw.items[c.w0..][0..c.wn]) |x| if (wl.items[x].wording) {
+                    for (mw.items[o.w0..][0..o.wn]) |y| if (y == x) {
+                        n_sh += 1;
+                    };
+                };
+                const gop = try by_root.getOrPut(t, uf.find(o.frame));
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* = @max(gop.value_ptr.*, n_sh);
+            }
+            var best: u32 = 0;
+            var best_n: u32 = 0;
+            var second_n: u32 = 0;
+            var rit = by_root.iterator();
+            while (rit.next()) |e| {
+                const v = e.value_ptr.*;
+                if (v > best_n) {
+                    second_n = best_n;
+                    best = e.key_ptr.*;
+                    best_n = v;
+                } else if (v > second_n) second_n = v;
+            }
+            const need: u32 = if (c.cue) 2 else 3;
+            if (best_n >= need and second_n < best_n) {
+                if (uf.join(c.frame, best)) wv.joined_one_off += 1;
             }
         }
     }
