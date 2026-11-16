@@ -2027,6 +2027,7 @@ const Search = struct {
     q: Query,
     set: ScopeSet,
     meaning: ?*const Meaning,
+    wv: ?*const Weave.Woven,
     qt: [max_groups * (1 + max_related)]QTerm = undefined,
     nq: usize = 0,
     gw: [max_groups]f32 = @splat(0),
@@ -2079,7 +2080,32 @@ const Search = struct {
                 }
             }
         }
-        if (s.meaning) |mn| {
+        // A claim is matched against its slot's wording: every way its
+        // attribute was ever phrased, by any name, and none of the chatter
+        // around this one memory.
+        const slot: ?*const Weave.Slot = if (s.wv) |wv| (if (wv.factOf(ord)) |f| &wv.slots[f.slot] else null) else null;
+        if (slot) |sl| if (sl.len > 0) {
+            const top = sl.share[0];
+            for (s.qt[0..s.nq]) |q| {
+                if (m[q.group] >= 1) continue;
+                for (sl.wording(), 0..) |k, j| if (k == q.key) {
+                    m[q.group] = @max(m[q.group], q.sim * (0.6 + 0.4 * sl.share[j] / top));
+                };
+            }
+            if (s.meaning) |mn| {
+                var best: [max_groups]f32 = @splat(0);
+                for (sl.wording(), 0..) |k, j| {
+                    const mi = mn.index(k) orelse continue;
+                    const wt = 0.5 + 0.5 * sl.share[j] / top;
+                    const sv = s.sims(mi);
+                    for (0..s.ng) |g| best[g] = @max(best[g], sv[g] * wt);
+                }
+                for (0..s.ng) |g| if (s.gmi[g] != null and m[g] < 1) {
+                    m[g] = @max(m[g], std.math.clamp((best[g] - sim_floor) / (1 - sim_floor), 0, 1));
+                };
+            }
+        };
+        if (slot == null) if (s.meaning) |mn| {
             // The claim about the rarest name the question shares with
             // this memory: the words between the name and its value.
             var name: ?words.Word = null;
@@ -2104,7 +2130,7 @@ const Search = struct {
             for (0..s.ng) |g| if (s.gmi[g] != null and m[g] < 1) {
                 m[g] = @max(m[g], std.math.clamp((best[g] - sim_floor) / (1 - sim_floor), 0, 1));
             };
-        }
+        };
         var base: f32 = 0;
         for (0..s.ng) |g| base += s.gw[g] * m[g];
         if (base <= 0) return null;
@@ -2149,10 +2175,10 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     }
     if (w.memCount() == 0) return hits.toOwnedSlice(gpa);
     const set = w.scopeSet(q.scope) orelse return hits.toOwnedSlice(gpa);
-    _ = w.weave();
+    const wv = w.weave();
     const s = try gpa.create(Search);
     defer gpa.destroy(s);
-    s.* = .{ .w = w, .gpa = gpa, .q = q, .set = set, .meaning = if (q.expand) w.options.meaning else null, .now = w.nowMs() };
+    s.* = .{ .w = w, .gpa = gpa, .q = q, .set = set, .meaning = if (q.expand) w.options.meaning else null, .wv = wv, .now = w.nowMs() };
     defer s.deinit();
     s.terms.fill(q.about);
     if (s.terms.len == 0) {
