@@ -481,6 +481,11 @@ vcs: Vec(u64) = .{},
 // Claims: ordinals, and `Weave.max_words` words each (0 padded).
 cl_ord: Vec(u32) = .{},
 cl_keys: Vec(u64) = .{},
+// The weave over the claims (Weave.zig). Replaced whole when rebuilt;
+// replaced weaves are kept until close, as readers may still hold them.
+woven: std.atomic.Value(?*Weave.Woven) = .init(null),
+weaving: std.atomic.Value(bool) = .init(false),
+retired: std.ArrayList(*Weave.Woven) = .empty,
 
 total_terms: u64 = 0,
 merges: u64 = 0,
@@ -676,6 +681,10 @@ fn freeAll(w: *Loom) void {
     w.fact_of.deinit(gpa);
     w.subjects.deinit(gpa);
     w.sc_map.deinit(gpa);
+    if (w.woven.load(.acquire)) |wv| wv.deinit(gpa);
+    w.woven.store(null, .release);
+    for (w.retired.items) |wv| wv.deinit(gpa);
+    w.retired.deinit(gpa);
     w.counter.deinit(gpa);
     w.rec_buf.deinit(gpa);
     w.dec_buf.deinit(gpa);
@@ -1225,6 +1234,50 @@ fn pickClaim(w: *Loom, ord: u32, terms: *const words.Terms, seen: []const u32, s
         k += 1;
     }
     _ = try w.cl_ord.push(ord);
+}
+
+// ------------------------------------------------------------------- weave
+
+/// What the weave asks of the store.
+const WeaveCtx = struct {
+    w: *const Loom,
+    pub fn df(c: WeaveCtx, key: u64) u32 {
+        return c.w.dfOf(key);
+    }
+    pub fn alive(c: WeaveCtx, ord: u32) bool {
+        return c.w.alive(ord);
+    }
+    /// Versions tied by a subject share a group: their subject cell.
+    pub fn group(c: WeaveCtx, ord: u32) u64 {
+        if (@atomicLoad(u32, c.w.tl_sf.at(ord), .acquire) & flag_subject == 0) return 0;
+        return c.w.cellOf(ord);
+    }
+    pub fn count(c: WeaveCtx) u64 {
+        return c.w.memCount();
+    }
+};
+
+/// The current weave, rebuilt first when the claims have grown by an
+/// eighth since it was woven (or at all, while there are fewer than 1024).
+/// One thread weaves at a time; the others go on with the weave they have.
+/// Call with the readers entered.
+fn weave(w: *Loom) ?*const Weave.Woven {
+    const nc = w.cl_ord.count();
+    const cur = w.woven.load(.acquire);
+    const have = if (cur) |c| c.claims else 0;
+    if (nc == have) return cur;
+    if (cur != null and nc >= 1024 and nc < have + have / 8) return cur;
+    if (w.weaving.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return cur;
+    defer w.weaving.store(false, .release);
+    const now = w.woven.load(.acquire);
+    if (now != cur) return now;
+    const nw = Weave.build(w.gpa, w.cl_ord.items()[0..nc], w.cl_keys.items()[0 .. nc * Weave.max_words], WeaveCtx{ .w = w }) catch return cur;
+    if (cur) |c| w.retired.append(w.gpa, c) catch {
+        // Cannot keep it for later: better a little memory lost than a
+        // reader reading freed memory.
+    };
+    w.woven.store(nw, .release);
+    return nw;
 }
 
 /// Reads a vector of lane ends: varint count, then the ends.
@@ -2400,6 +2453,16 @@ pub const Info = struct {
     index_bytes: usize,
     /// Word models of all lanes.
     model_bytes: usize,
+    /// Claims, and what the weave learned from them: frames (wordings),
+    /// slots (attributes), cells (a name's attribute) and claims whose
+    /// newest version is another claim.
+    claims: usize = 0,
+    frames: usize = 0,
+    slots: usize = 0,
+    cells: usize = 0,
+    linked: usize = 0,
+    joined_by_subject: usize = 0,
+    joined_by_precedence: usize = 0,
 };
 
 pub fn info(w: *Loom) Info {
@@ -2418,12 +2481,21 @@ pub fn info(w: *Loom) Info {
     for (w.cells.items()[1..]) |c| {
         if (c.nver > 1) strata += 1;
     }
+    const wv = w.weave();
+    if (wv) |x| idx += x.bytes();
     return .{
         .memories = w.memCount(),
         .scopes = w.sc_parent.count() - 1,
         .subjects = w.subjects.len,
         .strata = strata,
-        .auto_merges = w.merges,
+        .auto_merges = if (wv) |x| x.linked else 0,
+        .claims = w.cl_ord.count(),
+        .frames = if (wv) |x| x.frames else 0,
+        .slots = if (wv) |x| x.slots.len else 0,
+        .cells = if (wv) |x| x.cells.len else 0,
+        .linked = if (wv) |x| x.linked else 0,
+        .joined_by_subject = if (wv) |x| x.joined_by_subject else 0,
+        .joined_by_precedence = if (wv) |x| x.joined_by_precedence else 0,
         .lanes = w.nlanes,
         .file_bytes = bytes,
         .index_bytes = idx,
