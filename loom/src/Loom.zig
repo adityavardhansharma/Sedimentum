@@ -39,6 +39,7 @@ const Crc = std.hash.crc.@"CRC-32/ISCSI";
 const words = @import("words.zig");
 const ans = @import("ans.zig");
 pub const Meaning = @import("Meaning.zig");
+pub const Weave = @import("Weave.zig");
 
 const Loom = @This();
 const page = std.heap.page_size_min;
@@ -477,6 +478,9 @@ sc_settle: Vec(u32) = .{},
 own_ref: Vec(u32) = .{},
 /// Lane-end vectors of forgets and settles, `vc_len` each.
 vcs: Vec(u64) = .{},
+// Claims: ordinals, and `Weave.max_words` words each (0 padded).
+cl_ord: Vec(u32) = .{},
+cl_keys: Vec(u64) = .{},
 
 total_terms: u64 = 0,
 merges: u64 = 0,
@@ -514,6 +518,8 @@ fn initVecs(w: *Loom) !void {
     try w.sc_settle.init(1 << 24);
     try w.own_ref.init(1 << 24);
     try w.vcs.init(1 << 26);
+    try w.cl_ord.init(1 << 28);
+    try w.cl_keys.init(1 << 32);
 }
 
 fn scopeVecs(w: *Loom) [11]AnyVec {
@@ -521,9 +527,9 @@ fn scopeVecs(w: *Loom) [11]AnyVec {
 }
 
 /// Every index array, in snapshot order.
-fn indexVecs(w: *Loom) [20]AnyVec {
+fn indexVecs(w: *Loom) [22]AnyVec {
     const s = w.scopeVecs();
-    return [_]AnyVec{ w.t_key.any(), w.t_df.any(), w.t_p0.any(), w.t_tail.any(), w.post.any(), w.tl_loc.any(), w.tl_sf.any(), w.cells.any(), w.vcs.any() } ++ s;
+    return [_]AnyVec{ w.t_key.any(), w.t_df.any(), w.t_p0.any(), w.t_tail.any(), w.post.any(), w.tl_loc.any(), w.tl_sf.any(), w.cells.any(), w.vcs.any(), w.cl_ord.any(), w.cl_keys.any() } ++ s;
 }
 
 /// Empty index with its reserved zero entries.
@@ -1136,12 +1142,15 @@ fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const word
     try w.appendPost(w.sc_p0.at(f.sid), w.sc_tail.at(f.sid), ord);
     const n = ord + 1;
     const limit = structLimit(n);
+    // How many memories held each word before this one.
+    var seen: [words.Terms.cap]u32 = undefined;
     for (terms.items(), 0..) |word, i| {
         w.total_terms += terms.tf[i];
         var tid: u32 = if (tids) |t| t[i] else 0;
         if (tid == 0) {
             const v = w.lex.get(word.key);
             if (v == null) {
+                seen[i] = 0;
                 try w.lex.put(w.gpa, word.key, once_bit | ord);
                 continue;
             }
@@ -1155,6 +1164,7 @@ fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const word
             } else tid = @intCast(v.?);
         }
         const d = w.t_df.at(tid);
+        seen[i] = d.*;
         @atomicStore(u32, d, d.* + 1, .monotonic);
         const tail = w.t_tail.at(tid);
         if (tail.* == no_posts) continue;
@@ -1165,6 +1175,7 @@ fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const word
         }
         try w.appendPost(w.t_p0.at(tid), tail, ord);
     }
+    if (!gone) try w.pickClaim(ord, terms, seen[0..terms.len], f.subject.len > 0);
     if (f.subject.len > 0) {
         const key = subjectKey(f.sid, f.subject);
         if (w.subjects.get(key)) |c| {
@@ -1181,6 +1192,39 @@ fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const word
     }
     w.dirty = true;
     return ord;
+}
+
+/// A word is rare when at most this many memories held it before.
+fn rareLimit(n: usize) u32 {
+    return @intCast(@max(4, n >> 12));
+}
+
+/// Keeps a memory as a claim when it names something rare next to a value:
+/// two rare words, or one with a subject. A claim keeps its rare words and
+/// the words within six places of them, in text order. Writer only.
+fn pickClaim(w: *Loom, ord: u32, terms: *const words.Terms, seen: []const u32, subject: bool) !void {
+    const lim = rareLimit(ord + 1);
+    var rare: usize = 0;
+    for (seen) |d| {
+        if (d <= lim) rare += 1;
+    }
+    if (rare < 2 and !(subject and rare >= 1)) return;
+    const at = try w.cl_keys.extend(Weave.max_words);
+    var k: usize = 0;
+    for (terms.items()) |word| {
+        if (k == Weave.max_words) break;
+        var near = false;
+        for (terms.items(), seen) |r, d| {
+            if (d <= lim and absDiff(word.pos, r.pos) <= 6) {
+                near = true;
+                break;
+            }
+        }
+        if (!near) continue;
+        w.cl_keys.at(at + k).* = word.key;
+        k += 1;
+    }
+    _ = try w.cl_ord.push(ord);
 }
 
 /// Reads a vector of lane ends: varint count, then the ends.
