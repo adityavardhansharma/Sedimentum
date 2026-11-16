@@ -2503,7 +2503,13 @@ pub fn facts(w: *Loom, gpa: Allocator, name: []const u8, scope: []const u8) ![]F
     var t: words.Terms = .{};
     t.fill(name);
     if (t.len == 0) return out.toOwnedSlice(gpa);
-    for (wv.cellsOf(t.words[0].key)) |ci| {
+    try w.rowInto(gpa, wv, set, t.words[0].key, &out);
+    return out.toOwnedSlice(gpa);
+}
+
+/// A name's row of the grid, newest version of each cell. Readers entered.
+fn rowInto(w: *Loom, gpa: Allocator, wv: *const Weave.Woven, set: ScopeSet, name: u64, out: *std.ArrayList(FactRow)) !void {
+    for (wv.cellsOf(name)) |ci| {
         const cell = wv.cells[ci];
         const ord = w.newestOf(cell.head);
         if (!w.alive(ord) or !set.has(w, w.sidOf(ord))) continue;
@@ -2513,6 +2519,32 @@ pub fn facts(w: *Loom, gpa: Allocator, name: []const u8, scope: []const u8) ![]F
         errdefer gpa.free(wording);
         try out.append(gpa, .{ .wording = wording, .versions = cell.members, .memory = m });
     }
+}
+
+/// The rows of the names a text mentions (at most `max` names, rarest
+/// first), as memories.
+fn namedRows(w: *Loom, gpa: Allocator, text: []const u8, scope: []const u8, max: usize) ![]FactRow {
+    w.readers.enter();
+    defer w.readers.leave();
+    var out: std.ArrayList(FactRow) = .empty;
+    errdefer freeFacts(gpa, out.items);
+    const set = w.scopeSet(scope) orelse return out.toOwnedSlice(gpa);
+    const wv = w.weave() orelse return out.toOwnedSlice(gpa);
+    var t: words.Terms = .{};
+    t.fill(text);
+    var names: [8]u64 = undefined;
+    var nn: usize = 0;
+    for (t.items()) |word| {
+        if (wv.cellsOf(word.key).len == 0 or nn == names.len) continue;
+        names[nn] = word.key;
+        nn += 1;
+    }
+    std.mem.sortUnstable(u64, names[0..nn], w, struct {
+        fn lt(ww: *Loom, a: u64, b: u64) bool {
+            return ww.dfOf(a) < ww.dfOf(b);
+        }
+    }.lt);
+    for (names[0..@min(nn, max)]) |k| try w.rowInto(gpa, wv, set, k, &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -2544,6 +2576,17 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
     };
     const rec_ms = if (exact) try w.recentFiltered(gpa, scope, 6, true) else try gpa.alloc(Memory, 0);
     defer freeMemories(gpa, rec_ms);
+    // Everything known about the names the situation mentions: their rows
+    // of the grid, each attribute in its newest version only.
+    const rows = try w.namedRows(gpa, situation, scope, 2);
+    defer freeFacts(gpa, rows);
+    var row_ms: [64]Memory = undefined;
+    var nrow: usize = 0;
+    for (rows) |r| {
+        if (nrow == row_ms.len) break;
+        row_ms[nrow] = r.memory;
+        nrow += 1;
+    }
 
     var used: usize = 0;
     var items: usize = 0;
@@ -2559,6 +2602,7 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
     const Part = struct { title: []const u8, mems: []const Memory };
     const sections = [_]Part{
         .{ .title = "Relevant memory", .mems = rel[0..nrel] },
+        .{ .title = "Also known about them", .mems = row_ms[0..nrow] },
         .{ .title = "Recent in this scope", .mems = rec_ms },
     };
     for (sections) |sec| {
@@ -3042,6 +3086,12 @@ test "a name's row of the grid, and the schema the store learned" {
         }
     }
     try testing.expect(region);
+    // A brief about a name carries its whole row, newest versions only.
+    const b2 = try w.brief(testing.allocator, "anything new about cygnus?", "p", 2000);
+    defer b2.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, b2.text, "zq2new") != null);
+    try testing.expect(std.mem.indexOf(u8, b2.text, "zr2db") != null);
+    try testing.expect(std.mem.indexOf(u8, b2.text, "zq2old") == null);
 }
 
 test "a one-off change continues the claim it shares the most words with; another attribute is left alone" {
