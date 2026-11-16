@@ -49,6 +49,18 @@ pub fn build(b: *std.Build) void {
         }),
     }));
 
+    // zig-out/bin/loom-schema <store-dir> [name] [slots]: what a store learned.
+    b.installArtifact(b.addExecutable(.{
+        .name = "loom-schema",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/schema.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "loom", .module = mod }},
+        }),
+    }));
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

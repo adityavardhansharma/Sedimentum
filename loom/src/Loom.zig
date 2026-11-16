@@ -2250,20 +2250,20 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     // top `limit` facts.
     const extra = if (s.meaning != null) s.wsum else s.wsum - findable_w;
     const posts_only = s.meaning == null and extra <= 0.001 and pairs.items.len > 0;
-    var facts: std.ArrayList(FactHit) = .empty;
-    defer facts.deinit(gpa);
+    var fhits: std.ArrayList(FactHit) = .empty;
+    defer fhits.deinit(gpa);
     var decoded: usize = 0;
     for (cands.items) |c| {
         if (decoded >= max_decode) break;
-        if (facts.items.len >= limit) {
-            const kth = kthScore(facts.items, limit);
+        if (fhits.items.len >= limit) {
+            const kth = kthScore(fhits.items, limit);
             if (s.bound(c.s1 + extra) < kth) break;
         }
         const sc = (if (posts_only) s.scoreFromPosts(c.ord, c.s1, c.mask) else try s.score(c.ord)) orelse continue;
         if (!posts_only) decoded += 1;
         const key: u64 = if (q.deep) c.ord else w.factKey(c.ord);
         var found = false;
-        for (facts.items) |*f| if (f.key == key) {
+        for (fhits.items) |*f| if (f.key == key) {
             found = true;
             if (sc.score > f.score) {
                 f.score = sc.score;
@@ -2271,9 +2271,9 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
                 f.mask = sc.mask;
             }
         };
-        if (!found) try facts.append(gpa, .{ .key = key, .ord = c.ord, .score = sc.score, .mask = sc.mask });
+        if (!found) try fhits.append(gpa, .{ .key = key, .ord = c.ord, .score = sc.score, .mask = sc.mask });
     }
-    std.mem.sortUnstable(FactHit, facts.items, {}, struct {
+    std.mem.sortUnstable(FactHit, fhits.items, {}, struct {
         fn gt(_: void, a: FactHit, b: FactHit) bool {
             return a.score > b.score or (a.score == b.score and a.ord > b.ord);
         }
@@ -2282,7 +2282,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     // Answer with each fact's newest version.
     var pre: std.ArrayList(Pre) = .empty;
     defer pre.deinit(gpa);
-    for (facts.items) |f| {
+    for (fhits.items) |f| {
         var ord = f.ord;
         if (!q.deep) {
             const h = w.newestOf(f.ord);
@@ -2393,6 +2393,101 @@ fn newestInto(w: *const Loom, gpa: Allocator, set: ScopeSet, q: Query, limit: us
         errdefer m.deinit(gpa);
         try hits.append(gpa, .{ .memory = m, .score = @floatFromInt(x.ord), .buried = buried });
     }
+}
+
+// ------------------------------------------------------------------ schema
+
+/// An attribute the store learned: how its claims are worded (the words
+/// most of them share, stems, most shared first), and how much it holds.
+pub const SlotInfo = struct {
+    wording: []u8,
+    claims: u32,
+    frames: u32,
+    /// Names with this attribute.
+    cells: u32,
+};
+
+pub fn freeSchema(gpa: Allocator, ss: []const SlotInfo) void {
+    for (ss) |x| gpa.free(x.wording);
+    gpa.free(ss);
+}
+
+fn wordingText(gpa: Allocator, keys: []const u64) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (keys, 0..) |k, i| {
+        if (i > 0) try out.append(gpa, ' ');
+        var b: [words.max_packed]u8 = undefined;
+        try out.appendSlice(gpa, if (k & words.hashed_bit != 0) "#" else words.unpack(k, &b));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The slots the weave has learned, biggest first.
+pub fn schema(w: *Loom, gpa: Allocator) ![]SlotInfo {
+    try w.maybeRefresh();
+    w.readers.enter();
+    defer w.readers.leave();
+    const wv = w.weave() orelse return gpa.alloc(SlotInfo, 0);
+    const cells = try gpa.alloc(u32, wv.slots.len);
+    defer gpa.free(cells);
+    @memset(cells, 0);
+    for (wv.cells) |c| cells[c.slot] += 1;
+    var out: std.ArrayList(SlotInfo) = .empty;
+    errdefer freeSchema(gpa, out.items);
+    for (wv.slots, 0..) |sl, i| {
+        const t = try wordingText(gpa, sl.wording());
+        errdefer gpa.free(t);
+        try out.append(gpa, .{ .wording = t, .claims = sl.claims, .frames = sl.frames, .cells = cells[i] });
+    }
+    std.mem.sortUnstable(SlotInfo, out.items, {}, struct {
+        fn gt(_: void, a: SlotInfo, b: SlotInfo) bool {
+            return a.claims > b.claims;
+        }
+    }.gt);
+    return out.toOwnedSlice(gpa);
+}
+
+/// One attribute of a name: the slot's wording, how many versions the
+/// cell holds, and the newest.
+pub const FactRow = struct {
+    wording: []u8,
+    versions: u32,
+    memory: Memory,
+};
+
+pub fn freeFacts(gpa: Allocator, rows: []const FactRow) void {
+    for (rows) |r| {
+        gpa.free(r.wording);
+        r.memory.deinit(gpa);
+    }
+    gpa.free(rows);
+}
+
+/// Everything the store knows about `name` (its first word), one row per
+/// attribute, each in its newest version: a name's row of the grid.
+pub fn facts(w: *Loom, gpa: Allocator, name: []const u8, scope: []const u8) ![]FactRow {
+    try w.maybeRefresh();
+    w.readers.enter();
+    defer w.readers.leave();
+    var out: std.ArrayList(FactRow) = .empty;
+    errdefer freeFacts(gpa, out.items);
+    const set = w.scopeSet(scope) orelse return out.toOwnedSlice(gpa);
+    const wv = w.weave() orelse return out.toOwnedSlice(gpa);
+    var t: words.Terms = .{};
+    t.fill(name);
+    if (t.len == 0) return out.toOwnedSlice(gpa);
+    for (wv.cellsOf(t.words[0].key)) |ci| {
+        const cell = wv.cells[ci];
+        const ord = w.newestOf(cell.head);
+        if (!w.alive(ord) or !set.has(w, w.sidOf(ord))) continue;
+        const m = (try w.load(gpa, ord)) orelse continue;
+        errdefer m.deinit(gpa);
+        const wording = try wordingText(gpa, wv.slots[cell.slot].wording());
+        errdefer gpa.free(wording);
+        try out.append(gpa, .{ .wording = wording, .versions = cell.members, .memory = m });
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 // ------------------------------------------------------------------- brief
@@ -2877,6 +2972,50 @@ test "what tagged facts teach links the untagged versions of other names" {
         const o = try std.fmt.bufPrint(&old, "zq{d}old", .{i});
         for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, o) == null);
     }
+}
+
+test "a name's row of the grid, and the schema the store learned" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const names = [_][]const u8{ "atlas", "borealis", "cygnus", "draco", "eridanus", "fornax" };
+    var b: [128]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    for (0..2000) |i| _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i % 89}), .{});
+    for (names, 0..) |nm, i| {
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} is deployed in the zq{d}old region", .{ nm, i }), .{ .subject = try std.fmt.bufPrint(&sb, "{s}-region", .{nm}) });
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} keeps its records in zr{d}db", .{ nm, i }), .{});
+        for (0..30) |j| _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "lunch was fine {d}", .{j}), .{});
+    }
+    for (names, 0..) |nm, i| {
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} moved over to the zq{d}new hosting", .{ nm, i }), .{ .subject = try std.fmt.bufPrint(&sb, "{s}-region", .{nm}) });
+    }
+    const rows = try w.facts(testing.allocator, "Atlas", "");
+    defer freeFacts(testing.allocator, rows);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    var saw_new = false;
+    var saw_db = false;
+    for (rows) |r| {
+        if (std.mem.indexOf(u8, r.memory.text, "zq0new") != null) {
+            saw_new = true;
+            try testing.expectEqual(@as(u32, 2), r.versions);
+        }
+        if (std.mem.indexOf(u8, r.memory.text, "zr0db") != null) saw_db = true;
+        try testing.expect(std.mem.indexOf(u8, r.memory.text, "zq0old") == null);
+    }
+    try testing.expect(saw_new and saw_db);
+    const slots = try w.schema(testing.allocator);
+    defer freeSchema(testing.allocator, slots);
+    try testing.expect(slots.len >= 2);
+    var region = false;
+    for (slots) |sl| {
+        if (std.mem.indexOf(u8, sl.wording, "region") != null) {
+            region = true;
+            try testing.expectEqual(@as(u32, names.len), sl.cells);
+        }
+    }
+    try testing.expect(region);
 }
 
 test "a one-off change continues the claim it shares the most words with; another attribute is left alone" {
