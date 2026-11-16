@@ -4,7 +4,8 @@
 //! number in a u64: exact, reversible, never colliding, and in the same
 //! order as the words sort. Longer words (rare) are hashed into the upper
 //! half of the u64 range, which packed words never reach. So a word is
-//! compared, sorted and looked up as one integer everywhere in Loom (taken unchanged from Crystal).
+//! compared, sorted and looked up as one integer everywhere in Loom (taken
+//! from Crystal; Loom adds each word's byte offsets).
 //!
 //! Terms are lowercase, with a short stopword list and light suffix
 //! stripping ("deploying", "deployed" -> "deploy"), the same stemming the
@@ -152,6 +153,9 @@ pub const Word = struct {
     sent: u16,
     /// All digits.
     number: bool,
+    /// Where it is in the text, in bytes: [at, end).
+    at: u32 = 0,
+    end: u32 = 0,
 };
 
 /// Calls `sink.word(Word)` for every term of `text` (stopwords and
@@ -163,11 +167,13 @@ pub fn forEach(text: []const u8, sink: anytype) void {
     var digits = true;
     var pos: u16 = 0;
     var sent: u16 = 0;
+    var at: usize = 0;
     var i: usize = 0;
     while (i <= text.len) : (i += 1) {
         const c0: u8 = if (i < text.len) text[i] else ' ';
         const c = lower[c0];
         if (c != 0) {
+            if (n == 0 and !too_long) at = i;
             if (n < max_word) {
                 buf[n] = c;
                 n += 1;
@@ -180,7 +186,7 @@ pub fn forEach(text: []const u8, sink: anytype) void {
                 const raw = pack(buf[0..n]);
                 if (!(n <= 6 and isStop(raw))) {
                     const st = stem(buf[0..n]);
-                    sink.word(.{ .key = if (st.len == n) raw else pack(st), .pos = pos, .sent = sent, .number = digits });
+                    sink.word(.{ .key = if (st.len == n) raw else pack(st), .pos = pos, .sent = sent, .number = digits, .at = @intCast(at), .end = @intCast(i) });
                 }
             }
             pos +|= 1;

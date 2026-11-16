@@ -74,6 +74,10 @@ pub const Slot = struct {
     claims: u32 = 0,
     frames: u32 = 0,
 
+    pub fn holds(s: *const Slot, key: u64) bool {
+        for (s.wording()) |k| if (k == key) return true;
+        return false;
+    }
     pub fn wording(s: *const Slot) []const u64 {
         return s.keys[0..s.len];
     }
@@ -89,7 +93,18 @@ pub const Cell = struct {
 };
 
 /// Where a claim sits: its cell, and the newest claim it is a version of.
-pub const Fact = struct { cell: u32, head: u32, slot: u32 };
+pub const Fact = struct {
+    cell: u32,
+    head: u32,
+    slot: u32,
+    /// What the claim states, in bytes of its text: its rare words and
+    /// two words either side, the chatter around them left out.
+    at: u16 = 0,
+    len: u16 = 0,
+};
+
+/// Bytes of a claim's text, [at, at + len).
+pub const Span = struct { at: u16 = 0, len: u16 = 0 };
 
 pub const Woven = struct {
     arena: std.heap.ArenaAllocator,
@@ -166,6 +181,20 @@ const UnionFind = struct {
     }
 };
 
+/// The weight of the wording a claim has in place when its value is word `pv`.
+fn placed(ks: []const u64, pv: u8, widx: anytype, fidx: anytype, fwt: []const f32) f32 {
+    var sum: f32 = 0;
+    for (ks, 0..) |k, j| {
+        if (k == 0) break;
+        const off = @as(i32, @intCast(j)) - pv;
+        if (off == 0 or off < -max_before or off > max_after) continue;
+        const x = widx.get(k).?;
+        const fk = (@as(u64, x) << 8) | @as(u64, @intCast(off + 128));
+        if (fidx.get(fk)) |fi| sum += fwt[fi];
+    }
+    return sum;
+}
+
 fn pairKey(a: u32, b: u32) u64 {
     const lo = @min(a, b);
     const hi = @max(a, b);
@@ -192,8 +221,8 @@ const C = struct {
 /// Builds the weave over the claims `ords`. `ctx` answers `df(key) u32`
 /// (memories holding the word), `alive(ord) bool`, `group(ord) u64` (the
 /// claim's subject group, 0 for none), `count() u64` (memories) and
-/// `claimWords(ord, *[max_words]u64) !usize` (the claim's words near its
-/// rare ones, in text order).
+/// `claimWords(ord, *[max_words]u64, *Span) !usize` (the claim's words
+/// near its rare ones, in text order, and where its text states them).
 pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     const wv = try gpa.create(Woven);
     wv.* = .{ .arena = .init(gpa), .claims = ords.len };
@@ -206,9 +235,11 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     // Each claim's words, read from the store now (so with today's counts).
     const keys = try t.alloc(u64, ords.len * max_words);
     @memset(keys, 0);
+    const spans = try t.alloc(Span, ords.len);
+    @memset(spans, .{});
     for (ords, 0..) |ord, i| {
         if (!ctx.alive(ord)) continue;
-        _ = try ctx.claimWords(ord, keys[i * max_words ..][0..max_words]);
+        _ = try ctx.claimWords(ord, keys[i * max_words ..][0..max_words], &spans[i]);
     }
 
     // Distinct words of live claims, how many claims hold each, and each
@@ -279,6 +310,23 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
         if (wt.* > 0) w.wording = true;
     }
 
+    // The rarest word is the value in most claims, but not all: a value
+    // another fact also took is less rare than its name. Each claim's
+    // value is the rare word that puts the most wording in its place.
+    for (live.items, pivots.items) |i, *pv| {
+        const ks = keys[i * max_words ..][0..max_words];
+        var best: f32 = placed(ks, pv.*, &widx, &fidx, fwt);
+        for (ks, 0..) |k, j| {
+            if (k == 0) break;
+            if (j == pv.* or wl.items[widx.get(k).?].df > rare_lim) continue;
+            const sc = placed(ks, @intCast(j), &widx, &fidx, fwt);
+            if (sc > best) {
+                best = sc;
+                pv.* = @intCast(j);
+            }
+        }
+    }
+
     // Each claim: its wording features, and its words (names, values and
     // wording). A name or value is a rare word that is nobody's wording
     // and turns up mostly in claims.
@@ -328,7 +376,7 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     if (debug) {
         var shown: usize = 0;
         for (cs.items) |c| {
-            if (shown > 60) break;
+            if (shown > 60 and fr.size.items[c.frame] >= min_frame) continue;
             shown += 1;
             std.debug.print("claim {d} frame {d} (size {d}) cue {}:", .{ c.ord, c.frame, fr.size.items[c.frame], c.cue });
             for (mw.items[c.w0..][0..c.wn]) |x| {
@@ -666,28 +714,37 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     for (wv.cells, members.items) |*cell, m| {
         for (m.items) |ci| cell.head = @max(cell.head, cs.items[ci].ord);
     }
-    // Every claim's newest version: the newest claim of any of its cells
-    // that is not a different fact by its writer's subject.
+    // Every claim's newest version: the newest claim of its main cell (the
+    // name most of its versions share) that is not a different fact by its
+    // writer's subject. Its other names may be shared with other facts by
+    // chance, so they do not carry it.
     for (cs.items, 0..) |c, ci| {
         var head = c.ord;
         var main: u32 = std.math.maxInt(u32);
-        var main_n: u32 = 0;
+        var main_n: u64 = 0;
         for (claim_cells[ci]) |cell| {
             if (cell == std.math.maxInt(u32)) break;
-            if (wv.cells[cell].members > main_n) {
+            // Versions its writer tied to it count first.
+            var same: u64 = 0;
+            if (c.group != 0) for (members.items[cell].items) |cj| {
+                if (cs.items[cj].group == c.group) same += 1;
+            };
+            const n = (same << 32) | wv.cells[cell].members;
+            if (n > main_n) {
                 main = cell;
-                main_n = wv.cells[cell].members;
-            }
-            for (members.items[cell].items) |cj| {
-                const o = cs.items[cj];
-                if (o.ord <= head) continue;
-                if (c.group != 0 and o.group != 0 and c.group != o.group) continue;
-                head = o.ord;
+                main_n = n;
             }
         }
+        if (main != std.math.maxInt(u32)) for (members.items[main].items) |cj| {
+            const o = cs.items[cj];
+            if (o.ord <= head) continue;
+            // A claim its writer gave a subject continues only in that subject.
+            if (c.group != 0 and c.group != o.group) continue;
+            head = o.ord;
+        };
         if (main == std.math.maxInt(u32)) continue;
         if (head != c.ord) wv.linked += 1;
-        try wv.facts.put(a, c.ord, .{ .cell = main, .head = head, .slot = slot_of_frame[c.frame] });
+        try wv.facts.put(a, c.ord, .{ .cell = main, .head = head, .slot = slot_of_frame[c.frame], .at = spans[c.src].at, .len = spans[c.src].len });
     }
     // Name -> cells.
     {
@@ -800,7 +857,8 @@ const TestStore = struct {
     pub fn count(s: *const TestStore) u64 {
         return s.n;
     }
-    pub fn claimWords(s: *const TestStore, ord: u32, out: *[max_words]u64) !usize {
+    pub fn claimWords(s: *const TestStore, ord: u32, out: *[max_words]u64, span: *Span) !usize {
+        span.* = .{};
         const i = std.mem.indexOfScalar(u32, s.ords.items, ord).?;
         @memcpy(out, s.keys.items[i * max_words ..][0..max_words]);
         return max_words;

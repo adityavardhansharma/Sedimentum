@@ -987,12 +987,14 @@ fn newestOf(w: *const Loom, ord: u32) u32 {
     return h;
 }
 
-/// Which fact `ord` is a version of: its grid cell, else its subject
-/// cell, else itself.
+/// Which fact `ord` is a version of: the subject its writer gave it, else
+/// its grid cell, else itself. Two facts can share a name by chance; a
+/// subject is the writer's word.
 fn factKey(w: *const Loom, ord: u32) u64 {
-    if (w.woven.load(.acquire)) |wv| if (wv.factOf(ord)) |f| return (@as(u64, 2) << 32) | f.cell;
     const c = w.cellOf(ord);
-    return if (c != 0) (@as(u64, 1) << 32) | c else ord;
+    if (c != 0) return (@as(u64, 1) << 32) | c;
+    if (w.woven.load(.acquire)) |wv| if (wv.factOf(ord)) |f| return (@as(u64, 2) << 32) | f.cell;
+    return ord;
 }
 
 fn isBuried(w: *const Loom, ord: u32) bool {
@@ -1254,7 +1256,6 @@ fn pickClaim(w: *Loom, ord: u32, seen: []const u32, subject: bool) !void {
 const WeaveCtx = struct {
     w: *const Loom,
     heap: *std.ArrayList(u8),
-    terms: *words.Terms,
     pub fn df(c: WeaveCtx, key: u64) u32 {
         return c.w.dfOf(key);
     }
@@ -1270,21 +1271,49 @@ const WeaveCtx = struct {
         return c.w.memCount();
     }
     /// A claim's rare words (at most max(4, N/4096) memories hold them)
-    /// and every word within six places of one, in text order.
-    pub fn claimWords(c: WeaveCtx, ord: u32, out: *[Weave.max_words]u64) !usize {
+    /// and every word within six places of one, in text order, repeats
+    /// included (a word stated twice has two places); and `span`, the
+    /// bytes from two words before its first rare word to two after its
+    /// last, in the sentences that hold them.
+    pub fn claimWords(c: WeaveCtx, ord: u32, out: *[Weave.max_words]u64, span: *Weave.Span) !usize {
         const t = (try c.w.textOf(ord, c.heap, c.w.gpa)) orelse return 0;
-        c.terms.fill(t.text);
+        const All = struct {
+            ws: [256]words.Word = undefined,
+            n: usize = 0,
+            pub fn word(a: *@This(), x: words.Word) void {
+                if (a.n == a.ws.len) return;
+                a.ws[a.n] = x;
+                a.n += 1;
+            }
+        };
+        var all: All = .{};
+        words.forEach(t.text, &all);
+        const ws = all.ws[0..all.n];
         const lim = rareLimit(c.w.memCount());
         var rare: [Weave.max_words]u16 = undefined;
+        var ri: [Weave.max_words]u16 = undefined;
         var nr: usize = 0;
-        for (c.terms.items()) |word| {
+        for (ws, 0..) |word, i| {
             if (nr < rare.len and c.w.dfOf(word.key) <= lim) {
                 rare[nr] = word.pos;
+                ri[nr] = @intCast(i);
                 nr += 1;
             }
         }
+        if (nr > 0) {
+            const pad = 2;
+            const f = ri[0];
+            const l = ri[nr - 1];
+            var lo: usize = f -| pad;
+            while (ws[lo].sent != ws[f].sent) lo += 1;
+            var hi: usize = @min(l + pad, ws.len - 1);
+            while (ws[hi].sent != ws[l].sent) hi -= 1;
+            var end: usize = ws[hi].end;
+            if (end < t.text.len and isSentenceEnd(t.text[end])) end += 1;
+            if (end <= std.math.maxInt(u16)) span.* = .{ .at = @intCast(ws[lo].at), .len = @intCast(end - ws[lo].at) };
+        }
         var k: usize = 0;
-        for (c.terms.items()) |word| {
+        for (ws) |word| {
             if (k == out.len) break;
             for (rare[0..nr]) |p| if (absDiff(word.pos, p) <= 6) {
                 out[k] = word.key;
@@ -1313,9 +1342,7 @@ fn weave(w: *Loom) ?*const Weave.Woven {
     if (now != cur) return now;
     var heap: std.ArrayList(u8) = .empty;
     defer heap.deinit(w.gpa);
-    const terms = w.gpa.create(words.Terms) catch return cur;
-    defer w.gpa.destroy(terms);
-    const nw = Weave.build(w.gpa, w.cl_ord.items()[0..nc], WeaveCtx{ .w = w, .heap = &heap, .terms = terms }) catch return cur;
+    const nw = Weave.build(w.gpa, w.cl_ord.items()[0..nc], WeaveCtx{ .w = w, .heap = &heap }) catch return cur;
     if (cur) |c| w.retired.append(w.gpa, c) catch {
         // Cannot keep it for later: better a little memory lost than a
         // reader reading freed memory.
@@ -2026,6 +2053,8 @@ pub const Hit = struct {
     buried: bool,
     /// Which question words it contains (bit per word group).
     matched: u8 = 0,
+    /// Its ordinal in this store.
+    ord: u32 = 0,
 };
 
 pub fn freeHits(gpa: Allocator, hs: []const Hit) void {
@@ -2062,9 +2091,47 @@ const Search = struct {
     /// Meaning index -> similarity to each group, for this question.
     memo_key: [1024]u32 = @splat(std.math.maxInt(u32)),
     memo_sim: [1024][max_groups]f32 = undefined,
+    /// Per question word: a name (rare enough to tell facts apart).
+    qrare: [max_groups * (1 + max_related)]bool = undefined,
+    /// Per slot: how well its wording matches each question group.
+    slot_match: std.AutoHashMapUnmanaged(u32, [max_groups]f32) = .empty,
+    /// Per group: its question word itself, and whether it is a name.
+    gexact: [max_groups]?u64 = @splat(null),
+    gexact_rare: [max_groups]bool = @splat(false),
 
     fn deinit(s: *Search) void {
         s.heap.deinit(s.gpa);
+        s.slot_match.deinit(s.gpa);
+    }
+
+    /// How well a slot's pooled wording matches each question group: a
+    /// question word in it (weighted by how much of the slot says it), or
+    /// with meaning on, the closest word in meaning.
+    fn slotMatch(s: *Search, sid: u32) ![max_groups]f32 {
+        const gop = try s.slot_match.getOrPut(s.gpa, sid);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const sl = &s.wv.?.slots[sid];
+        var m: [max_groups]f32 = @splat(0);
+        const top = sl.share[0];
+        for (s.qt[0..s.nq]) |q| {
+            for (sl.wording(), 0..) |k, j| if (k == q.key) {
+                m[q.group] = @max(m[q.group], q.sim * (0.6 + 0.4 * sl.share[j] / top));
+            };
+        }
+        if (s.meaning) |mn| {
+            var best: [max_groups]f32 = @splat(0);
+            for (sl.wording(), 0..) |k, j| {
+                const mi = mn.index(k) orelse continue;
+                const wt = 0.5 + 0.5 * sl.share[j] / top;
+                const sv = s.sims(mi);
+                for (0..s.ng) |g| best[g] = @max(best[g], sv[g] * wt);
+            }
+            for (0..s.ng) |g| if (s.gmi[g] != null) {
+                m[g] = @max(m[g], std.math.clamp((best[g] - sim_floor) / (1 - sim_floor), 0, 1));
+            };
+        }
+        gop.value_ptr.* = m;
+        return m;
     }
 
     fn recency(s: *const Search, t: u64) f32 {
@@ -2093,7 +2160,17 @@ const Search = struct {
         var m: [max_groups]f32 = @splat(0);
         var mask: u8 = 0;
         var lexpos: [max_groups]?usize = @splat(null);
-        for (s.qt[0..s.nq]) |q| {
+        // A claim is matched against its slot's wording: every way its
+        // attribute was ever phrased, by any name, and none of the chatter
+        // around this one memory.
+        var slot_id: ?u32 = null;
+        if (s.wv) |wv| if (wv.factOf(ord)) |f| {
+            if (wv.slots[f.slot].len > 0) slot_id = f.slot;
+        };
+        for (s.qt[0..s.nq], 0..) |q, qi| {
+            // In a claim, only names (rare words) and its slot's wording
+            // count (below); the chatter around it does not.
+            if (slot_id) |sid| if (q.sim < 1 or (!s.qrare[qi] and !s.wv.?.slots[sid].holds(q.key))) continue;
             if (s.terms.find(q.key)) |i| {
                 if (q.sim > m[q.group]) m[q.group] = q.sim;
                 if (q.sim == 1) {
@@ -2102,32 +2179,13 @@ const Search = struct {
                 }
             }
         }
-        // A claim is matched against its slot's wording: every way its
-        // attribute was ever phrased, by any name, and none of the chatter
-        // around this one memory.
-        const slot: ?*const Weave.Slot = if (s.wv) |wv| (if (wv.factOf(ord)) |f| &wv.slots[f.slot] else null) else null;
-        if (slot) |sl| if (sl.len > 0) {
-            const top = sl.share[0];
-            for (s.qt[0..s.nq]) |q| {
-                if (m[q.group] >= 1) continue;
-                for (sl.wording(), 0..) |k, j| if (k == q.key) {
-                    m[q.group] = @max(m[q.group], q.sim * (0.6 + 0.4 * sl.share[j] / top));
-                };
-            }
-            if (s.meaning) |mn| {
-                var best: [max_groups]f32 = @splat(0);
-                for (sl.wording(), 0..) |k, j| {
-                    const mi = mn.index(k) orelse continue;
-                    const wt = 0.5 + 0.5 * sl.share[j] / top;
-                    const sv = s.sims(mi);
-                    for (0..s.ng) |g| best[g] = @max(best[g], sv[g] * wt);
-                }
-                for (0..s.ng) |g| if (s.gmi[g] != null and m[g] < 1) {
-                    m[g] = @max(m[g], std.math.clamp((best[g] - sim_floor) / (1 - sim_floor), 0, 1));
-                };
-            }
-        };
-        if (slot == null) if (s.meaning) |mn| {
+        if (slot_id) |sid| {
+            const sm = try s.slotMatch(sid);
+            for (0..s.ng) |g| if (m[g] < 1) {
+                m[g] = @max(m[g], sm[g]);
+            };
+        }
+        if (slot_id == null) if (s.meaning) |mn| {
             // The claim about the rarest name the question shares with
             // this memory: the words between the name and its value.
             var name: ?words.Word = null;
@@ -2170,6 +2228,30 @@ const Search = struct {
         const cov = s1 / s.wsum;
         const subj: f32 = if (r.subject.len > 0) 1.1 else 1.0;
         return .{ .score = s1 * cov * cov * s.recency(r.time) * subj, .mask = mask };
+    }
+
+    /// Score of a claim, without reading its text: in a claim only its
+    /// names and its slot's wording count, and the postings already say
+    /// which question words it holds; only the record's time is read.
+    fn scoreClaim(s: *Search, ord: u32, sid: u32, cmask: u8) !?Scored {
+        const r = s.w.recOf(s.w.tl_loc.get(ord)) orelse return null;
+        if (r.erased or r.time < s.q.since) return null;
+        var m = try s.slotMatch(sid);
+        var mask: u8 = 0;
+        const sl = &s.wv.?.slots[sid];
+        for (0..s.ng) |g| if (cmask & (@as(u8, 1) << @intCast(g)) != 0) {
+            const k = s.gexact[g] orelse continue;
+            if (s.gexact_rare[g] or sl.holds(k)) {
+                m[g] = 1;
+                mask |= @as(u8, 1) << @intCast(g);
+            }
+        };
+        var base: f32 = 0;
+        for (0..s.ng) |g| base += s.gw[g] * m[g];
+        if (base <= 0) return null;
+        const cov = base / s.wsum;
+        const subj: f32 = if (r.subject.len > 0) 1.1 else 1.0;
+        return .{ .score = base * cov * cov * s.recency(r.time) * subj, .mask = mask };
     }
 
     fn bound(s: *const Search, base: f32) f32 {
@@ -2249,6 +2331,16 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
         }
     }
 
+    {
+        const lim = rareLimit(w.memCount());
+        for (s.qt[0..s.nq], 0..) |t, qi| {
+            s.qrare[qi] = w.dfOf(t.key) <= lim;
+            if (t.sim == 1 and s.gexact[t.group] == null) {
+                s.gexact[t.group] = t.key;
+                s.gexact_rare[t.group] = s.qrare[qi];
+            }
+        }
+    }
     // Candidates: the postings of the question's findable words, newest
     // first; a word too common to keep postings only confirms.
     var pairs: std.ArrayList(u64) = .empty;
@@ -2307,8 +2399,17 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
             const kth = kthScore(fhits.items, limit);
             if (s.bound(c.s1 + extra) < kth) break;
         }
-        const sc = (if (posts_only) s.scoreFromPosts(c.ord, c.s1, c.mask) else try s.score(c.ord)) orelse continue;
-        if (!posts_only) decoded += 1;
+        var claim_slot: ?u32 = null;
+        if (wv) |x| if (x.factOf(c.ord)) |f| {
+            if (x.slots[f.slot].len > 0) claim_slot = f.slot;
+        };
+        const sc = (if (posts_only)
+            s.scoreFromPosts(c.ord, c.s1, c.mask)
+        else if (claim_slot) |sid|
+            try s.scoreClaim(c.ord, sid, c.mask)
+        else
+            try s.score(c.ord)) orelse continue;
+        if (!posts_only and claim_slot == null) decoded += 1;
         const key: u64 = if (q.deep) c.ord else w.factKey(c.ord);
         var found = false;
         for (fhits.items) |*f| if (f.key == key) {
@@ -2357,7 +2458,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
         if (!q.deep and x.buried) continue;
         const m = (try w.load(gpa, x.ord)) orelse continue;
         errdefer m.deinit(gpa);
-        try hits.append(gpa, .{ .memory = m, .score = x.score, .buried = x.buried, .matched = x.mask });
+        try hits.append(gpa, .{ .memory = m, .score = x.score, .buried = x.buried, .matched = x.mask, .ord = x.ord });
     }
     return hits.toOwnedSlice(gpa);
 }
@@ -2439,7 +2540,7 @@ fn newestInto(w: *const Loom, gpa: Allocator, set: ScopeSet, q: Query, limit: us
             continue;
         }
         errdefer m.deinit(gpa);
-        try hits.append(gpa, .{ .memory = m, .score = @floatFromInt(x.ord), .buried = buried });
+        try hits.append(gpa, .{ .memory = m, .score = @floatFromInt(x.ord), .buried = buried, .ord = x.ord });
     }
 }
 
@@ -2502,6 +2603,7 @@ pub const FactRow = struct {
     wording: []u8,
     versions: u32,
     memory: Memory,
+    ord: u32 = 0,
 };
 
 pub fn freeFacts(gpa: Allocator, rows: []const FactRow) void {
@@ -2525,27 +2627,29 @@ pub fn facts(w: *Loom, gpa: Allocator, name: []const u8, scope: []const u8) ![]F
     var t: words.Terms = .{};
     t.fill(name);
     if (t.len == 0) return out.toOwnedSlice(gpa);
-    try w.rowInto(gpa, wv, set, t.words[0].key, &out);
+    try w.rowInto(gpa, wv, set, t.words[0].key, &.{}, true, &out);
     return out.toOwnedSlice(gpa);
 }
 
 /// A name's row of the grid, newest version of each cell. Readers entered.
-fn rowInto(w: *Loom, gpa: Allocator, wv: *const Weave.Woven, set: ScopeSet, name: u64, out: *std.ArrayList(FactRow)) !void {
+fn rowInto(w: *Loom, gpa: Allocator, wv: *const Weave.Woven, set: ScopeSet, name: u64, skip: []const u64, with_wording: bool, out: *std.ArrayList(FactRow)) !void {
     for (wv.cellsOf(name)) |ci| {
         const cell = wv.cells[ci];
         const ord = w.newestOf(cell.head);
         if (!w.alive(ord) or !set.has(w, w.sidOf(ord))) continue;
+        // Memories the caller already has are not loaded again.
+        if (std.mem.indexOfScalar(u64, skip, w.tl_loc.get(ord)) != null) continue;
         const m = (try w.load(gpa, ord)) orelse continue;
         errdefer m.deinit(gpa);
-        const wording = try wordingText(gpa, wv.slots[cell.slot].wording());
+        const wording = if (with_wording) try wordingText(gpa, wv.slots[cell.slot].wording()) else try gpa.alloc(u8, 0);
         errdefer gpa.free(wording);
-        try out.append(gpa, .{ .wording = wording, .versions = cell.members, .memory = m });
+        try out.append(gpa, .{ .wording = wording, .versions = cell.members, .memory = m, .ord = ord });
     }
 }
 
 /// The rows of the names a text mentions (at most `max` names, rarest
-/// first), as memories.
-fn namedRows(w: *Loom, gpa: Allocator, text: []const u8, scope: []const u8, max: usize) ![]FactRow {
+/// first), as memories, leaving out the memories `skip` names by id.
+fn namedRows(w: *Loom, gpa: Allocator, text: []const u8, scope: []const u8, max: usize, skip: []const u64) ![]FactRow {
     w.readers.enter();
     defer w.readers.leave();
     var out: std.ArrayList(FactRow) = .empty;
@@ -2566,7 +2670,7 @@ fn namedRows(w: *Loom, gpa: Allocator, text: []const u8, scope: []const u8, max:
             return ww.dfOf(a) < ww.dfOf(b);
         }
     }.lt);
-    for (names[0..@min(nn, max)]) |k| try w.rowInto(gpa, wv, set, k, &out);
+    for (names[0..@min(nn, max)]) |k| try w.rowInto(gpa, wv, set, k, skip, false, &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -2586,6 +2690,10 @@ pub const Brief = struct {
 /// A briefing for an agent: the facts that matter for `situation`, each in
 /// its newest version only, then the newest in the scope, never over
 /// `budget` tokens (4 bytes a token).
+fn isSentenceEnd(c: u8) bool {
+    return c == '.' or c == '!' or c == '?' or c == ';' or c == '\n';
+}
+
 pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8, budget: usize) !Brief {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -2600,13 +2708,17 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
     defer freeMemories(gpa, rec_ms);
     // Everything known about the names the situation mentions: their rows
     // of the grid, each attribute in its newest version only.
-    const rows = try w.namedRows(gpa, situation, scope, 2);
+    var have: [16]u64 = undefined;
+    for (hits, 0..) |x, i| have[i] = x.memory.id;
+    const rows = try w.namedRows(gpa, situation, scope, 2, have[0..hits.len]);
     defer freeFacts(gpa, rows);
     var row_ms: [64]Memory = undefined;
+    var row_ords: [64]u32 = undefined;
     var nrow: usize = 0;
     for (rows) |r| {
         if (nrow == row_ms.len) break;
         row_ms[nrow] = r.memory;
+        row_ords[nrow] = r.ord;
         nrow += 1;
     }
 
@@ -2615,23 +2727,35 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
     var seen: [64]u64 = undefined;
     var nseen: usize = 0;
     var rel: [16]Memory = undefined;
+    var rel_ords: [16]u32 = undefined;
     var nrel: usize = 0;
     for (hits) |x| {
         rel[nrel] = x.memory;
+        rel_ords[nrel] = x.ord;
         nrel += 1;
     }
     const now = w.nowMs();
-    const Part = struct { title: []const u8, mems: []const Memory };
+    const Part = struct { title: []const u8, mems: []const Memory, ords: ?[]const u32 };
+    // A claim shows what it states (its names and values, and the words
+    // right around them); other memories, and the recent conversation,
+    // are shown whole.
     const sections = [_]Part{
-        .{ .title = "Relevant memory", .mems = rel[0..nrel] },
-        .{ .title = "Also known about them", .mems = row_ms[0..nrow] },
-        .{ .title = "Recent in this scope", .mems = rec_ms },
+        .{ .title = "Relevant memory", .mems = rel[0..nrel], .ords = rel_ords[0..nrel] },
+        .{ .title = "Also known about them", .mems = row_ms[0..nrow], .ords = row_ords[0..nrow] },
+        .{ .title = "Recent in this scope", .mems = rec_ms, .ords = null },
     };
+    w.readers.enter();
+    defer w.readers.leave();
+    const wv = w.weave();
     for (sections) |sec| {
         var header_done = false;
-        for (sec.mems) |m| {
+        for (sec.mems, 0..) |m, mi| {
             if (std.mem.indexOfScalar(u64, seen[0..nseen], m.id) != null) continue;
-            const snippet = m.text[0..@min(m.text.len, 600)];
+            var body = m.text;
+            if (sec.ords) |os| if (wv) |x| if (x.factOf(os[mi])) |f| {
+                if (f.len > 0 and @as(usize, f.at) + f.len <= m.text.len) body = m.text[f.at..][0..f.len];
+            };
+            const snippet = body[0..@min(body.len, 600)];
             const cost = (snippet.len + m.scope.len + 40 + 3) / 4;
             if (used + cost > budget) continue;
             if (!header_done) {
@@ -2640,7 +2764,7 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
             }
             const age_s = (now -| m.time) / 1000;
             const v, const u = if (age_s < 3600) .{ age_s / 60, "m" } else if (age_s < 86400) .{ age_s / 3600, "h" } else .{ age_s / 86400, "d" };
-            try out.print(gpa, "- [{d}{s} ago {s}] {s}{s}\n", .{ v, u, m.scope, snippet, if (snippet.len < m.text.len) "..." else "" });
+            try out.print(gpa, "- [{d}{s} ago {s}] {s}{s}\n", .{ v, u, m.scope, snippet, if (snippet.len < body.len) "..." else "" });
             used += cost;
             items += 1;
             if (nseen < seen.len) {
