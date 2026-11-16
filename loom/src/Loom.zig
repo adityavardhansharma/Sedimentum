@@ -975,8 +975,30 @@ fn settled(w: *const Loom, ord: u32) bool {
 }
 
 /// An older version of its fact, or settled under a summary.
+/// The newest version of `ord`: by its subject, or by the weave's grid
+/// (the newest live claim of its cell), whichever is newer.
+fn newestOf(w: *const Loom, ord: u32) u32 {
+    var h = w.headOf(ord);
+    const wv = w.woven.load(.acquire) orelse return h;
+    if (wv.factOf(ord)) |f| {
+        if (f.head > h and w.alive(f.head)) h = f.head;
+    }
+    if (h != ord) if (wv.factOf(h)) |f| {
+        if (f.head > h and w.alive(f.head)) h = f.head;
+    };
+    return h;
+}
+
+/// Which fact `ord` is a version of: its grid cell, else its subject
+/// cell, else itself.
+fn factKey(w: *const Loom, ord: u32) u64 {
+    if (w.woven.load(.acquire)) |wv| if (wv.factOf(ord)) |f| return (@as(u64, 2) << 32) | f.cell;
+    const c = w.cellOf(ord);
+    return if (c != 0) (@as(u64, 1) << 32) | c else ord;
+}
+
 fn isBuried(w: *const Loom, ord: u32) bool {
-    return w.headOf(ord) != ord or w.settled(ord);
+    return w.newestOf(ord) != ord or w.settled(ord);
 }
 
 /// Bytes of lane `l` the index may read.
@@ -1956,7 +1978,7 @@ pub fn current(w: *Loom, gpa: Allocator, scope: []const u8, subject: []const u8)
     const sid = w.scopeId(scope) orelse return null;
     const c = w.subjects.get(subjectKey(sid, subject)) orelse return null;
     const head = @atomicLoad(u32, &w.cells.at(@intCast(c)).head, .acquire);
-    return w.load(gpa, head);
+    return w.load(gpa, w.newestOf(head));
 }
 
 // ------------------------------------------------------------------ recall
@@ -2127,6 +2149,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     }
     if (w.memCount() == 0) return hits.toOwnedSlice(gpa);
     const set = w.scopeSet(q.scope) orelse return hits.toOwnedSlice(gpa);
+    _ = w.weave();
     const s = try gpa.create(Search);
     defer gpa.destroy(s);
     s.* = .{ .w = w, .gpa = gpa, .q = q, .set = set, .meaning = if (q.expand) w.options.meaning else null, .now = w.nowMs() };
@@ -2238,8 +2261,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
         }
         const sc = (if (posts_only) s.scoreFromPosts(c.ord, c.s1, c.mask) else try s.score(c.ord)) orelse continue;
         if (!posts_only) decoded += 1;
-        const cell = w.cellOf(c.ord);
-        const key: u64 = if (q.deep or cell == 0) c.ord else (@as(u64, 1) << 32) | cell;
+        const key: u64 = if (q.deep) c.ord else w.factKey(c.ord);
         var found = false;
         for (facts.items) |*f| if (f.key == key) {
             found = true;
@@ -2263,8 +2285,14 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     for (facts.items) |f| {
         var ord = f.ord;
         if (!q.deep) {
-            const h = w.headOf(f.ord);
+            const h = w.newestOf(f.ord);
             if (h != f.ord and w.alive(h)) ord = h;
+            // Two keys can reach one fact (a subject cell and a grid cell).
+            var dup = false;
+            for (pre.items) |x| if (x.ord == ord) {
+                dup = true;
+            };
+            if (dup) continue;
             if (w.settled(ord)) continue;
         }
         if (q.since > 0 and ord != f.ord) {
@@ -2813,6 +2841,40 @@ test "an old wording reaches the newest version of its fact" {
     const deep = try w.recall(testing.allocator, .{ .about = "billing postgres cockroach payments", .limit = 5, .deep = true });
     defer freeHits(testing.allocator, deep);
     try testing.expectEqual(@as(usize, 2), deep.len);
+}
+
+test "what tagged facts teach links the untagged versions of other names" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const names = [_][]const u8{ "atlas", "borealis", "cygnus", "draco", "eridanus", "fornax", "gemini", "hydra" };
+    var b: [128]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    for (0..3000) |i| _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i % 97}), .{});
+    for (names, 0..) |nm, i| {
+        const subj: ?[]const u8 = if (i < 4) try std.fmt.bufPrint(&sb, "{s}-region", .{nm}) else null;
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} is deployed in the zq{d}old region", .{ nm, i }), .{ .subject = subj });
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} keeps its records in zr{d}db", .{ nm, i }), .{});
+        for (0..40) |j| _ = try w.remember("p/chat", try std.fmt.bufPrint(&b, "lunch was fine {d}", .{j}), .{});
+    }
+    for (names, 0..) |nm, i| {
+        const subj: ?[]const u8 = if (i < 4) try std.fmt.bufPrint(&sb, "{s}-region", .{nm}) else null;
+        _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} moved over to the zq{d}new hosting", .{ nm, i }), .{ .subject = subj });
+    }
+    const inf = w.info();
+    try testing.expect(inf.joined_by_subject >= 1);
+    try testing.expect(inf.linked >= names.len);
+    for (names, 0..) |nm, i| {
+        const hits = try w.recall(testing.allocator, .{ .about = try std.fmt.bufPrint(&b, "which region is {s} deployed in", .{nm}), .limit = 5 });
+        defer freeHits(testing.allocator, hits);
+        try testing.expect(hits.len >= 1);
+        var want: [16]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, hits[0].memory.text, try std.fmt.bufPrint(&want, "zq{d}new", .{i})) != null);
+        var old: [16]u8 = undefined;
+        const o = try std.fmt.bufPrint(&old, "zq{d}old", .{i});
+        for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, o) == null);
+    }
 }
 
 test "forget and forgetScope erase text, and survive reopening" {
