@@ -2864,6 +2864,22 @@ fn isSentenceEnd(c: u8) bool {
     return c == '.' or c == '!' or c == '?' or c == ';' or c == '\n';
 }
 
+/// Which of the question's words (the first 16) a text holds.
+fn questionMask(q: *const words.Terms, text: []const u8) u16 {
+    const S = struct {
+        q: *const words.Terms,
+        m: u16 = 0,
+        pub fn word(st: *@This(), x: words.Word) void {
+            if (st.q.find(x.key)) |i| if (i < 16) {
+                st.m |= @as(u16, 1) << @intCast(i);
+            };
+        }
+    };
+    var st: S = .{ .q = q };
+    words.forEach(text, &st);
+    return st.m;
+}
+
 pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8, budget: usize) !Brief {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -2885,8 +2901,21 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
     var row_ms: [64]Memory = undefined;
     var row_ords: [64]u32 = undefined;
     var nrow: usize = 0;
-    for (rows) |r| {
+    // A row the weave could not tie to its newer version (two wordings it
+    // never joined) is still an old version when a newer hit says
+    // exactly the same question words: leave it out, as recall buries
+    // such versions.
+    var qt: words.Terms = .{};
+    qt.fill(situation);
+    var hmask: [16]?u16 = @splat(null);
+    rows: for (rows) |r| {
         if (nrow == row_ms.len) break;
+        const rm = questionMask(&qt, r.memory.text);
+        if (@popCount(rm) >= 2) for (hits, 0..) |x, hi| {
+            if (x.memory.time <= r.memory.time) continue;
+            if (hmask[hi] == null) hmask[hi] = questionMask(&qt, x.memory.text);
+            if (hmask[hi].? == rm) continue :rows;
+        };
         row_ms[nrow] = r.memory;
         row_ords[nrow] = r.ord;
         nrow += 1;
