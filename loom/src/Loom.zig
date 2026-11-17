@@ -205,18 +205,25 @@ fn reserveAnon(at: ?[*]align(page) u8, len: usize) ![]align(page) u8 {
     return m;
 }
 
-/// Where a writer's index pages live while it runs. With a scratch file
-/// (unnamed, in the store's folder, gone when the process is) the pages
-/// are the file's: the kernel writes them out and drops them as it needs
-/// to, so building a large index does not hold it all in anonymous memory.
-/// Without one (no O_TMPFILE there), plain anonymous memory, as before.
-/// Only the writer, under its lock, reserves and releases.
+/// Where a writer's index pages live while it runs. Each reservation has
+/// a stretch of an unnamed scratch file (in the store's folder, gone with
+/// the process) set aside, but starts as anonymous memory: a small index
+/// is fastest there. Once the index grows past `spill_bytes`, or a
+/// reopened index is first written, `Loom.adopt` moves every reservation
+/// into its stretch of the file (`shared`), and from then on the pages are
+/// the file's: the kernel writes them out and drops them as it needs to,
+/// so a large index is not held in anonymous memory. Without O_TMPFILE
+/// there, it stays anonymous memory throughout. Only the writer, under its
+/// lock, reserves, releases and moves.
 const Backing = struct {
+    const Res = struct { off: u64, len: usize };
     fd: i32 = -1,
+    /// Reservations are mapped from the file (after `Loom.adopt`).
+    shared: bool = false,
     /// End of the file, where the next reservation goes.
     end: u64 = 0,
-    /// Start address -> file offset of each reservation.
-    offs: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    /// Start address -> its stretch of the file.
+    offs: std.AutoHashMapUnmanaged(usize, Res) = .empty,
     gpa: Allocator = undefined,
 
     const align_to: u64 = 1 << 21;
@@ -236,35 +243,61 @@ const Backing = struct {
         b.fd = -1;
     }
 
-    /// Zeroed pages for `len` bytes, at `at` (which must be a reservation
-    /// made here, and then holds zeros again) or anywhere.
+    /// Zeroed pages for `len` bytes, at `at` (which then holds zeros
+    /// again) or anywhere.
     fn reserve(b: *Backing, at: ?[*]align(page) u8, len: usize) ![]align(page) u8 {
         if (b.fd < 0) return reserveAnon(at, len);
         const linux = std.os.linux;
-        var off: u64 = undefined;
         if (at) |p| {
-            off = b.offs.get(@intFromPtr(p)) orelse return reserveAnon(at, len);
-            b.punch(off, len);
-        } else {
-            off = b.end;
-            const next = off + std.mem.alignForward(u64, len, align_to);
-            if (linux.errno(linux.ftruncate(b.fd, @intCast(next))) != .SUCCESS) return reserveAnon(null, len);
-            b.end = next;
+            const r = b.offs.get(@intFromPtr(p)) orelse return reserveAnon(at, len);
+            b.punch(r.off, len);
+            if (!b.shared) return reserveAnon(at, len);
+            return b.mapShared(p, r);
         }
-        const m = std.posix.mmap(at, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true, .FIXED = at != null }, b.fd, off) catch return reserveAnon(at, len);
-        std.posix.madvise(m.ptr, m.len, linux.MADV.NOHUGEPAGE) catch {};
-        if (at == null) b.offs.put(b.gpa, @intFromPtr(m.ptr), off) catch {
+        const off = b.end;
+        const next = off + std.mem.alignForward(u64, len, align_to);
+        if (linux.errno(linux.ftruncate(b.fd, @intCast(next))) != .SUCCESS) return reserveAnon(null, len);
+        b.end = next;
+        const m = if (b.shared)
+            std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true }, b.fd, off) catch return reserveAnon(null, len)
+        else
+            try reserveAnon(null, len);
+        if (b.shared) std.posix.madvise(m.ptr, m.len, linux.MADV.NOHUGEPAGE) catch {};
+        b.offs.put(b.gpa, @intFromPtr(m.ptr), .{ .off = off, .len = len }) catch {
             std.posix.munmap(m);
             return reserveAnon(null, len);
         };
         return m;
     }
 
+    /// Maps reservation `r` at `p` from the file.
+    fn mapShared(b: *Backing, p: [*]align(page) u8, r: Res) ![]align(page) u8 {
+        const m = try std.posix.mmap(p, r.len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true, .FIXED = true }, b.fd, r.off);
+        std.posix.madvise(m.ptr, m.len, std.os.linux.MADV.NOHUGEPAGE) catch {};
+        return m;
+    }
+
+    /// Moves the first `used` bytes of the reservation at `p` into the
+    /// file, and maps all of it from there. False if it is not one of
+    /// ours or the file could not take it (it is then left as it was).
+    fn move(b: *Backing, p: [*]align(page) u8, used: usize) bool {
+        const r = b.offs.get(@intFromPtr(p)) orelse return false;
+        const n = @min(std.mem.alignForward(usize, used, page), r.len);
+        var done: usize = 0;
+        while (done < n) {
+            const rc = std.os.linux.pwrite(b.fd, p + done, n - done, @intCast(r.off + done));
+            if (std.os.linux.errno(rc) != .SUCCESS or rc == 0) return false;
+            done += rc;
+        }
+        _ = b.mapShared(p, r) catch return false;
+        return true;
+    }
+
     /// Unmaps a reservation and gives its disk space back.
     fn release(b: *Backing, mem: []align(page) u8) void {
         std.posix.munmap(mem);
         if (b.fd < 0) return;
-        if (b.offs.fetchRemove(@intFromPtr(mem.ptr))) |kv| b.punch(kv.value, mem.len);
+        if (b.offs.fetchRemove(@intFromPtr(mem.ptr))) |kv| b.punch(kv.value.off, kv.value.len);
     }
 
     fn punch(b: *Backing, off: u64, len: usize) void {
@@ -521,9 +554,11 @@ dirty: bool = false,
 
 /// Where the index pages live while this writer runs.
 back: Backing = .{},
-/// False while the index is the snapshot mapped copy-on-write: the first
-/// write moves it into `back` (`adopt`).
-adopted: bool = true,
+/// The index has moved into `back`'s file (`adopt`).
+adopted: bool = false,
+/// The index is the snapshot, mapped copy-on-write: move it before the
+/// first write.
+spill_now: bool = false,
 // Lexicon.
 lex: Map = .{},
 t_key: Vec(u64) = .{},
@@ -1262,8 +1297,8 @@ fn linkInto(w: *Loom, c: u32, ord: u32) !void {
 
 /// Adds a memory to the index. `tids` are its terms' ids when known.
 fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const words.Terms, tids: ?[]const u32) !u32 {
-    if (!w.adopted) w.adopt();
     const ord: u32 = @intCast(w.tl_loc.count());
+    if (!w.adopted and (w.spill_now or ord & 1023 == 0 and w.heldBytes() >= spill_bytes)) w.adopt();
     var sf: u32 = f.sid;
     if (f.subject.len > 0) sf |= flag_subject;
     const gone = f.erased or w.forgottenByVc(f.sid, lane, off);
@@ -1506,7 +1541,7 @@ fn mergeVc(w: *Loom, slot: *u32, vc: *const [vc_len]u64) !u32 {
 }
 
 fn setForgotten(w: *Loom, ord: u32) !void {
-    if (!w.adopted) w.adopt();
+    if (!w.adopted and w.spill_now) w.adopt();
     const p = w.tl_sf.at(ord);
     const v = p.*;
     if (v & flag_forgotten != 0) return;
@@ -3250,47 +3285,51 @@ fn loadSnapshot(w: *Loom) !?[max_lanes]u64 {
     }
     w.total_terms = head.total_terms;
     w.merges = head.merges;
-    w.adopted = w.back.fd < 0;
+    w.spill_now = true;
     var ends: [max_lanes]u64 = @splat(data_start);
     for (0..head.nlanes) |l| ends[l] = head.ends[l];
     return ends;
 }
 
-/// Moves an index mapped from the snapshot into the scratch file, before
-/// the first write to it. A page written while mapped copy-on-write would
-/// become anonymous memory, and a long session writes into most of them
-/// (every word's postings tail); in the scratch file they are the
-/// kernel's to write out and drop. Readers see the same bytes throughout.
-/// On any failure the index simply stays where it is.
+/// Moves the index into the scratch file (see `Backing`): when a fresh
+/// index grows past `spill_bytes`, or before the first write to an index
+/// mapped from the snapshot (whose written pages would otherwise become
+/// anonymous copies). Readers see the same bytes throughout. A part that
+/// cannot move stays where it is; that costs memory, never correctness.
 fn adopt(w: *Loom) void {
     w.adopted = true;
     const b = &w.back;
     if (b.fd < 0) return;
+    b.shared = true;
     const nidx = w.indexVecs().len;
     for (0..nidx + w.nlanes) |i| {
         const v = if (i < nidx) w.indexVecs()[i] else w.lanes[i - nidx].ords.any();
-        const n = std.mem.alignForward(usize, v.len.* * v.size, page);
-        if (n == 0) continue;
-        const off = b.offs.get(@intFromPtr(v.mem.*.ptr)) orelse continue;
-        const src = v.mem.*[0..n];
-        var done: usize = 0;
-        while (done < n) {
-            const rc = std.os.linux.pwrite(b.fd, src[done..].ptr, n - done, @intCast(off + done));
-            if (std.os.linux.errno(rc) != .SUCCESS or rc == 0) return;
-            done += rc;
-        }
-        _ = std.posix.mmap(src.ptr, n, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .FIXED = true }, b.fd, off) catch return;
+        if (v.mem.*.len == 0) continue;
+        _ = b.move(v.mem.*.ptr, v.len.* * v.size);
     }
     for ([_]*Map{ &w.lex, &w.fact_of, &w.subjects, &w.sc_map }) |m| {
         const t = m.table orelse continue;
-        const t2 = m.newTable(w.gpa, t.cap) catch return;
+        if (b.move(t.mem.ptr, t.mem.len)) continue;
+        // Mapped from the snapshot: copy it into a table of ours.
+        const t2 = m.newTable(w.gpa, t.cap) catch continue;
         @memcpy(t2.mem[0 .. t.cap * 16], t.mem[0 .. t.cap * 16]);
         m.retired.append(w.gpa, t) catch {
             m.freeTable(w.gpa, t2);
-            return;
+            continue;
         };
         @atomicStore(?*Map.Table, &m.table, t2, .seq_cst);
     }
+}
+
+/// A fresh index moves into the scratch file past this size.
+const spill_bytes: usize = 16 << 20;
+
+/// Index bytes held now, arrays and tables.
+fn heldBytes(w: *Loom) usize {
+    var n: usize = 0;
+    for (w.indexVecs()) |v| n += v.len.* * v.size;
+    for ([_]*const Map{ &w.lex, &w.fact_of, &w.subjects, &w.sc_map }) |m| n += m.bytes();
+    return n;
 }
 
 fn mapSection(f: Io.File, s: SnapSection, v: AnyVec) !void {
