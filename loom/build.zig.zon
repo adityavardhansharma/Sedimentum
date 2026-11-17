@@ -1,0 +1,8 @@
+.{
+    .name = .loom,
+    .version = "0.0.1",
+    .fingerprint = 0xc2597137a526bdbf,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
+}

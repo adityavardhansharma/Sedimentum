@@ -11,7 +11,8 @@ README:
 | [`v3/`](v3/) | Stream store with no write-ahead log. It also has the `sedimentum` CLI, the C library and the kiban comparison benchmark, which open every key-value format. |
 | [`holo/`](holo/) | Holo: agent memory with recall, sedimentation and token-budgeted briefs, built on v3. |
 | [`stratum/`](stratum/) | Stratum: one fact over its whole life, a lane file per writer, and promised turns. |
-| [`crystal/`](crystal/) | Crystal, the newest approach: flat arrays, words as numbers, entropy-coded lanes, and facts that link by the shape of their claim. |
+| [`crystal/`](crystal/) | Crystal: flat arrays, words as numbers, entropy-coded lanes, and facts that link by the shape of their claim. |
+| [`loom/`](loom/) | Loom, the newest approach: Crystal's storage, with a schema the store learns from its own memories (attributes × names), whose newest claim per cell is what recall and briefs answer with. |
 
 The engines share some files (for example, Holo runs on the v3 store), so
 each folder carries its own copy of the code it needs. A change to shared
