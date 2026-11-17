@@ -146,19 +146,19 @@ fn Vec(comptime T: type) type {
         mem: []align(page) u8 = &.{},
         len: usize = 0,
 
-        fn init(v: *Self, cap: usize) !void {
-            v.mem = try reserveAnon(null, cap * @sizeOf(T));
+        fn init(v: *Self, b: *Backing, cap: usize) !void {
+            v.mem = try b.reserve(null, cap * @sizeOf(T));
             v.len = 0;
         }
-        fn deinit(v: *Self) void {
-            if (v.mem.len > 0) std.posix.munmap(v.mem);
+        fn deinit(v: *Self, b: *Backing) void {
+            if (v.mem.len > 0) b.release(v.mem);
             v.mem = &.{};
             v.len = 0;
         }
         /// Empties it, giving back its pages (also pages mapped from disk).
-        fn reset(v: *Self) !void {
+        fn reset(v: *Self, b: *Backing) !void {
             if (v.mem.len == 0) return;
-            _ = try reserveAnon(v.mem.ptr, v.mem.len);
+            _ = try b.reserve(v.mem.ptr, v.mem.len);
             @atomicStore(usize, &v.len, 0, .release);
         }
         inline fn ptr(v: *const Self) [*]T {
@@ -205,6 +205,74 @@ fn reserveAnon(at: ?[*]align(page) u8, len: usize) ![]align(page) u8 {
     return m;
 }
 
+/// Where a writer's index pages live while it runs. With a scratch file
+/// (unnamed, in the store's folder, gone when the process is) the pages
+/// are the file's: the kernel writes them out and drops them as it needs
+/// to, so building a large index does not hold it all in anonymous memory.
+/// Without one (no O_TMPFILE there), plain anonymous memory, as before.
+/// Only the writer, under its lock, reserves and releases.
+const Backing = struct {
+    fd: i32 = -1,
+    /// End of the file, where the next reservation goes.
+    end: u64 = 0,
+    /// Start address -> file offset of each reservation.
+    offs: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    gpa: Allocator = undefined,
+
+    const align_to: u64 = 1 << 21;
+
+    fn open(b: *Backing, gpa: Allocator, dir_fd: i32) void {
+        b.gpa = gpa;
+        if (builtin.os.tag != .linux) return;
+        const linux = std.os.linux;
+        const rc = linux.openat(dir_fd, ".", .{ .ACCMODE = .RDWR, .TMPFILE = true, .DIRECTORY = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(rc) != .SUCCESS) return;
+        b.fd = @intCast(rc);
+    }
+
+    fn close(b: *Backing) void {
+        b.offs.deinit(b.gpa);
+        if (b.fd >= 0) _ = std.os.linux.close(b.fd);
+        b.fd = -1;
+    }
+
+    /// Zeroed pages for `len` bytes, at `at` (which must be a reservation
+    /// made here, and then holds zeros again) or anywhere.
+    fn reserve(b: *Backing, at: ?[*]align(page) u8, len: usize) ![]align(page) u8 {
+        if (b.fd < 0) return reserveAnon(at, len);
+        const linux = std.os.linux;
+        var off: u64 = undefined;
+        if (at) |p| {
+            off = b.offs.get(@intFromPtr(p)) orelse return reserveAnon(at, len);
+            b.punch(off, len);
+        } else {
+            off = b.end;
+            const next = off + std.mem.alignForward(u64, len, align_to);
+            if (linux.errno(linux.ftruncate(b.fd, @intCast(next))) != .SUCCESS) return reserveAnon(null, len);
+            b.end = next;
+        }
+        const m = std.posix.mmap(at, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .NORESERVE = true, .FIXED = at != null }, b.fd, off) catch return reserveAnon(at, len);
+        std.posix.madvise(m.ptr, m.len, linux.MADV.NOHUGEPAGE) catch {};
+        if (at == null) b.offs.put(b.gpa, @intFromPtr(m.ptr), off) catch {
+            std.posix.munmap(m);
+            return reserveAnon(null, len);
+        };
+        return m;
+    }
+
+    /// Unmaps a reservation and gives its disk space back.
+    fn release(b: *Backing, mem: []align(page) u8) void {
+        std.posix.munmap(mem);
+        if (b.fd < 0) return;
+        if (b.offs.fetchRemove(@intFromPtr(mem.ptr))) |kv| b.punch(kv.value, mem.len);
+    }
+
+    fn punch(b: *Backing, off: u64, len: usize) void {
+        const linux = std.os.linux;
+        _ = linux.fallocate(b.fd, linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE, @intCast(off), @intCast(std.mem.alignForward(usize, len, page)));
+    }
+};
+
 const AnyVec = struct { mem: *[]align(page) u8, len: *usize, size: usize };
 
 /// u64 -> u64, insert and update. Readers: `get`, lock-free. One writer.
@@ -226,6 +294,7 @@ const Map = struct {
     table: ?*Table = null,
     len: usize = 0,
     retired: std.ArrayList(*Table) = .empty,
+    back: *Backing = undefined,
 
     inline fn enc(k: u64) u64 {
         return if (k == std.math.maxInt(u64)) k else k + 1;
@@ -269,15 +338,15 @@ const Map = struct {
         }
     }
 
-    fn newTable(gpa: Allocator, cap: usize) !*Table {
+    fn newTable(m: *Map, gpa: Allocator, cap: usize) !*Table {
         const t = try gpa.create(Table);
         errdefer gpa.destroy(t);
-        t.* = .{ .shift = @intCast(64 - @as(u7, std.math.log2_int(usize, cap))), .cap = cap, .mem = try reserveAnon(null, std.mem.alignForward(usize, cap * 16, page)) };
+        t.* = .{ .shift = @intCast(64 - @as(u7, std.math.log2_int(usize, cap))), .cap = cap, .mem = try m.back.reserve(null, std.mem.alignForward(usize, cap * 16, page)) };
         return t;
     }
 
     fn grow(m: *Map, gpa: Allocator, cap: usize) !void {
-        const t = try newTable(gpa, cap);
+        const t = try m.newTable(gpa, cap);
         const mask = cap - 1;
         if (m.table) |o| {
             const ks = t.keys();
@@ -294,15 +363,15 @@ const Map = struct {
         @atomicStore(?*Table, &m.table, t, .seq_cst);
     }
 
-    fn freeTable(gpa: Allocator, t: *Table) void {
-        std.posix.munmap(t.mem);
+    fn freeTable(m: *Map, gpa: Allocator, t: *Table) void {
+        m.back.release(t.mem);
         gpa.destroy(t);
     }
 
     /// Frees replaced tables, when no reader is inside a read.
     fn reclaim(m: *Map, gpa: Allocator, readers: *const Readers) void {
         if (m.retired.items.len == 0 or !readers.quiet()) return;
-        for (m.retired.items) |t| freeTable(gpa, t);
+        for (m.retired.items) |t| m.freeTable(gpa, t);
         m.retired.clearRetainingCapacity();
     }
 
@@ -313,8 +382,8 @@ const Map = struct {
     }
 
     fn deinit(m: *Map, gpa: Allocator) void {
-        if (m.table) |t| freeTable(gpa, t);
-        for (m.retired.items) |t| freeTable(gpa, t);
+        if (m.table) |t| m.freeTable(gpa, t);
+        for (m.retired.items) |t| m.freeTable(gpa, t);
         m.retired.deinit(gpa);
         m.table = null;
         m.len = 0;
@@ -450,6 +519,8 @@ last_refresh: std.atomic.Value(i64) = .init(0),
 broken: bool = false,
 dirty: bool = false,
 
+/// Where the index pages live while this writer runs.
+back: Backing = .{},
 // Lexicon.
 lex: Map = .{},
 t_key: Vec(u64) = .{},
@@ -507,26 +578,26 @@ fn laneName(buf: *[32]u8, i: usize) []const u8 {
 
 fn initVecs(w: *Loom) !void {
     const big: usize = 1 << 30;
-    try w.t_key.init(1 << 28);
-    try w.t_df.init(1 << 28);
-    try w.t_p0.init(1 << 28);
-    try w.t_tail.init(1 << 28);
-    try w.post.init(1 << 32);
-    try w.tl_loc.init(big);
-    try w.tl_sf.init(big);
-    try w.cells.init(1 << 28);
-    try w.sc_name_off.init(1 << 24);
-    try w.sc_name_len.init(1 << 24);
-    try w.sc_names.init(1 << 32);
-    try w.sc_parent.init(1 << 24);
-    try w.sc_child.init(1 << 24);
-    try w.sc_sib.init(1 << 24);
-    try w.sc_p0.init(1 << 24);
-    try w.sc_tail.init(1 << 24);
-    try w.sc_forget.init(1 << 24);
-    try w.sc_settle.init(1 << 24);
-    try w.own_ref.init(1 << 24);
-    try w.vcs.init(1 << 26);
+    try w.t_key.init(&w.back, 1 << 28);
+    try w.t_df.init(&w.back, 1 << 28);
+    try w.t_p0.init(&w.back, 1 << 28);
+    try w.t_tail.init(&w.back, 1 << 28);
+    try w.post.init(&w.back, 1 << 32);
+    try w.tl_loc.init(&w.back, big);
+    try w.tl_sf.init(&w.back, big);
+    try w.cells.init(&w.back, 1 << 28);
+    try w.sc_name_off.init(&w.back, 1 << 24);
+    try w.sc_name_len.init(&w.back, 1 << 24);
+    try w.sc_names.init(&w.back, 1 << 32);
+    try w.sc_parent.init(&w.back, 1 << 24);
+    try w.sc_child.init(&w.back, 1 << 24);
+    try w.sc_sib.init(&w.back, 1 << 24);
+    try w.sc_p0.init(&w.back, 1 << 24);
+    try w.sc_tail.init(&w.back, 1 << 24);
+    try w.sc_forget.init(&w.back, 1 << 24);
+    try w.sc_settle.init(&w.back, 1 << 24);
+    try w.own_ref.init(&w.back, 1 << 24);
+    try w.vcs.init(&w.back, 1 << 26);
 }
 
 fn scopeVecs(w: *Loom) [11]AnyVec {
@@ -542,11 +613,11 @@ fn indexVecs(w: *Loom) [20]AnyVec {
 /// Empty index with its reserved zero entries.
 fn resetIndex(w: *Loom) !void {
     for (w.indexVecs()) |v| {
-        _ = try reserveAnon(v.mem.*.ptr, v.mem.*.len);
+        _ = try w.back.reserve(v.mem.*.ptr, v.mem.*.len);
         @atomicStore(usize, v.len, 0, .release);
     }
     for (w.lanes[0..w.nlanes]) |*l| {
-        try l.ords.reset();
+        try l.ords.reset(&w.back);
         l.end = data_start;
         for (l.models[0..l.nmodels]) |m| m.deinit(w.gpa);
         l.nmodels = 0;
@@ -576,6 +647,8 @@ pub fn open(gpa: Allocator, io: Io, parent: Io.Dir, sub_path: []const u8, option
     errdefer gpa.destroy(w);
     w.* = .{ .gpa = gpa, .io = io, .dir = dir, .options = options, .counter = .init(gpa) };
     errdefer w.freeAll();
+    w.back.open(gpa, dir.handle);
+    for ([_]*Map{ &w.lex, &w.fact_of, &w.subjects, &w.sc_map }) |m| m.back = &w.back;
     try w.initVecs();
 
     // Claim the first lane no other writer holds. The OS drops the lock
@@ -628,7 +701,7 @@ fn addLane(w: *Loom, file: Io.File, writable: bool, idle: bool) !void {
     const map = try std.posix.mmap(null, map_reserve, .{ .READ = true, .WRITE = writable }, .{ .TYPE = .SHARED }, file.handle, 0);
     errdefer std.posix.munmap(map);
     var l: Lane = .{ .file = file, .map = map, .idle = idle };
-    try l.ords.init(1 << 28);
+    try l.ords.init(&w.back, 1 << 28);
     w.lanes[w.nlanes] = l;
     @atomicStore(usize, &w.nlanes, w.nlanes + 1, .release);
 }
@@ -670,13 +743,13 @@ fn freeAll(w: *Loom) void {
         for (l.models[0..l.nmodels]) |m| m.deinit(gpa);
         l.model_offs.deinit(gpa);
         l.scope_refs.deinit(gpa);
-        l.ords.deinit();
+        l.ords.deinit(&w.back);
         std.posix.munmap(l.map);
         l.file.close(w.io);
     }
     w.nlanes = 0;
     for (w.indexVecs()) |v| if (v.mem.*.len > 0) {
-        std.posix.munmap(v.mem.*);
+        w.back.release(v.mem.*);
         v.mem.* = &.{};
     };
     w.lex.deinit(gpa);
@@ -688,6 +761,7 @@ fn freeAll(w: *Loom) void {
     for (w.retired.items) |wv| wv.deinit(gpa);
     w.retired.deinit(gpa);
     w.counter.deinit(gpa);
+    w.back.close();
     w.rec_buf.deinit(gpa);
     w.dec_buf.deinit(gpa);
 }
