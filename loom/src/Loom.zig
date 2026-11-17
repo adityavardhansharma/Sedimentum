@@ -22,9 +22,10 @@
 //!
 //! New in Loom:
 //!
-//!   Claims    the ordinals of the memories that state something (cl_ord),
-//!             picked when written and kept in the snapshot. The weave
-//!             reads their words back from the text when it is rebuilt.
+//!   Claims    a flag on the memories that state something, set when they
+//!             are written (no other per-claim state is kept, on disk or in
+//!             RAM). The weave reads the newest claims' words back from
+//!             their text when it is rebuilt.
 //!   Weave     the frames, slots and grid, rebuilt from the claims when
 //!             they have grown by an eighth (Weave.zig). Recall answers
 //!             with a cell's newest claim, and matches questions against
@@ -416,6 +417,8 @@ const Cell = extern struct { head: u32, root: u32, nver: u32 };
 const no_posts: u32 = std.math.maxInt(u32);
 const flag_forgotten: u32 = 1 << 24;
 const flag_subject: u32 = 1 << 25;
+/// The memory states something (a claim the weave reads).
+const flag_claim: u32 = 1 << 26;
 const scope_mask: u32 = (1 << 24) - 1;
 const vc_len = max_lanes;
 
@@ -479,11 +482,13 @@ own_ref: Vec(u32) = .{},
 /// Lane-end vectors of forgets and settles, `vc_len` each.
 vcs: Vec(u64) = .{},
 // Claims: their ordinals. The weave reads their words from the lanes.
-cl_ord: Vec(u32) = .{},
 // The weave over the claims (Weave.zig). Replaced whole when rebuilt;
 // a replaced weave is freed once no reader can hold it.
 woven: std.atomic.Value(?*Weave.Woven) = .init(null),
 weaving: std.atomic.Value(bool) = .init(false),
+/// Claims in the store, counted from the flags when first needed.
+nclaims: std.atomic.Value(usize) = .init(0),
+nclaims_ready: std.atomic.Value(bool) = .init(false),
 retired: std.ArrayList(*Weave.Woven) = .empty,
 
 total_terms: u64 = 0,
@@ -522,7 +527,6 @@ fn initVecs(w: *Loom) !void {
     try w.sc_settle.init(1 << 24);
     try w.own_ref.init(1 << 24);
     try w.vcs.init(1 << 26);
-    try w.cl_ord.init(1 << 28);
 }
 
 fn scopeVecs(w: *Loom) [11]AnyVec {
@@ -530,9 +534,9 @@ fn scopeVecs(w: *Loom) [11]AnyVec {
 }
 
 /// Every index array, in snapshot order.
-fn indexVecs(w: *Loom) [21]AnyVec {
+fn indexVecs(w: *Loom) [20]AnyVec {
     const s = w.scopeVecs();
-    return [_]AnyVec{ w.t_key.any(), w.t_df.any(), w.t_p0.any(), w.t_tail.any(), w.post.any(), w.tl_loc.any(), w.tl_sf.any(), w.cells.any(), w.vcs.any(), w.cl_ord.any() } ++ s;
+    return [_]AnyVec{ w.t_key.any(), w.t_df.any(), w.t_p0.any(), w.t_tail.any(), w.post.any(), w.tl_loc.any(), w.tl_sf.any(), w.cells.any(), w.vcs.any() } ++ s;
 }
 
 /// Empty index with its reserved zero entries.
@@ -978,10 +982,10 @@ fn settled(w: *const Loom, ord: u32) bool {
 fn newestOf(w: *const Loom, ord: u32) u32 {
     var h = w.headOf(ord);
     const wv = w.woven.load(.acquire) orelse return h;
-    if (wv.factOf(ord)) |f| {
+    if (w.factOf(wv, ord)) |f| {
         if (f.head > h and w.alive(f.head)) h = f.head;
     }
-    if (h != ord) if (wv.factOf(h)) |f| {
+    if (h != ord) if (w.factOf(wv, h)) |f| {
         if (f.head > h and w.alive(f.head)) h = f.head;
     };
     return h;
@@ -993,7 +997,7 @@ fn newestOf(w: *const Loom, ord: u32) u32 {
 fn factKey(w: *const Loom, ord: u32) u64 {
     const c = w.cellOf(ord);
     if (c != 0) return (@as(u64, 1) << 32) | c;
-    if (w.woven.load(.acquire)) |wv| if (wv.factOf(ord)) |f| return (@as(u64, 2) << 32) | f.cell;
+    if (w.woven.load(.acquire)) |wv| if (w.factOf(wv, ord)) |f| return (@as(u64, 2) << 32) | f.cell;
     return ord;
 }
 
@@ -1247,7 +1251,15 @@ fn pickClaim(w: *Loom, ord: u32, seen: []const u32, subject: bool) !void {
         if (d <= lim) rare += 1;
     }
     if (rare < 2 and !(subject and rare >= 1)) return;
-    _ = try w.cl_ord.push(ord);
+    _ = @atomicRmw(u32, w.tl_sf.at(ord), .Or, flag_claim, .release);
+    if (w.nclaims_ready.load(.acquire)) _ = w.nclaims.fetchAdd(1, .monotonic);
+}
+
+/// What the weave knows of `ord`, if it is a claim: one flag read for the
+/// memories that are not.
+fn factOf(w: *const Loom, wv: *const Weave.Woven, ord: u32) ?Weave.Fact {
+    if (@atomicLoad(u32, w.tl_sf.at(ord), .acquire) & flag_claim == 0) return null;
+    return wv.factOf(ord);
 }
 
 // ------------------------------------------------------------------- weave
@@ -1330,8 +1342,11 @@ const WeaveCtx = struct {
 /// One thread weaves at a time; the others go on with the weave they have.
 /// Call with the readers entered. The weave replaced is freed by the
 /// writer when no reader is in (see `reclaim`).
+/// How many of the newest claims the weave reads.
+const max_woven = 1 << 17;
+
 fn weave(w: *Loom) ?*const Weave.Woven {
-    const nc = w.cl_ord.count();
+    const nc = w.claimCount();
     const cur = w.woven.load(.acquire);
     const have = if (cur) |c| c.claims else 0;
     if (nc == have) return cur;
@@ -1340,15 +1355,42 @@ fn weave(w: *Loom) ?*const Weave.Woven {
     defer w.weaving.store(false, .release);
     const now = w.woven.load(.acquire);
     if (now != cur) return now;
+    // The newest claims only: what a store is told lately is what it is
+    // asked about, and the weave's memory stays bounded however large the
+    // store grows. Older claims answer as themselves (and by subject).
+    var ords: std.ArrayList(u32) = .empty;
+    defer ords.deinit(w.gpa);
+    var o = w.memCount();
+    while (o > 0 and ords.items.len < max_woven) {
+        o -= 1;
+        if (@atomicLoad(u32, w.tl_sf.at(o), .acquire) & flag_claim != 0) ords.append(w.gpa, @intCast(o)) catch return cur;
+    }
+    std.mem.reverse(u32, ords.items);
     var heap: std.ArrayList(u8) = .empty;
     defer heap.deinit(w.gpa);
-    const nw = Weave.build(w.gpa, w.cl_ord.items()[0..nc], WeaveCtx{ .w = w, .heap = &heap }) catch return cur;
+    const nw = Weave.build(w.gpa, ords.items, WeaveCtx{ .w = w, .heap = &heap }) catch return cur;
+    nw.claims = nc;
     if (cur) |c| w.retired.append(w.gpa, c) catch {
         // Cannot keep it for later: better a little memory lost than a
         // reader reading freed memory.
     };
     w.woven.store(nw, .release);
     return nw;
+}
+
+/// Claims in the store: counted from the flags the first time, then kept
+/// up as claims are written. Readers entered.
+fn claimCount(w: *Loom) usize {
+    if (w.nclaims_ready.load(.acquire)) return w.nclaims.load(.monotonic);
+    var n: usize = 0;
+    for (0..w.memCount()) |o| {
+        if (@atomicLoad(u32, w.tl_sf.at(o), .acquire) & flag_claim != 0) n += 1;
+    }
+    // Claims written while counting may be counted twice or not at all;
+    // that only moves the next rebuild a little.
+    w.nclaims.store(n, .monotonic);
+    w.nclaims_ready.store(true, .release);
+    return n;
 }
 
 /// Reads a vector of lane ends: varint count, then the ends.
@@ -2098,6 +2140,22 @@ const Search = struct {
     /// Per group: its question word itself, and whether it is a name.
     gexact: [max_groups]?u64 = @splat(null),
     gexact_rare: [max_groups]bool = @splat(false),
+    rare_ready: bool = false,
+
+    /// Which question words are names, worked out when the first claim
+    /// is scored (most questions over chat never score one).
+    fn prepRare(s: *Search) void {
+        if (s.rare_ready) return;
+        s.rare_ready = true;
+        const lim = rareLimit(s.w.memCount());
+        for (s.qt[0..s.nq], 0..) |t, qi| {
+            s.qrare[qi] = s.w.dfOf(t.key) <= lim;
+            if (t.sim == 1 and s.gexact[t.group] == null) {
+                s.gexact[t.group] = t.key;
+                s.gexact_rare[t.group] = s.qrare[qi];
+            }
+        }
+    }
 
     fn deinit(s: *Search) void {
         s.heap.deinit(s.gpa);
@@ -2164,9 +2222,10 @@ const Search = struct {
         // attribute was ever phrased, by any name, and none of the chatter
         // around this one memory.
         var slot_id: ?u32 = null;
-        if (s.wv) |wv| if (wv.factOf(ord)) |f| {
+        if (s.wv) |wv| if (s.w.factOf(wv, ord)) |f| {
             if (wv.slots[f.slot].len > 0) slot_id = f.slot;
         };
+        if (slot_id != null) s.prepRare();
         for (s.qt[0..s.nq], 0..) |q, qi| {
             // In a claim, only names (rare words) and its slot's wording
             // count (below); the chatter around it does not.
@@ -2236,6 +2295,7 @@ const Search = struct {
     fn scoreClaim(s: *Search, ord: u32, sid: u32, cmask: u8) !?Scored {
         const r = s.w.recOf(s.w.tl_loc.get(ord)) orelse return null;
         if (r.erased or r.time < s.q.since) return null;
+        s.prepRare();
         var m = try s.slotMatch(sid);
         var mask: u8 = 0;
         const sl = &s.wv.?.slots[sid];
@@ -2331,16 +2391,6 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
         }
     }
 
-    {
-        const lim = rareLimit(w.memCount());
-        for (s.qt[0..s.nq], 0..) |t, qi| {
-            s.qrare[qi] = w.dfOf(t.key) <= lim;
-            if (t.sim == 1 and s.gexact[t.group] == null) {
-                s.gexact[t.group] = t.key;
-                s.gexact_rare[t.group] = s.qrare[qi];
-            }
-        }
-    }
     // Candidates: the postings of the question's findable words, newest
     // first; a word too common to keep postings only confirms.
     var pairs: std.ArrayList(u64) = .empty;
@@ -2400,7 +2450,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
             if (s.bound(c.s1 + extra) < kth) break;
         }
         var claim_slot: ?u32 = null;
-        if (wv) |x| if (x.factOf(c.ord)) |f| {
+        if (wv) |x| if (w.factOf(x, c.ord)) |f| {
             if (x.slots[f.slot].len > 0) claim_slot = f.slot;
         };
         const sc = (if (posts_only)
@@ -2752,7 +2802,7 @@ pub fn brief(w: *Loom, gpa: Allocator, situation: []const u8, scope: []const u8,
         for (sec.mems, 0..) |m, mi| {
             if (std.mem.indexOfScalar(u64, seen[0..nseen], m.id) != null) continue;
             var body = m.text;
-            if (sec.ords) |os| if (wv) |x| if (x.factOf(os[mi])) |f| {
+            if (sec.ords) |os| if (wv) |x| if (w.factOf(x, os[mi])) |f| {
                 if (f.len > 0 and @as(usize, f.at) + f.len <= m.text.len) body = m.text[f.at..][0..f.len];
             };
             const snippet = body[0..@min(body.len, 600)];
@@ -2805,6 +2855,14 @@ pub const Info = struct {
     joined_one_off: usize = 0,
 };
 
+/// Learns the schema now if the claims have grown since it was last
+/// learned (recall and briefs do this on their own when they need to).
+pub fn learn(w: *Loom) void {
+    w.readers.enter();
+    defer w.readers.leave();
+    _ = w.weave();
+}
+
 pub fn info(w: *Loom) Info {
     w.readers.enter();
     defer w.readers.leave();
@@ -2821,7 +2879,8 @@ pub fn info(w: *Loom) Info {
     for (w.cells.items()[1..]) |c| {
         if (c.nver > 1) strata += 1;
     }
-    const wv = w.weave();
+    // Info reports the weave there is; it does not build one.
+    const wv = w.woven.load(.acquire);
     if (wv) |x| idx += x.bytes();
     return .{
         .memories = w.memCount(),
@@ -2829,7 +2888,7 @@ pub fn info(w: *Loom) Info {
         .subjects = w.subjects.len,
         .strata = strata,
         .auto_merges = if (wv) |x| x.linked else 0,
-        .claims = w.cl_ord.count(),
+        .claims = if (wv) |x| x.claims else 0,
         .frames = if (wv) |x| x.frames else 0,
         .slots = if (wv) |x| x.slots.len else 0,
         .cells = if (wv) |x| x.cells.len else 0,
@@ -3175,6 +3234,7 @@ test "what tagged facts teach links the untagged versions of other names" {
         const subj: ?[]const u8 = if (i < 4) try std.fmt.bufPrint(&sb, "{s}-region", .{nm}) else null;
         _ = try w.remember("p", try std.fmt.bufPrint(&b, "{s} moved over to the zq{d}new hosting", .{ nm, i }), .{ .subject = subj });
     }
+    w.learn();
     const inf = w.info();
     try testing.expect(inf.joined_by_subject >= 1);
     try testing.expect(inf.linked >= names.len);

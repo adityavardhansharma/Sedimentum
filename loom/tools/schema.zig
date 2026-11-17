@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("LOOM_DEBUG") != null) loom.Weave.debug = true;
     const h = try Loom.open(gpa, io, Io.Dir.cwd(), args[1], .{ .sync_writes = false });
     defer h.close();
+    h.learn();
     const inf = h.info();
     try w.print("memories {d}, claims {d}, frames {d}, slots {d}, cells {d}, linked {d} (slots joined: {d} by subject, {d} by precedence, {d} one-off)\n", .{
         inf.memories, inf.claims, inf.frames, inf.slots, inf.cells, inf.linked, inf.joined_by_subject, inf.joined_by_precedence, inf.joined_one_off,

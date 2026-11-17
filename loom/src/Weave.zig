@@ -225,10 +225,13 @@ const C = struct {
 /// near its rare ones, in text order, and where its text states them).
 pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     const wv = try gpa.create(Woven);
-    wv.* = .{ .arena = .init(gpa), .claims = ords.len };
+    // Weaves are built and dropped whole, often by different threads: their
+    // memory comes straight from the OS and goes straight back, instead of
+    // staying in a thread's malloc arena after it is freed.
+    wv.* = .{ .arena = .init(std.heap.page_allocator), .claims = ords.len };
     errdefer wv.deinit(gpa);
     const a = wv.arena.allocator();
-    var tmp_arena: std.heap.ArenaAllocator = .init(gpa);
+    var tmp_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer tmp_arena.deinit();
     const t = tmp_arena.allocator();
 
