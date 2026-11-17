@@ -3322,7 +3322,7 @@ fn adopt(w: *Loom) void {
 }
 
 /// A fresh index moves into the scratch file past this size.
-const spill_bytes: usize = 16 << 20;
+const spill_bytes: usize = 32 << 20;
 
 /// Index bytes held now, arrays and tables.
 fn heldBytes(w: *Loom) usize {
