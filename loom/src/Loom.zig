@@ -3266,17 +3266,9 @@ fn adopt(w: *Loom) void {
     w.adopted = true;
     const b = &w.back;
     if (b.fd < 0) return;
-    var vecs: [32]AnyVec = undefined;
-    var nv: usize = 0;
-    for (w.indexVecs()) |v| {
-        vecs[nv] = v;
-        nv += 1;
-    }
-    for (w.lanes[0..w.nlanes]) |*l| {
-        vecs[nv] = l.ords.any();
-        nv += 1;
-    }
-    for (vecs[0..nv]) |v| {
+    const nidx = w.indexVecs().len;
+    for (0..nidx + w.nlanes) |i| {
+        const v = if (i < nidx) w.indexVecs()[i] else w.lanes[i - nidx].ords.any();
         const n = std.mem.alignForward(usize, v.len.* * v.size, page);
         if (n == 0) continue;
         const off = b.offs.get(@intFromPtr(v.mem.*.ptr)) orelse continue;
