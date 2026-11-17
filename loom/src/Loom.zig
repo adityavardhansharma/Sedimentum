@@ -1057,9 +1057,15 @@ fn settled(w: *const Loom, ord: u32) bool {
 /// The newest version of `ord`: by its subject, or by the weave's grid
 /// (the newest live claim of its cell), whichever is newer.
 fn newestOf(w: *const Loom, ord: u32) u32 {
+    const wv = w.woven.load(.acquire) orelse return w.headOf(ord);
+    return w.newestFrom(ord, w.factOf(wv, ord));
+}
+
+/// `newestOf`, with the weave's fact for `ord` already looked up.
+fn newestFrom(w: *const Loom, ord: u32, fact: ?Weave.Fact) u32 {
     var h = w.headOf(ord);
     const wv = w.woven.load(.acquire) orelse return h;
-    if (w.factOf(wv, ord)) |f| {
+    if (fact) |f| {
         if (f.head > h and w.alive(f.head)) h = f.head;
     }
     if (h != ord) if (w.factOf(wv, h)) |f| {
@@ -1072,9 +1078,15 @@ fn newestOf(w: *const Loom, ord: u32) u32 {
 /// its grid cell, else itself. Two facts can share a name by chance; a
 /// subject is the writer's word.
 fn factKey(w: *const Loom, ord: u32) u64 {
+    const wv = w.woven.load(.acquire) orelse return w.factKeyOf(ord, null);
+    return w.factKeyOf(ord, w.factOf(wv, ord));
+}
+
+/// `factKey` with the weave's fact for `ord` already looked up.
+fn factKeyOf(w: *const Loom, ord: u32, fact: ?Weave.Fact) u64 {
     const c = w.cellOf(ord);
     if (c != 0) return (@as(u64, 1) << 32) | c;
-    if (w.woven.load(.acquire)) |wv| if (w.factOf(wv, ord)) |f| return (@as(u64, 2) << 32) | f.cell;
+    if (fact) |f| return (@as(u64, 2) << 32) | f.cell;
     return ord;
 }
 
@@ -2309,12 +2321,6 @@ const Search = struct {
     /// meaning, times the share of the question covered (squared), times
     /// recency.
     fn score(s: *Search, ord: u32) !?Scored {
-        const t = (try s.w.textOf(ord, &s.heap, s.gpa)) orelse return null;
-        if (t.time < s.q.since) return null;
-        s.terms.fill(t.text);
-        var m: [max_groups]f32 = @splat(0);
-        var mask: u8 = 0;
-        var lexpos: [max_groups]?usize = @splat(null);
         // A claim is matched against its slot's wording: every way its
         // attribute was ever phrased, by any name, and none of the chatter
         // around this one memory.
@@ -2322,6 +2328,17 @@ const Search = struct {
         if (s.wv) |wv| if (s.w.factOf(wv, ord)) |f| {
             if (wv.slots[f.slot].len > 0) slot_id = f.slot;
         };
+        return s.scoreText(ord, slot_id);
+    }
+
+    /// `score`, with the memory's slot (if it is a claim) known.
+    fn scoreText(s: *Search, ord: u32, slot_id: ?u32) !?Scored {
+        const t = (try s.w.textOf(ord, &s.heap, s.gpa)) orelse return null;
+        if (t.time < s.q.since) return null;
+        s.terms.fill(t.text);
+        var m: [max_groups]f32 = @splat(0);
+        var mask: u8 = 0;
+        var lexpos: [max_groups]?usize = @splat(null);
         if (slot_id != null) s.prepRare();
         for (s.qt[0..s.nq], 0..) |q, qi| {
             // In a claim, only names (rare words) and its slot's wording
@@ -2420,7 +2437,7 @@ const Search = struct {
 
 const Cand = struct { ord: u32, s1: f32, mask: u8 = 0 };
 const Scored = struct { score: f32, mask: u8 };
-const FactHit = struct { key: u64, ord: u32, score: f32, mask: u8 };
+const FactHit = struct { key: u64, ord: u32, score: f32, mask: u8, fact: ?Weave.Fact = null };
 
 /// Facts ranked by how well any of their versions matches `about`,
 /// answered with each fact's newest version.
@@ -2546,18 +2563,21 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
             const kth = kthScore(fhits.items, limit);
             if (s.bound(c.s1 + extra) < kth) break;
         }
+        // One look into the weave per candidate: its slot, key and newest
+        // version all come from it.
+        const fact: ?Weave.Fact = if (wv) |x| w.factOf(x, c.ord) else null;
         var claim_slot: ?u32 = null;
-        if (wv) |x| if (w.factOf(x, c.ord)) |f| {
-            if (x.slots[f.slot].len > 0) claim_slot = f.slot;
+        if (fact) |f| if (wv.?.slots[f.slot].len > 0) {
+            claim_slot = f.slot;
         };
         const sc = (if (posts_only)
             s.scoreFromPosts(c.ord, c.s1, c.mask)
         else if (claim_slot) |sid|
             try s.scoreClaim(c.ord, sid, c.mask)
         else
-            try s.score(c.ord)) orelse continue;
+            try s.scoreText(c.ord, null)) orelse continue;
         if (!posts_only and claim_slot == null) decoded += 1;
-        const key: u64 = if (q.deep) c.ord else w.factKey(c.ord);
+        const key: u64 = if (q.deep) c.ord else w.factKeyOf(c.ord, fact);
         var found = false;
         for (fhits.items) |*f| if (f.key == key) {
             found = true;
@@ -2565,9 +2585,10 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
                 f.score = sc.score;
                 f.ord = c.ord;
                 f.mask = sc.mask;
+                f.fact = fact;
             }
         };
-        if (!found) try fhits.append(gpa, .{ .key = key, .ord = c.ord, .score = sc.score, .mask = sc.mask });
+        if (!found) try fhits.append(gpa, .{ .key = key, .ord = c.ord, .score = sc.score, .mask = sc.mask, .fact = fact });
     }
     std.mem.sortUnstable(FactHit, fhits.items, {}, struct {
         fn gt(_: void, a: FactHit, b: FactHit) bool {
@@ -2581,7 +2602,7 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
     for (fhits.items) |f| {
         var ord = f.ord;
         if (!q.deep) {
-            const h = w.newestOf(f.ord);
+            const h = w.newestFrom(f.ord, f.fact);
             if (h != f.ord and w.alive(h)) ord = h;
             // Two keys can reach one fact (a subject cell and a grid cell).
             var dup = false;

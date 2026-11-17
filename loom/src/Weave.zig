@@ -115,7 +115,10 @@ pub const Woven = struct {
     frames: usize = 0,
     slots: []Slot = &.{},
     cells: []Cell = &.{},
-    facts: std.AutoHashMapUnmanaged(u32, Fact) = .empty,
+    /// Claim ordinal -> its fact: open addressing, key and value side by
+    /// side, so a lookup is one cache line (a recall looks up every
+    /// candidate it reads).
+    facts: FactTable = .{},
     /// Name -> its cells.
     names: std.AutoHashMapUnmanaged(u64, []const u32) = .empty,
     /// Claims whose newest version is another claim.
@@ -140,6 +143,48 @@ pub const Woven = struct {
 
     pub fn bytes(wv: *const Woven) usize {
         return wv.arena.queryCapacity();
+    }
+};
+
+pub const FactTable = struct {
+    const empty_ord = std.math.maxInt(u32);
+    const Entry = struct { ord: u32 = empty_ord, fact: Fact = undefined };
+    slots: []Entry = &.{},
+    shift: u6 = 63,
+    len: usize = 0,
+
+    fn init(ft: *FactTable, a: Allocator, n: usize) !void {
+        const cap = std.math.ceilPowerOfTwo(usize, @max(16, n * 2)) catch return error.OutOfMemory;
+        ft.slots = try a.alloc(Entry, cap);
+        @memset(ft.slots, .{});
+        ft.shift = @intCast(64 - @as(u7, std.math.log2_int(usize, cap)));
+    }
+
+    inline fn home(ft: *const FactTable, ord: u32) usize {
+        return @intCast((@as(u64, ord) *% 0x9E3779B97F4A7C15) >> ft.shift);
+    }
+
+    fn put(ft: *FactTable, ord: u32, f: Fact) void {
+        const mask = ft.slots.len - 1;
+        var i = ft.home(ord);
+        while (ft.slots[i].ord != empty_ord and ft.slots[i].ord != ord) i = (i + 1) & mask;
+        if (ft.slots[i].ord == empty_ord) ft.len += 1;
+        ft.slots[i] = .{ .ord = ord, .fact = f };
+    }
+
+    pub fn get(ft: *const FactTable, ord: u32) ?Fact {
+        if (ft.slots.len == 0) return null;
+        const mask = ft.slots.len - 1;
+        var i = ft.home(ord);
+        while (true) : (i = (i + 1) & mask) {
+            const e = &ft.slots[i];
+            if (e.ord == ord) return e.fact;
+            if (e.ord == empty_ord) return null;
+        }
+    }
+
+    pub fn count(ft: *const FactTable) usize {
+        return ft.len;
     }
 };
 
@@ -724,6 +769,7 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     // name most of its versions share) that is not a different fact by its
     // writer's subject. Its other names may be shared with other facts by
     // chance, so they do not carry it.
+    try wv.facts.init(a, cs.items.len);
     for (cs.items, 0..) |c, ci| {
         var head = c.ord;
         var main: u32 = std.math.maxInt(u32);
@@ -750,7 +796,7 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
         };
         if (main == std.math.maxInt(u32)) continue;
         if (head != c.ord) wv.linked += 1;
-        try wv.facts.put(a, c.ord, .{ .cell = main, .head = head, .slot = slot_of_frame[c.frame], .at = spans[c.src].at, .len = spans[c.src].len });
+        wv.facts.put(c.ord, .{ .cell = main, .head = head, .slot = slot_of_frame[c.frame], .at = spans[c.src].at, .len = spans[c.src].len });
     }
     // Name -> cells.
     {
@@ -943,9 +989,9 @@ test "frames, slots learned from subjects, and a grid that links untagged versio
     }
     // The records fact of a name is a different slot: never superseded.
     var records_linked: usize = 0;
-    var it = wv.facts.iterator();
-    while (it.next()) |e| {
-        const ord = e.key_ptr.*;
+    for (wv.facts.slots) |e| {
+        if (e.ord == FactTable.empty_ord) continue;
+        const ord = e.ord;
         var is_deploy = false;
         for (olds) |o| if (o == ord) {
             is_deploy = true;
@@ -953,7 +999,7 @@ test "frames, slots learned from subjects, and a grid that links untagged versio
         for (news) |o| if (o == ord) {
             is_deploy = true;
         };
-        if (!is_deploy and e.value_ptr.head != ord) records_linked += 1;
+        if (!is_deploy and e.fact.head != ord) records_linked += 1;
     }
     if (records_linked != 0) {
         for (s.ords.items) |o| if (wv.factOf(o)) |f| std.debug.print("ord {d} cell {d} head {d} slot {d} name {d}\n", .{ o, f.cell, f.head, f.slot, wv.cells[f.cell].name });
