@@ -2146,7 +2146,9 @@ const Search = struct {
     /// Per question word: a name (rare enough to tell facts apart).
     qrare: [max_groups * (1 + max_related)]bool = undefined,
     /// Per slot: how well its wording matches each question group.
-    slot_match: std.AutoHashMapUnmanaged(u32, [max_groups]f32) = .empty,
+    /// Direct-mapped by slot id; no allocation per question.
+    sm_key: [64]u32 = @splat(std.math.maxInt(u32)),
+    sm_val: [64][max_groups]f32 = undefined,
     /// Per group: its question word itself, and whether it is a name.
     gexact: [max_groups]?u64 = @splat(null),
     gexact_rare: [max_groups]bool = @splat(false),
@@ -2169,15 +2171,14 @@ const Search = struct {
 
     fn deinit(s: *Search) void {
         s.heap.deinit(s.gpa);
-        s.slot_match.deinit(s.gpa);
     }
 
     /// How well a slot's pooled wording matches each question group: a
     /// question word in it (weighted by how much of the slot says it), or
     /// with meaning on, the closest word in meaning.
     fn slotMatch(s: *Search, sid: u32) ![max_groups]f32 {
-        const gop = try s.slot_match.getOrPut(s.gpa, sid);
-        if (gop.found_existing) return gop.value_ptr.*;
+        const at: usize = @intCast(sid & 63);
+        if (s.sm_key[at] == sid) return s.sm_val[at];
         const sl = &s.wv.?.slots[sid];
         var m: [max_groups]f32 = @splat(0);
         const top = sl.share[0];
@@ -2204,7 +2205,8 @@ const Search = struct {
                 m[g] = @max(m[g], std.math.clamp((best[g] - sim_floor) / (1 - sim_floor), 0, 1));
             };
         }
-        gop.value_ptr.* = m;
+        s.sm_key[at] = sid;
+        s.sm_val[at] = m;
         return m;
     }
 
