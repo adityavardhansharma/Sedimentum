@@ -2603,7 +2603,9 @@ pub fn recall(w: *Loom, gpa: Allocator, q: Query) ![]Hit {
         var ord = f.ord;
         if (!q.deep) {
             const h = w.newestFrom(f.ord, f.fact);
-            if (h != f.ord and w.alive(h)) ord = h;
+            // A newer version said in another scope is another place's
+            // fact by the same name, not this one's answer.
+            if (h != f.ord and w.alive(h) and set.has(w, w.sidOf(h))) ord = h;
             // Two keys can reach one fact (a subject cell and a grid cell).
             var dup = false;
             for (pre.items) |x| if (x.ord == ord) {
@@ -3412,6 +3414,31 @@ test "what tagged facts teach links the untagged versions of other names" {
         const o = try std.fmt.bufPrint(&old, "zq{d}old", .{i});
         for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, o) == null);
     }
+}
+
+test "a newer claim by the same name in another project does not answer for this one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const w = try tmpStore(&tmp, null);
+    defer w.close();
+    const names = [_][]const u8{ "atlas", "borealis", "cygnus", "draco", "eridanus", "fornax" };
+    var b: [128]u8 = undefined;
+    for (0..3000) |i| _ = try w.remember("a/chat", try std.fmt.bufPrint(&b, "the team talked about the plan {d} today", .{i % 97}), .{});
+    for (names, 0..) |nm, i| {
+        _ = try w.remember("a", try std.fmt.bufPrint(&b, "decision: the backup schedule for {s} is zk{d}aa.", .{ nm, i }), .{});
+        for (0..30) |j| _ = try w.remember("a/chat", try std.fmt.bufPrint(&b, "lunch was fine {d}", .{j}), .{});
+    }
+    // Project b happens to have its own atlas, stated later.
+    _ = try w.remember("b", "decision: the backup schedule for atlas is zkbbother.", .{});
+    w.learn();
+    const hits = try w.recall(testing.allocator, .{ .about = "what is the backup schedule for atlas?", .scope = "a", .limit = 5 });
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(hits.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, hits[0].memory.text, "zk0aa") != null);
+    for (hits) |x| try testing.expect(std.mem.indexOf(u8, x.memory.text, "zkbbother") == null);
+    const all = try w.recall(testing.allocator, .{ .about = "what is the backup schedule for atlas?", .limit = 5 });
+    defer freeHits(testing.allocator, all);
+    try testing.expect(all.len >= 1);
 }
 
 test "a name's row of the grid, and the schema the store learned" {
