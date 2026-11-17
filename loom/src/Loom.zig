@@ -521,6 +521,9 @@ dirty: bool = false,
 
 /// Where the index pages live while this writer runs.
 back: Backing = .{},
+/// False while the index is the snapshot mapped copy-on-write: the first
+/// write moves it into `back` (`adopt`).
+adopted: bool = true,
 // Lexicon.
 lex: Map = .{},
 t_key: Vec(u64) = .{},
@@ -1247,6 +1250,7 @@ fn linkInto(w: *Loom, c: u32, ord: u32) !void {
 
 /// Adds a memory to the index. `tids` are its terms' ids when known.
 fn indexMemory(w: *Loom, lane: usize, off: u64, f: MemFields, terms: *const words.Terms, tids: ?[]const u32) !u32 {
+    if (!w.adopted) w.adopt();
     const ord: u32 = @intCast(w.tl_loc.count());
     var sf: u32 = f.sid;
     if (f.subject.len > 0) sf |= flag_subject;
@@ -1490,6 +1494,7 @@ fn mergeVc(w: *Loom, slot: *u32, vc: *const [vc_len]u64) !u32 {
 }
 
 fn setForgotten(w: *Loom, ord: u32) !void {
+    if (!w.adopted) w.adopt();
     const p = w.tl_sf.at(ord);
     const v = p.*;
     if (v & flag_forgotten != 0) return;
@@ -3193,9 +3198,55 @@ fn loadSnapshot(w: *Loom) !?[max_lanes]u64 {
     }
     w.total_terms = head.total_terms;
     w.merges = head.merges;
+    w.adopted = w.back.fd < 0;
     var ends: [max_lanes]u64 = @splat(data_start);
     for (0..head.nlanes) |l| ends[l] = head.ends[l];
     return ends;
+}
+
+/// Moves an index mapped from the snapshot into the scratch file, before
+/// the first write to it. A page written while mapped copy-on-write would
+/// become anonymous memory, and a long session writes into most of them
+/// (every word's postings tail); in the scratch file they are the
+/// kernel's to write out and drop. Readers see the same bytes throughout.
+/// On any failure the index simply stays where it is.
+fn adopt(w: *Loom) void {
+    w.adopted = true;
+    const b = &w.back;
+    if (b.fd < 0) return;
+    var vecs: [32]AnyVec = undefined;
+    var nv: usize = 0;
+    for (w.indexVecs()) |v| {
+        vecs[nv] = v;
+        nv += 1;
+    }
+    for (w.lanes[0..w.nlanes]) |*l| {
+        vecs[nv] = l.ords.any();
+        nv += 1;
+    }
+    for (vecs[0..nv]) |v| {
+        const n = std.mem.alignForward(usize, v.len.* * v.size, page);
+        if (n == 0) continue;
+        const off = b.offs.get(@intFromPtr(v.mem.*.ptr)) orelse continue;
+        const src = v.mem.*[0..n];
+        var done: usize = 0;
+        while (done < n) {
+            const rc = std.os.linux.pwrite(b.fd, src[done..].ptr, n - done, @intCast(off + done));
+            if (std.os.linux.errno(rc) != .SUCCESS or rc == 0) return;
+            done += rc;
+        }
+        _ = std.posix.mmap(src.ptr, n, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .FIXED = true }, b.fd, off) catch return;
+    }
+    for ([_]*Map{ &w.lex, &w.fact_of, &w.subjects, &w.sc_map }) |m| {
+        const t = m.table orelse continue;
+        const t2 = m.newTable(w.gpa, t.cap) catch return;
+        @memcpy(t2.mem[0 .. t.cap * 16], t.mem[0 .. t.cap * 16]);
+        m.retired.append(w.gpa, t) catch {
+            m.freeTable(w.gpa, t2);
+            return;
+        };
+        @atomicStore(?*Map.Table, &m.table, t2, .seq_cst);
+    }
 }
 
 fn mapSection(f: Io.File, s: SnapSection, v: AnyVec) !void {
