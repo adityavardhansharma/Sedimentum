@@ -2108,6 +2108,16 @@ const max_groups = 8;
 const max_related = 4;
 const min_related_sim = 0.45;
 const sim_floor = 0.15;
+
+/// Two words that start with the same five letters or more: forms of one
+/// word the stemmer does not join. Packed words are base 37, first letter
+/// first, so the first five letters are the number over 37^7.
+fn sameStem(a: u64, b: u64) bool {
+    if (a & words.hashed_bit != 0 or b & words.hashed_bit != 0) return false;
+    const p7: u64 = comptime std.math.pow(u64, 37, 7);
+    const pa = a / p7;
+    return pa % 37 != 0 and pa == b / p7;
+}
 const max_decode = 256;
 
 /// A question word, or a word related in meaning to one. Words of one
@@ -2172,9 +2182,15 @@ const Search = struct {
         var m: [max_groups]f32 = @splat(0);
         const top = sl.share[0];
         for (s.qt[0..s.nq]) |q| {
-            for (sl.wording(), 0..) |k, j| if (k == q.key) {
-                m[q.group] = @max(m[q.group], q.sim * (0.6 + 0.4 * sl.share[j] / top));
-            };
+            for (sl.wording(), 0..) |k, j| {
+                const wt = 0.6 + 0.4 * sl.share[j] / top;
+                if (k == q.key) {
+                    m[q.group] = @max(m[q.group], q.sim * wt);
+                } else if (q.sim == 1 and sameStem(k, q.key)) {
+                    // Another form of the word ("allowed", "allowance").
+                    m[q.group] = @max(m[q.group], 0.8 * wt);
+                }
+            }
         }
         if (s.meaning) |mn| {
             var best: [max_groups]f32 = @splat(0);
@@ -3473,4 +3489,12 @@ test "brief holds the newest version only and fits its budget" {
     try testing.expect(std.mem.indexOf(u8, b.text, "ninetysec") != null);
     try testing.expect(std.mem.indexOf(u8, b.text, "fiftysec") == null);
     try testing.expect(b.tokens <= 300);
+}
+
+test "forms of one word the stemmer does not join" {
+    try testing.expect(sameStem(words.pack("allowed"), words.pack("allowance")));
+    try testing.expect(sameStem(words.pack("deploy"), words.pack("deployment")));
+    try testing.expect(!sameStem(words.pack("keep"), words.pack("kept")));
+    try testing.expect(!sameStem(words.pack("record"), words.pack("region")));
+    try testing.expect(!sameStem(words.pack("live"), words.pack("lives")));
 }

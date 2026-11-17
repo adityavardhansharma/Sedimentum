@@ -314,11 +314,14 @@ pub fn build(gpa: Allocator, ords: []const u32, ctx: anytype) !*Woven {
     }
 
     // The rarest word is the value in most claims, but not all: a value
-    // another fact also took is less rare than its name. Each claim's
-    // value is the rare word that puts the most wording in its place.
+    // another fact also took is less rare than its name. A claim whose
+    // rarest word has no wording in place takes as its value the rare word
+    // that puts the most wording in place. (One that has some keeps it:
+    // chatter can put stray wording around a name.)
     for (live.items, pivots.items) |i, *pv| {
         const ks = keys[i * max_words ..][0..max_words];
         var best: f32 = placed(ks, pv.*, &widx, &fidx, fwt);
+        if (best > 0) continue;
         for (ks, 0..) |k, j| {
             if (k == 0) break;
             if (j == pv.* or wl.items[widx.get(k).?].df > rare_lim) continue;
