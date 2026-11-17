@@ -98,91 +98,106 @@ zig-out/bin/loom-flushbench <each|leader|fdatasync> <file>
 
 `src/bench.zig` is Crystal's benchmark driver with only the engine changed.
 Raw outputs are in `bench-results/` (Loom as `<mode>.json`, Crystal rerun
-on the same machine as `crystal-<mode>.json`).
+on the same machine as `crystal-<mode>.json`; agent and lanes as three runs,
+`-r1` to `-r3`).
 
 ## Results
 
-16 Nov, Loom against Crystal, both run on the same machine the same day:
-8 vCPU Xeon at 2.3 GHz, ext4. 1M memories unless it says 10M.
+17 Nov, Loom against Crystal, both run on the same machine the same day:
+4 vCPU, ext4. 1M memories unless it says 10M. Agent and lanes ran three
+times each; their numbers are the middle run, and the noise between runs is
+a few percent.
 
 **Questions in other words** (20 facts per name, 30% changed later)
 
-| Question, search          | Loom #1 / top 5 / old | Crystal #1 / top 5 / old |
-|:--------------------------|----------------------:|-------------------------:|
-| Same words, words only    | 97.8% / 98.3% / 0.4%  | 93.6% / 94.8% / 4.2%     |
-| Same words, with meaning  | 97.8% / 98.3% / 0.4%  | 93.6% / 97.9% / 4.2%     |
-| Other words, words only   | 9.8% / 28.4% / 0%     | 10.2% / 29.0% / 0.05%    |
-| Other words, with meaning | 23.9% / 75.6% / 0%    | 23.7% / 71.8% / 0.55%    |
-| Brief has the answer      | 98.8% (old 1.2%)      | 93.9% (old 3.5%)         |
-| Brief, words only         | 98.7% (old 1.2%)      | 77.9% (old 1.8%)         |
-| Brief size (tokens)       | 789                   | 629                      |
-| Load, memories/s          | 333k                  | 275k                     |
+| Question, search          | Loom #1 / top 5 / old  | Crystal #1 / top 5 / old | Loom p50 | Crystal p50 |
+|:--------------------------|-----------------------:|-------------------------:|---------:|------------:|
+| Same words, words only    | 99.15% / 99.2% / 0.05% | 93.6% / 94.8% / 4.2%     | 14 µs    | 43 µs       |
+| Same words, with meaning  | 99.15% / 99.2% / 0.05% | 93.55% / 97.9% / 4.2%    | 36 µs    | 170 µs      |
+| Other words, words only   | 14.05% / 31.7% / 0%    | 10.2% / 29.0% / 0.05%    | 12 µs    | 38 µs       |
+| Other words, with meaning | 28.05% / 77.6% / 0%    | 23.7% / 71.8% / 0.55%    | 21 µs    | 74 µs       |
+| Brief has the answer      | 99.2% (old 1.0%)       | 93.9% (old 3.5%)         | 36 µs    | 83 µs       |
+| Brief, words only         | 99.2% (old 1.0%)       | 77.9% (old 1.8%)         | 26 µs    | 47 µs       |
+| Brief size (tokens)       | 595                    | 629                      |          |             |
+| Load, memories/s          | 353k                   | 293k                     |          |             |
 
 **The same at 10M** (1,000 names, 20,000 facts)
 
-| Question, search          | Loom #1 / old  | p50     | Crystal #1 / old | p50     |
-|:--------------------------|---------------:|--------:|-----------------:|--------:|
-| Same words, words only    | 97.2% / 1.0%   | 0.10 ms | 90.6% / 6.5%     | 0.17 ms |
-| Same words, with meaning  | 97.2% / 1.0%   | 0.54 ms | 90.7% / 6.4%     | 1.07 ms |
-| Other words, with meaning | 23.0% / 0.05%  | 0.09 ms | 22.3% / 0.45%    | 0.15 ms |
-| Brief has the answer      | 98.3% (old 1.8%) | 0.12 ms | 93.7% (old 5.2%) | 0.15 ms |
-| Load, memories/s          | 350k           |         | 280k             |         |
+| Question, search          | Loom #1 / old    | p50     | Crystal #1 / old | p50     |
+|:--------------------------|-----------------:|--------:|-----------------:|--------:|
+| Same words, words only    | 98.15% / 0%      | 0.04 ms | 90.55% / 6.45%   | 0.10 ms |
+| Same words, with meaning  | 98.15% / 0%      | 0.24 ms | 90.7% / 6.4%     | 0.88 ms |
+| Other words, words only   | 12.35% / 0%      | 0.03 ms | 8.25% / 0.15%    | 0.06 ms |
+| Other words, with meaning | 27.05% / 0%      | 0.04 ms | 22.3% / 0.45%    | 0.11 ms |
+| Brief has the answer      | 98.25% (old 1.75%) | 0.05 ms | 93.7% (old 5.2%) | 0.11 ms |
+| Load, memories/s          | 375k             |         | 326k             |         |
 
 **Finding old facts** (1 fact per 500 messages, 30% changed later)
 
-| Measure                          | Loom              | Crystal           |
-|:---------------------------------|------------------:|------------------:|
-| Right at #1, whole store (1M/10M)| 100% / 99.9%      | 100% / 99.9%      |
-| Whole store p50, 1M / 10M        | 0.047 / 1.34 ms   | 0.058 / 1.62 ms   |
-| One project p50, 1M / 10M        | 0.012 / 0.157 ms  | 0.012 / 0.145 ms  |
-| RAM after queries (anon), 1M/10M | 10.8 / 70 MB      | 3.4 / 6.3 MB      |
-| Disk, 1M / 10M                   | 123 MB / 1.09 GB  | 123 MB / 1.09 GB  |
+| Measure                           | Loom              | Crystal           |
+|:----------------------------------|------------------:|------------------:|
+| Right at #1, whole store (1M/10M) | 100% / 99.9%      | 100% / 99.9%      |
+| Right at #1, one project (1M/10M) | 100% / 99.95%     | 100% / 100%       |
+| Whole store p50, 1M / 10M         | 42-45 µs / 1.15 ms | 40-41 µs / 1.25 ms |
+| One project p50, 1M / 10M         | 12 / 132 µs       | 12 / 130 µs       |
+| Brief p50, 1M / 10M               | 13 / 134 µs       | 12 / 132 µs       |
+| Brief size (tokens), 1M / 10M     | 45 / 66           | 70 / 103          |
+| RAM after queries (anon), 1M/10M  | 4.2 / 12.1 MB     | 3.4 / 6.3 MB      |
+| Disk, 1M / 10M                    | 123 MB / 1.09 GB  | 123 MB / 1.09 GB  |
 
 **Project jargon restated over time** (made-up words, three synonyms per setting)
 
-| Facts          | Loom #1 / old at #1 | Crystal #1 / old at #1 |
-|:---------------|--------------------:|-----------------------:|
-| With a subject | 99.8% / 0%          | 100% / 0%              |
-| No subject     | 98.95% / 1.0%       | 99.55% / 0.45%         |
+| Facts          | Loom #1 / old at #1 | p50   | Crystal #1 / old at #1 | p50   |
+|:---------------|--------------------:|------:|-----------------------:|------:|
+| With a subject | 100% / 0%           | 2 µs  | 100% / 0%              | 8 µs  |
+| No subject     | 100% / 0%           | 2 µs  | 99.55% / 0.45%         | 8 µs  |
+| Brief          | 100% (old 0.05%)    | 3 µs  | 100% (old 0.3%)        | 8 µs  |
 
 **Agent workload** (1M messages, then 8 threads, 40,000 turns)
 
 | Measure                       | Loom          | Crystal       |
 |:------------------------------|--------------:|--------------:|
-| Turns/s, every turn durable   | 8,350         | 7,516         |
-| Turns/s, promised             | 41,387        | 37,033        |
-| Brief p50                     | 0.46 ms       | 0.48 ms       |
-| RAM after reopening (anon)    | 45 MB         | 9.5 MB        |
-| Reopen                        | 0.107 s       | 0.124 s       |
+| Seed, messages/s              | 140k          | 132k          |
+| Turns/s, every turn durable   | 8,260-8,490   | 8,370-8,540   |
+| Turns/s, promised             | 37,800-39,900 | 37,500-38,600 |
+| Brief p50                     | 0.44-0.50 ms  | 0.43-0.45 ms  |
+| RAM during turns (anon)       | 63 MB         | 63 MB         |
+| RAM after reopening (anon)    | 9.9 MB        | 9.7 MB        |
+| Reopen                        | 0.10 s        | 0.11 s        |
 | Disk                          | 186 MB        | 186 MB        |
 
 **Several writer processes** (20,000 memories each, a sync every 64)
 
 | Writers | Loom writes/s | Crystal writes/s | Lost | Garbled |
 |--------:|--------------:|-----------------:|-----:|--------:|
-| 1       | 225k          | 241k             | 0    | 0       |
-| 3       | 377k          | 447k             | 0    | 0       |
-| 8       | 329k          | 309k             | 0    | 0       |
-| 32      | 148k          | 137k             | 0    | 0       |
+| 1       | 256k          | 225k             | 0    | 0       |
+| 3       | 412k          | 372k             | 0    | 0       |
+| 8       | 363k          | 318k             | 0    | 0       |
+| 32      | 137k          | 135k             | 0    | 0       |
 
-Crash test: 8 writers killed with `kill -9`; all 1,052,096 confirmed writes
-were there afterwards, nothing garbled, and new writers took over the dead
-lanes with nothing lost.
+Disk and peak heap are the same as Crystal's in every lanes run. Crash
+test: 8 writers killed with `kill -9`; every confirmed write was there
+afterwards in all three runs (up to 1,116,928), nothing garbled, and new
+writers took over the dead lanes with nothing lost.
 
 ## Limits and tradeoffs
 
-- **The weave costs RAM.** The learned table lives in memory: 10.8 MB
-  after queries at 1M (Crystal 3.4 MB), 70 MB at 10M (6.3 MB), 45 MB after
-  reopening the agent store (9.5 MB). It is rebuilt, not persisted, so the
-  first query after opening builds it. Building it is a burst of heap
-  (8.8 MB peak at 1M hard, 48 MB at 10M, and about 57 MB per process in the
-  lanes test, where every memory is a claim).
-- **Briefs are larger** (789 tokens against 629) because they carry the
-  rows of the names they are about. That is where most of their gain comes
-  from.
-- **Jargon with no subject is slightly worse** (98.95% against 99.55%).
-  When names are common words and the settings are made-up, the place a
-  value is stated is less telling than Crystal's write-time rule.
+- **Where Crystal is still ahead, slightly.** Whole-store recall over chat
+  at 1M is 2-4 µs slower (about 1.5 µs of it is reading the learned
+  table); briefs over chat are about 1 µs slower; the agent brief p50 is
+  0-10% slower and durable turns/s are within noise of each other. One
+  question in 2,000 is missed at 10M in one project (99.95%).
+- **The weave costs a little RAM.** It lives in memory, is rebuilt rather
+  than persisted, and reads only the newest 131,072 claims, so its size
+  is bounded however large the store grows (older claims answer as
+  themselves and by subject). After queries: 4.2 MB at 1M (Crystal 3.4),
+  12.1 MB at 10M (6.3). Its arenas go back to the OS when a weave is
+  replaced, so a reopened agent store holds 9.9 MB (9.7).
+- **Writing a large store in one session uses more RAM than 80 MB, for
+  both engines.** The per-memory vectors are heap while a session writes
+  and are mapped from the snapshot after it reopens: about 37 MB while
+  loading 1M, 222 MB while loading 10M, 63 MB during the agent run. This
+  is the substrate Loom shares with Crystal, not the weave.
 - **A schema needs repetition.** A kind of fact stated fewer than 4 times
   in one wording learns nothing until a subject, a change word or a shared
   name joins it to something; until then it is answered as its own memory,
